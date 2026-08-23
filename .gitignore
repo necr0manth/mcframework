@@ -1,0 +1,10 @@
+/.mcpack-cache/
+/.mypy_cache/
+/.pytest_cache/
+/.pytest-tmp-core/
+/.ruff_cache/
+/.venv/
+/dist/
+/src/*.egg-info/
+__pycache__/
+*.py[cod]

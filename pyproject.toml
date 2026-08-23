@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "minecraft-pack-framework"
+version = "0.1.0"
+description = "Deterministic, layered Minecraft pack builder and synchronizer"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [{ name = "Minecraft Pack Framework contributors" }]
+dependencies = []
+
+[project.optional-dependencies]
+sftp = ["paramiko>=3.5,<5"]
+dev = [
+  "build>=1.2",
+  "mypy>=1.15",
+  "pytest>=8.3",
+  "ruff>=0.11",
+]
+
+[project.scripts]
+mcpack = "mcframework.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcframework"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+packages = ["mcframework"]
+
+[[tool.mypy.overrides]]
+module = ["paramiko", "paramiko.*"]
+ignore_missing_imports = true
