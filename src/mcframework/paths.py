@@ -19,8 +19,6 @@ def normalize_relative_path(value: str, *, allow_glob: bool = False) -> str:
     path = PurePosixPath(candidate)
     if any(part in {"", ".", ".."} for part in path.parts):
         raise UnsafePathError(f"path contains an unsafe component: {value!r}")
-    if not allow_glob and any(char in candidate for char in "*?["):
-        raise UnsafePathError(f"glob characters are not allowed in a concrete path: {value!r}")
     normalized = path.as_posix()
     if normalized == ".":
         raise UnsafePathError("path must identify a file or directory")

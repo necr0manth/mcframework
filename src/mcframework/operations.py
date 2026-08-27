@@ -13,9 +13,11 @@ from .model import (
     ArtifactSource,
     Dependency,
     Group,
+    IgnoreSelector,
     PackageDeclaration,
     PackState,
     Section,
+    SelectorKind,
     UpdatePolicy,
     frozen_map,
 )
@@ -42,9 +44,7 @@ class ResourceDomain:
         for allowed, concrete in zip(self.identity, resource.identity, strict=True):
             if allowed == concrete:
                 continue
-            if any(char in allowed for char in "*?[") and not any(
-                char in concrete for char in "*?["
-            ):
+            if any(char in allowed for char in "*?["):
                 if not matches(concrete, allowed):
                     return False
             else:
@@ -177,10 +177,15 @@ class AddPruneSelector:
 
 @dataclass(frozen=True)
 class AddIgnoreSelector:
-    pattern: str
+    selector: IgnoreSelector
+
+    @property
+    def pattern(self) -> str:
+        """Compatibility accessor for callers that only handled legacy globs."""
+        return self.selector.value
 
     def writes(self) -> tuple[Resource, ...]:
-        return (Resource("sync", ("ignore", self.pattern)),)
+        return (Resource("sync", ("ignore", self.selector.kind.value, self.selector.value)),)
 
     def reads(self) -> tuple[Resource, ...]:
         return ()
@@ -321,9 +326,33 @@ def operation_from_json(
                 int(raw.get("order", 0)),
             )
         )
-    if kind in {"prune", "ignore"}:
+    if kind == "prune":
         pattern = normalize_relative_path(required_string(raw, "glob", source), allow_glob=True)
-        return AddPruneSelector(pattern) if kind == "prune" else AddIgnoreSelector(pattern)
+        return AddPruneSelector(pattern)
+    if kind == "ignore":
+        selector_raw = raw.get("selector")
+        if selector_raw is None:
+            selector = IgnoreSelector(
+                SelectorKind.GLOB,
+                normalize_relative_path(required_string(raw, "glob", source), allow_glob=True),
+            )
+        else:
+            if not isinstance(selector_raw, dict) or set(selector_raw) != {"kind", "path"}:
+                raise ResolutionError(
+                    f"{source}: ignore.selector must contain exactly kind and path"
+                )
+            try:
+                selector_kind = SelectorKind(required_string(selector_raw, "kind", source))
+            except ValueError as exc:
+                raise ResolutionError(f"{source}: invalid ignore selector kind") from exc
+            selector = IgnoreSelector(
+                selector_kind,
+                normalize_relative_path(
+                    required_string(selector_raw, "path", source),
+                    allow_glob=selector_kind is SelectorKind.GLOB,
+                ),
+            )
+        return AddIgnoreSelector(selector)
     raise ResolutionError(f"{source}: unsupported operation type {kind!r}")
 
 
@@ -431,8 +460,8 @@ def apply_local_operations(
             sections[operation.section.identity] = operation.section
         elif isinstance(operation, AddPruneSelector) and operation.pattern not in prune:
             prune.append(operation.pattern)
-        elif isinstance(operation, AddIgnoreSelector) and operation.pattern not in ignore:
-            ignore.append(operation.pattern)
+        elif isinstance(operation, AddIgnoreSelector) and operation.selector not in ignore:
+            ignore.append(operation.selector)
     # Activation operations read only the immutable parent state. Applying their
     # already-validated delta last makes the local merge independent of source order.
     for operation in activation_operations:
@@ -550,7 +579,9 @@ def operation_to_json(operation: Operation) -> dict[str, Any]:
     if isinstance(operation, AddPruneSelector):
         return {"type": "prune", "glob": operation.pattern}
     if isinstance(operation, AddIgnoreSelector):
-        return {"type": "ignore", "glob": operation.pattern}
+        if operation.selector.kind is SelectorKind.GLOB:
+            return {"type": "ignore", "glob": operation.selector.value}
+        return {"type": "ignore", "selector": operation.selector.document()}
     raise TypeError(f"unsupported operation: {operation!r}")
 
 

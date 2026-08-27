@@ -1,7 +1,12 @@
 /.mcpack-cache/
+/.mcpack/
+/build/
 /.mypy_cache/
 /.pytest_cache/
 /.pytest-tmp-core/
+/.pytest-tmp-explorer*/
+/.playwright-cli/
+/.tmp-*/
 /.ruff_cache/
 /.venv/
 /dist/

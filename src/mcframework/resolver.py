@@ -76,7 +76,12 @@ class Resolver:
             produced.append(ProducedOperationTrace("payload", "<payload>", payload_operations))
         state = apply_local_operations(state, tuple(operations), precedence)
         trace.append(
-            LayerApplicationTrace(layer.identity, frozen_map(redact(parameters)), tuple(produced))
+            LayerApplicationTrace(
+                layer.identity,
+                frozen_map(redact(parameters)),
+                tuple(produced),
+                str(Path(layer.root).resolve()),
+            )
         )
         return state, trace
 

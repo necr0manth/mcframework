@@ -8,6 +8,8 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from .paths import matches, normalize_relative_path
+
 if TYPE_CHECKING:
     from .operations import Operation, Producer
 
@@ -26,6 +28,38 @@ class Activation(StrEnum):
 class UpdatePolicy(StrEnum):
     FIXED = "fixed"
     LATEST_COMPATIBLE = "latest_compatible"
+
+
+class SelectorKind(StrEnum):
+    GLOB = "glob"
+    EXACT = "exact"
+    SUBTREE = "subtree"
+
+
+@dataclass(frozen=True)
+class IgnoreSelector:
+    """A sync-ignore selector with explicit literal versus legacy-glob semantics."""
+
+    kind: SelectorKind
+    value: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "value",
+            normalize_relative_path(self.value, allow_glob=self.kind is SelectorKind.GLOB),
+        )
+
+    def contains(self, path: str) -> bool:
+        candidate = normalize_relative_path(path)
+        if self.kind is SelectorKind.GLOB:
+            return matches(candidate, self.value)
+        if self.kind is SelectorKind.EXACT:
+            return candidate == self.value
+        return candidate == self.value or candidate.startswith(self.value + "/")
+
+    def document(self) -> dict[str, str]:
+        return {"kind": self.kind.value, "path": self.value}
 
 
 @dataclass(frozen=True)
@@ -98,7 +132,7 @@ class PackState:
     groups: Mapping[str, Group] = field(default_factory=frozen_map)
     sections: Mapping[str, Section] = field(default_factory=frozen_map)
     prune: tuple[str, ...] = ()
-    ignore: tuple[str, ...] = ()
+    ignore: tuple[IgnoreSelector, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -113,6 +147,7 @@ class LayerApplicationTrace:
     layer: str
     parameters: Mapping[str, Any]
     producers: tuple[ProducedOperationTrace, ...]
+    root: str = ""
 
 
 @dataclass(frozen=True)

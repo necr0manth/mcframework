@@ -7,7 +7,7 @@ import pytest
 from mcframework.errors import MergeConflict, ResolutionError
 from mcframework.loader import WorkspaceLoader
 from mcframework.model import LayerDefinition, frozen_map
-from mcframework.operations import Producer, PutFile, ResourceDomain
+from mcframework.operations import Producer, PutFile, Resource, ResourceDomain
 from mcframework.resolver import Resolver
 
 
@@ -163,6 +163,13 @@ def test_effect_domain_rejects_escape(tmp_path: Path) -> None:
     layer = LayerDefinition("bad", str(tmp_path), (), (producer,), frozen_map())
     with pytest.raises(ResolutionError, match="outside may_write"):
         Resolver(WorkspaceLoader(tmp_path)).resolve(layer)
+
+
+def test_glob_effect_domain_accepts_literal_glob_characters_in_path() -> None:
+    domain = ResourceDomain("file", (".idea/**",))
+    resource = Resource("file", (".idea/shelf/Uncommitted_[Changes]/mod?.jar",))
+
+    assert domain.contains(resource)
 
 
 def test_trace_redacts_secrets(layer_factory, tmp_path: Path) -> None:

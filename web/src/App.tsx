@@ -1,0 +1,466 @@
+import { useEffect, useMemo, useState } from 'react';
+import { ApiClient, ApiError, runRevisionedMutation } from './api.js';
+import FileExplorer from './FileExplorer.js';
+import { allMembersActive, buildMetadataTree, canImportDelta, deltaPresentation, providerMatchFor } from './view-model.js';
+
+type View = 'pack' | 'delta' | 'files';
+type Activation = 'available' | 'enabled' | 'disabled' | 'transitive' | string;
+
+type PackageItem = {
+  id: string;
+  logical_id: string;
+  kind: string;
+  version: string;
+  activation: Activation;
+  destination: string;
+  source: { provider: string; location: string; sha256: string };
+  source_file: string;
+  editable: boolean;
+};
+
+type Declaration = {
+  id: string;
+  kind: string;
+  layer: string;
+  producer: string;
+  source: string;
+  operation_index: number;
+  editable: boolean;
+  data: Record<string, unknown>;
+};
+
+type ProviderCandidate = {
+  provider: string;
+  project_id: string;
+  version_id: string;
+  version: string;
+  download_url: string;
+  confidence: 'exact' | 'fuzzy' | string;
+  reason: string;
+  hashes: Record<string, unknown>;
+};
+
+type DeltaItem = {
+  id: string;
+  kind: string;
+  status: string;
+  path: string;
+  from_path: string;
+  to_path: string;
+  package_id: string;
+  logical_id: string;
+  desired_version: string;
+  actual_version: string;
+  editable: boolean;
+  capture_modes: string[];
+  reason: string;
+  desired_sha256?: string;
+  actual_sha256?: string;
+  jar_metadata: {
+    loader: string;
+    mod_ids: string[];
+    name: string;
+    version: string;
+    dependencies: string[];
+  };
+  provider_candidates: ProviderCandidate[];
+};
+
+type Layer = { id: string; path: string; local: boolean; virtual: boolean };
+type Section = { id: string; title: string; members: string[]; order: number };
+type Group = { id: string; name: string; description: string; activation: Activation; members: string[] };
+type MetadataFile = { id: string; layer: string; path: string; sections: string[]; declarations: string[] };
+
+type Bootstrap = {
+  revision: number;
+  csrf: string;
+  instance: { name: string; path: string };
+  link: { branch: string; effective_layer: string; features: string[] };
+  packages: PackageItem[];
+  declarations: Declaration[];
+  groups: Group[];
+  sections: Section[];
+  metadata_files: MetadataFile[];
+  delta: { items: DeltaItem[]; summary: Record<string, unknown> };
+  writable_layers: Layer[];
+  feature_candidates: string[];
+  capabilities: Record<string, boolean>;
+};
+
+type MetadataTree = Omit<MetadataFile, 'sections'> & {
+  sections: Array<Section & { declarations: Declaration[] }>;
+};
+
+type Selected =
+  | { type: 'package'; value: PackageItem }
+  | { type: 'declaration'; value: Declaration };
+
+type CaptureDraft = {
+  item: DeltaItem;
+  target: string;
+  mode: 'capture' | 'import';
+  providerKey: string;
+  fuzzyConfirmed: boolean;
+};
+
+const client = new ApiClient(window.fetch.bind(window));
+
+function active(state: Activation) {
+  return state === 'enabled' || state === 'transitive';
+}
+
+function declarationTarget(item: Declaration) {
+  return String(item.data.id ?? item.data.source ?? item.data.target ?? '');
+}
+
+function candidateKey(item: ProviderCandidate) {
+  return `${item.provider}\0${item.project_id}\0${item.version_id}`;
+}
+
+function Empty({ title, children }: { title: string; children: React.ReactNode }) {
+  return <div className="empty"><span aria-hidden="true">◇</span><h2>{title}</h2><p>{children}</p></div>;
+}
+
+function Badge({ state }: { state: string }) {
+  return <span className={`badge activation-${state}`}>{state}</span>;
+}
+
+function Toggle({ checked, disabled, label, onChange }: {
+  checked: boolean;
+  disabled?: boolean;
+  label: string;
+  onChange: () => void;
+}) {
+  return (
+    <button type="button" className={`switch ${checked ? 'on' : ''}`} role="switch"
+      aria-checked={checked} aria-label={label} disabled={disabled} onClick={onChange}>
+      <span />
+    </button>
+  );
+}
+
+export default function App() {
+  const [data, setData] = useState<Bootstrap | null>(null);
+  const [view, setView] = useState<View>('pack');
+  const [selected, setSelected] = useState<Selected | null>(null);
+  const [targetLayer, setTargetLayer] = useState('');
+  const [captureDraft, setCaptureDraft] = useState<CaptureDraft | null>(null);
+  const [captureError, setCaptureError] = useState('');
+  const [featureDialog, setFeatureDialog] = useState(false);
+  const [featureChoice, setFeatureChoice] = useState('');
+  const [busy, setBusy] = useState('');
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [stopped, setStopped] = useState(false);
+
+  function applyBootstrap(next: Bootstrap) {
+    setData(next);
+    if (!next.writable_layers.some((layer) => layer.id === targetLayer)) {
+      setTargetLayer(next.writable_layers[0]?.id || '');
+    }
+    if (selected?.type === 'package') {
+      const replacement = next.packages.find((item) => item.id === selected.value.id);
+      if (replacement) setSelected({ type: 'package', value: replacement });
+    } else if (selected?.type === 'declaration') {
+      const replacement = next.declarations.find((item) => item.id === selected.value.id);
+      if (replacement) setSelected({ type: 'declaration', value: replacement });
+    } else {
+      setSelected(next.packages[0]
+        ? { type: 'package', value: next.packages[0] }
+        : next.declarations[0]
+          ? { type: 'declaration', value: next.declarations[0] }
+          : null);
+    }
+  }
+
+  useEffect(() => {
+    let live = true;
+    client.bootstrap().then((next: Bootstrap) => {
+      if (!live) return;
+      setData(next);
+      setTargetLayer(next.writable_layers[0]?.id || '');
+      setSelected(next.packages[0]
+        ? { type: 'package', value: next.packages[0] }
+        : next.declarations[0]
+          ? { type: 'declaration', value: next.declarations[0] }
+          : null);
+    }).catch((reason: Error) => live && setError(reason.message));
+    return () => { live = false; };
+  }, []);
+
+  const metadataTree = useMemo(
+    () => data ? buildMetadataTree(data) as MetadataTree[] : [],
+    [data],
+  );
+
+  async function refreshAfterConflict(reason: ApiError) {
+    try {
+      const next = await client.bootstrap() as Bootstrap;
+      applyBootstrap(next);
+      const actual = (reason.details as Record<string, unknown>).actual;
+      setError(`Another change was saved${actual === undefined ? '' : ` (revision ${actual})`}. The view was refreshed; review and try again.`);
+    } catch (refreshReason) {
+      setError(refreshReason instanceof Error ? refreshReason.message : 'The view is stale and refresh failed');
+    }
+  }
+
+  async function act(label: string, action: () => Promise<Bootstrap>, success: string) {
+    setBusy(label);
+    setError('');
+    setNotice('');
+    try {
+      const outcome = await runRevisionedMutation(client, action);
+      applyBootstrap(outcome.value as Bootstrap);
+      if (!outcome.applied) {
+        const actual = (outcome.conflict?.details as Record<string, unknown> | undefined)?.actual;
+        setError(`Another change was saved${actual === undefined ? '' : ` (revision ${actual})`}. The view was refreshed; review and try again.`);
+        return false;
+      }
+      setNotice(success);
+      return true;
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Request failed');
+      return false;
+    } finally {
+      setBusy('');
+    }
+  }
+
+  async function retry() {
+    setError('');
+    setBusy('bootstrap');
+    try {
+      applyBootstrap(await client.bootstrap() as Bootstrap);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Request failed');
+    } finally {
+      setBusy('');
+    }
+  }
+
+  function togglePackage(item: PackageItem) {
+    const state = active(item.activation) ? 'disabled' : 'enabled';
+    void act(
+      `activation:${item.id}`,
+      () => client.setActivation(item.id, state, targetLayer),
+      `${item.id} is now ${state}.`,
+    );
+  }
+
+  function toggleGroup(item: Group) {
+    const state = active(item.activation) ? 'disabled' : 'enabled';
+    void act(
+      `group:${item.id}`,
+      () => client.setGroupActivation(item.id, state, targetLayer),
+      `${item.name} group is now ${state}.`,
+    );
+  }
+
+  function toggleSection(item: Section) {
+    if (!data) return;
+    const state = allMembersActive(data.packages, item.members) ? 'disabled' : 'enabled';
+    void act(
+      `section:${item.id}`,
+      () => client.setSectionActivation(item.id, state, targetLayer),
+      `${item.title} section was updated atomically.`,
+    );
+  }
+
+  function openCapture(item: DeltaItem) {
+    const canImport = canImportDelta(item) && data?.capabilities.package_import;
+    setCaptureError('');
+    setCaptureDraft({
+      item,
+      target: targetLayer,
+      mode: canImport ? 'import' : 'capture',
+      providerKey: 'local',
+      fuzzyConfirmed: false,
+    });
+  }
+
+  async function submitCapture() {
+    if (!captureDraft) return;
+    const { item, target, mode, providerKey, fuzzyConfirmed } = captureDraft;
+    if (mode === 'import') {
+      const candidate = item.provider_candidates.find((entry) => candidateKey(entry) === providerKey);
+      try {
+        const providerMatch = providerMatchFor(candidate, fuzzyConfirmed);
+        setCaptureDraft(null);
+        await act(
+          `delta:${item.id}`,
+          () => client.importPackage(item.id, target, providerMatch),
+          `${item.logical_id || item.path || item.id} was imported.`,
+        );
+      } catch (reason) {
+        setCaptureError(reason instanceof Error ? reason.message : 'Choose a verified provider match');
+      }
+    } else {
+      setCaptureDraft(null);
+      await act(
+        `delta:${item.id}`,
+        () => client.capture(item.id, target),
+        `${item.path || item.id} was captured.`,
+      );
+    }
+  }
+
+  async function addFeature() {
+    if (!featureChoice) return;
+    const feature = featureChoice;
+    setFeatureDialog(false);
+    await act(
+      `feature:${feature}`,
+      () => client.addFeature(feature),
+      `Feature ${feature} was added.`,
+    );
+  }
+
+  async function stopServer() {
+    if (!window.confirm('Stop the local web server for this instance?')) return;
+    setBusy('shutdown');
+    try {
+      await client.shutdown();
+      setStopped(true);
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.code === 'revision_conflict') {
+        await refreshAfterConflict(reason);
+      } else {
+        setError(reason instanceof Error ? reason.message : 'Could not stop the server');
+      }
+    } finally {
+      setBusy('');
+    }
+  }
+
+  if (stopped) {
+    return <main className="center-state"><div className="state-card"><span className="brand-symbol">M</span><h1>Web server stopped</h1><p>This page is no longer connected. Start it again with <code>mcpack web {data?.instance.name || '&lt;instance&gt;'}</code>.</p></div></main>;
+  }
+
+  if (!data) {
+    return <main className="center-state"><div className="state-card"><span className="brand-symbol">M</span>{busy === 'bootstrap' || !error ? <><div className="spinner" /><h1>Loading instance</h1><p>Resolving packages and comparing local files…</p></> : <><h1>Could not load the instance</h1><p>{error}</p><button className="primary" onClick={retry}>Retry</button></>}</div></main>;
+  }
+
+  const readOnly = !data.capabilities.activation && !data.capabilities.features &&
+    !data.capabilities.capture && !data.capabilities.package_import;
+  const remainingFeatures = data.feature_candidates.filter(
+    (feature) => !data.link.features.includes(feature),
+  );
+  const activePackages = data.packages.filter((item) => active(item.activation)).length;
+  const selectedCandidate = captureDraft?.item.provider_candidates.find(
+    (candidate) => candidateKey(candidate) === captureDraft.providerKey,
+  );
+
+  return (
+    <div className="app-shell">
+      <header className="topbar">
+        <div className="brand"><span className="brand-symbol">M</span><div><strong>Minecraft Pack Framework</strong><small>Instance workspace</small></div></div>
+        <div className="instance-context"><span className="live-dot" /><div><small>{data.instance.name} · revision {data.revision}</small><strong>{data.link.effective_layer}</strong></div></div>
+        <div className="top-actions">
+          {data.capabilities.sync && <button className="secondary" disabled={!!busy} onClick={() => void act('sync', () => client.sync(), 'Instance synchronized.')}>{busy === 'sync' ? 'Syncing…' : 'Sync instance'}</button>}
+          {data.capabilities.shutdown && <button className="quiet" disabled={!!busy} onClick={() => void stopServer()}>Stop web</button>}
+        </div>
+      </header>
+
+      <aside className="sidebar">
+        <nav aria-label="Instance views">
+          <p className="eyebrow">Workspace</p>
+          <button className={view === 'pack' ? 'nav-item active' : 'nav-item'} aria-current={view === 'pack' ? 'page' : undefined} onClick={() => setView('pack')}><span>▦</span><b>Pack</b><em>{data.packages.length}</em></button>
+          <button className={view === 'delta' ? 'nav-item active' : 'nav-item'} aria-current={view === 'delta' ? 'page' : undefined} onClick={() => setView('delta')}><span>≠</span><b>Instance delta</b><em>{data.delta.items.length}</em></button>
+          <button className={view === 'files' ? 'nav-item active' : 'nav-item'} aria-current={view === 'files' ? 'page' : undefined} onClick={() => setView('files')}><span>⌘</span><b>Files</b><em>{data.delta.items.length}</em></button>
+        </nav>
+
+        <section className="feature-panel">
+          <div className="panel-title"><div><p className="eyebrow">Temporary layer</p><h2>Features</h2></div>{data.capabilities.features && remainingFeatures.length > 0 && <button aria-label="Add feature" onClick={() => { setFeatureChoice(remainingFeatures[0] || ''); setFeatureDialog(true); }}>+</button>}</div>
+          {data.link.features.length ? <ul>{data.link.features.map((feature) => <li key={feature}><span>{feature}</span>{data.capabilities.features && <button disabled={!!busy} aria-label={`Remove ${feature}`} onClick={() => void act(`feature:${feature}`, () => client.removeFeature(feature), `Feature ${feature} was removed.`)}>×</button>}</li>)}</ul> : <p className="muted-copy">No features are active. The instance resolves directly from <strong>{data.link.branch}</strong>.</p>}
+        </section>
+
+        <div className="path-card"><p className="eyebrow">Minecraft directory</p><code title={data.instance.path}>{data.instance.path || 'Path unavailable'}</code></div>
+      </aside>
+
+      <main className="workspace">
+        {(error || notice) && <div className={`banner ${error ? 'error' : 'success'}`} role={error ? 'alert' : 'status'}><span>{error ? '!' : '✓'}</span><p>{error || notice}</p><button aria-label="Dismiss" onClick={() => { setError(''); setNotice(''); }}>×</button></div>}
+        {readOnly && <div className="banner warning"><span>i</span><p><strong>Read-only session.</strong> This server did not grant editing capabilities.</p></div>}
+
+        {view === 'pack' ? <>
+          <div className="page-heading"><div><p className="eyebrow">Resolved composition</p><h1>Pack structure</h1><p>Metadata files, semantic sections and declarations in resolver order.</p></div><div className="summary"><strong>{activePackages}</strong><span>active</span><i /><strong>{data.declarations.length}</strong><span>declarations</span></div></div>
+
+          {data.groups.length > 0 && <section className="groups" aria-label="Package groups">{data.groups.map((group) => <article key={group.id}><span className="group-icon">G</span><div><small>Package group</small><strong>{group.name}</strong><p>{group.description || group.id}</p></div><Badge state={group.activation} /><Toggle checked={active(group.activation)} disabled={!!busy || !data.capabilities.activation} label={`Toggle ${group.name} group`} onChange={() => toggleGroup(group)} /></article>)}</section>}
+
+          <div className="pack-grid">
+            <div className="content-stack">
+              {metadataTree.length === 0 ? <Empty title="No logical declarations">Add metadata to the linked layer, then reload this page.</Empty> : metadataTree.map((file) => <section className="metadata-file" key={`${file.layer}:${file.path}`}><header><div><p className="eyebrow">Metadata file</p><h2>{file.path}</h2></div><span>{file.layer || 'unknown layer'} · {file.sections.reduce((count, section) => count + section.declarations.length, 0)} declarations</span></header>{file.sections.map((section) => {
+                const sectionChecked = allMembersActive(
+                  [...data.packages, ...data.groups],
+                  section.members,
+                );
+                const canToggleSection = !section.id.startsWith('_unsectioned') && section.members.length > 0;
+                return <div className="metadata-section" key={section.id}><div className="metadata-section-head"><div><p className="eyebrow">Section</p><h3>{section.title}</h3></div><span>{section.declarations.length} operations · ordered</span>{canToggleSection && <Toggle checked={sectionChecked} disabled={!!busy || !data.capabilities.activation} label={`Toggle ${section.title} section atomically`} onChange={() => toggleSection(section)} />}</div><div className="ordered-declarations">{section.declarations.map((declaration) => {
+                  const target = declarationTarget(declaration);
+                  const packageItem = data.packages.find((item) => item.id === target || item.logical_id === target);
+                  return <DeclarationRow key={declaration.id} declaration={declaration} packageItem={packageItem} selected={selected} busy={busy} activationAvailable={data.capabilities.activation} onSelect={setSelected} onToggle={togglePackage} />;
+                })}</div></div>;
+              })}</section>)}
+            </div>
+
+            <aside className="details" aria-label="Selection details">
+              {selected?.type === 'package' ? <PackageDetails item={selected.value} /> : selected?.type === 'declaration' ? <DeclarationDetails item={selected.value} /> : <Empty title="Nothing selected">Choose a declaration to inspect its provenance.</Empty>}
+            </aside>
+          </div>
+        </> : view === 'delta' ? <>
+          <div className="page-heading delta-heading"><div><p className="eyebrow">Semantic comparison</p><h1>Instance delta</h1><p>Package-aware changes, file changes and detected renames against the resolved layer.</p></div><TargetSelect layers={data.writable_layers} value={targetLayer} onChange={setTargetLayer} /></div>
+
+          <section className="delta-summary">{['add', 'remove', 'change', 'update', 'rename'].map((key) => <div key={key}><strong>{String(data.delta.summary[key] ?? data.delta.items.filter((item) => item.status === key).length)}</strong><span>{key}</span></div>)}</section>
+
+          {data.delta.items.length ? <div className="delta-list">{data.delta.items.map((item) => {
+            const presentation = deltaPresentation(item);
+            const canReviewImport = canImportDelta(item) && data.capabilities.package_import;
+            return <article className={`delta-card delta-${item.kind}`} key={item.id}><span className={`change-kind ${presentation.tone}`}>{presentation.label}</span><div className="delta-copy"><div className="delta-title"><h2>{presentation.title}</h2><span>{item.kind}</span></div><code>{presentation.path}</code><p>{presentation.detail}</p>{(item.actual_version || item.desired_version) && item.status !== 'update' && <small>Local {item.actual_version || '?'} · desired {item.desired_version || '?'}</small>}{item.desired_sha256 && <small>Expected {item.desired_sha256.slice(0, 12)}…</small>}{item.actual_sha256 && <small>Local {item.actual_sha256.slice(0, 12)}…</small>}</div><div className="delta-actions">{!item.editable && <span className="readonly-pill">Read-only producer</span>}<button className="primary" disabled={!!busy || !item.editable || (!data.capabilities.capture && !data.capabilities.package_import) || !data.writable_layers.length} onClick={() => openCapture(item)}>{busy === `delta:${item.id}` ? 'Capturing…' : canReviewImport ? 'Review import' : 'Capture change'}</button></div></article>;
+          })}</div> : <Empty title="Instance matches the layer">There are no uncaptured semantic changes in this instance.</Empty>}
+        </> : <FileExplorer client={client} data={data} targetLayer={targetLayer} layers={data.writable_layers} onTargetLayer={setTargetLayer} onMutate={(label, action, success) => act(label, async () => await action() as Bootstrap, success)} onError={setError} />}
+      </main>
+
+      {captureDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setCaptureDraft(null)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="capture-title"><header><div><p className="eyebrow">Semantic write</p><h2 id="capture-title">{deltaPresentation(captureDraft.item).title}</h2></div><button aria-label="Close" onClick={() => setCaptureDraft(null)}>×</button></header><div className="modal-body"><p>Only this semantic item will be written. Unrelated instance changes stay untouched.</p><TargetSelect layers={data.writable_layers} value={captureDraft.target} onChange={(target) => setCaptureDraft({ ...captureDraft, target })} />{canImportDelta(captureDraft.item) && data.capabilities.package_import && <fieldset><legend>Capture mode</legend><label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'import'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'import' })} /><span><strong>Import as package</strong><small>Use verified provider metadata or a local SHA-256 artifact.</small></span></label>{data.capabilities.capture && <label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'capture'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'capture' })} /><span><strong>Capture as file</strong><small>Preserve the change as a file operation.</small></span></label>}</fieldset>}{captureDraft.mode === 'import' && <ImportChoices draft={captureDraft} selectedCandidate={selectedCandidate} onChange={setCaptureDraft} />}{captureError && <div className="inline-error" role="alert">{captureError}</div>}</div><footer><button className="secondary" onClick={() => setCaptureDraft(null)}>Cancel</button><button className="primary" onClick={() => void submitCapture()}>{captureDraft.mode === 'import' ? 'Import package' : 'Capture change'}</button></footer></section></div>}
+
+      {featureDialog && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setFeatureDialog(false)}><section className="modal compact" role="dialog" aria-modal="true" aria-labelledby="feature-title"><header><div><p className="eyebrow">Temporary layer</p><h2 id="feature-title">Add feature</h2></div><button aria-label="Close" onClick={() => setFeatureDialog(false)}>×</button></header><div className="modal-body"><p>The instance will be relinked to a local temporary layer containing this feature.</p><label><span>Feature</span><select value={featureChoice} onChange={(event) => setFeatureChoice(event.target.value)}>{remainingFeatures.map((feature) => <option value={feature} key={feature}>{feature}</option>)}</select></label></div><footer><button className="secondary" onClick={() => setFeatureDialog(false)}>Cancel</button><button className="primary" disabled={!featureChoice} onClick={() => void addFeature()}>Add feature</button></footer></section></div>}
+    </div>
+  );
+}
+
+function DeclarationRow({ declaration, packageItem, selected, busy, activationAvailable, onSelect, onToggle }: {
+  declaration: Declaration;
+  packageItem?: PackageItem;
+  selected: Selected | null;
+  busy: string;
+  activationAvailable: boolean;
+  onSelect: (selected: Selected) => void;
+  onToggle: (item: PackageItem) => void;
+}) {
+  const isSelected = packageItem
+    ? selected?.type === 'package' && selected.value.id === packageItem.id
+    : selected?.type === 'declaration' && selected.value.id === declaration.id;
+  return <article className={isSelected ? 'package-row selected' : 'package-row'}><span className="declaration-order">{String(declaration.operation_index + 1).padStart(2, '0')}</span><button className="package-main" onClick={() => onSelect(packageItem ? { type: 'package', value: packageItem } : { type: 'declaration', value: declaration })}><span className="package-icon">{(packageItem?.id || declaration.kind).slice(0, 1).toUpperCase()}</span><span><strong>{packageItem?.id || declarationTarget(declaration) || declaration.kind}</strong><small>{declaration.kind} · {declaration.producer}{packageItem?.destination ? ` · ${packageItem.destination}` : ''}</small></span></button>{packageItem ? <><div className="package-meta"><small>Provider</small><strong>{packageItem.source.provider}</strong></div><div className="package-meta"><small>Version</small><strong>{packageItem.version}</strong></div><Badge state={packageItem.activation} /><Toggle checked={active(packageItem.activation)} disabled={!!busy || !activationAvailable || !packageItem.editable || packageItem.activation === 'transitive'} label={`Toggle ${packageItem.id}`} onChange={() => onToggle(packageItem)} /></> : <><div className="package-meta declaration-source"><small>Source</small><strong>{declaration.source}</strong></div><Badge state={declaration.editable ? 'editable' : 'read-only'} /></>}</article>;
+}
+
+function TargetSelect({ layers, value, onChange }: { layers: Layer[]; value: string; onChange: (value: string) => void }) {
+  return <label className="target-field"><span>Writable target</span><select value={value} disabled={!layers.length} onChange={(event) => onChange(event.target.value)}>{layers.length ? layers.map((layer) => <option value={layer.id} key={layer.id}>{layer.id}{layer.local ? ' · local' : ''}{layer.virtual ? ' · feature layer' : ''}</option>) : <option>No writable layers</option>}</select></label>;
+}
+
+function ImportChoices({ draft, selectedCandidate, onChange }: {
+  draft: CaptureDraft;
+  selectedCandidate?: ProviderCandidate;
+  onChange: (draft: CaptureDraft) => void;
+}) {
+  const metadata = draft.item.jar_metadata;
+  const providerCandidates = draft.item.provider_candidates.filter(
+    (candidate) => candidate.provider !== 'local',
+  );
+  return <div className="import-panel">{(metadata.name || metadata.version || metadata.mod_ids.length > 0) && <section className="jar-details"><p className="eyebrow">Parsed JAR metadata</p><strong>{metadata.name || metadata.mod_ids.join(', ') || 'Unknown mod'}</strong><span>{[metadata.version, metadata.loader].filter(Boolean).join(' · ') || 'Version and loader unavailable'}</span>{metadata.mod_ids.length > 0 && <code>{metadata.mod_ids.join(', ')}</code>}{metadata.dependencies.length > 0 && <small>Dependencies: {metadata.dependencies.join(', ')}</small>}</section>}<fieldset className="provider-list"><legend>Artifact source</legend><label className="provider-choice"><input type="radio" name="provider" checked={draft.providerKey === 'local'} onChange={() => onChange({ ...draft, providerKey: 'local', fuzzyConfirmed: false })} /><span><strong>Local artifact</strong><small>Exact SHA-256 fallback{draft.item.actual_sha256 ? ` · ${draft.item.actual_sha256.slice(0, 12)}…` : ''}</small></span><Badge state="exact" /></label>{providerCandidates.map((candidate) => <label className="provider-choice" key={candidateKey(candidate)}><input type="radio" name="provider" checked={draft.providerKey === candidateKey(candidate)} onChange={() => onChange({ ...draft, providerKey: candidateKey(candidate), fuzzyConfirmed: false })} /><span><strong>{candidate.provider} · {candidate.version || candidate.version_id}</strong><small>{candidate.project_id}{candidate.reason ? ` · ${candidate.reason}` : ''}</small></span><Badge state={candidate.confidence} /></label>)}</fieldset>{selectedCandidate?.confidence === 'fuzzy' && <label className="fuzzy-confirm"><input type="checkbox" checked={draft.fuzzyConfirmed} onChange={(event) => onChange({ ...draft, fuzzyConfirmed: event.target.checked })} /><span><strong>Use this fuzzy match</strong><small>I reviewed the project and version identity. This match will not be selected automatically.</small></span></label>}</div>;
+}
+
+function PackageDetails({ item }: { item: PackageItem }) {
+  return <><span className="details-icon">{item.id.slice(0, 1).toUpperCase()}</span><p className="eyebrow">Package details</p><h2>{item.id}</h2><Badge state={item.activation} />{!item.editable && <div className="callout"><strong>Read-only declaration</strong><p>The producing source cannot be edited safely from this interface.</p></div>}<dl><div><dt>Logical identity</dt><dd>{item.logical_id}</dd></div><div><dt>Kind</dt><dd>{item.kind}</dd></div><div><dt>Provider</dt><dd>{item.source.provider}</dd></div><div><dt>Version</dt><dd>{item.version}</dd></div><div><dt>Destination</dt><dd>{item.destination || 'Not specified'}</dd></div><div><dt>Source metadata</dt><dd>{item.source_file || 'Generated'}</dd></div><div><dt>Artifact location</dt><dd>{item.source.location || 'Not specified'}</dd></div><div><dt>SHA-256</dt><dd className="hash">{item.source.sha256 || 'Not available'}</dd></div></dl></>;
+}
+
+function DeclarationDetails({ item }: { item: Declaration }) {
+  return <><span className="details-icon">D</span><p className="eyebrow">Declaration details</p><h2>{declarationTarget(item) || item.id}</h2><Badge state={item.editable ? 'editable' : 'read-only'} /><dl><div><dt>Operation</dt><dd>{item.kind}</dd></div><div><dt>Layer</dt><dd>{item.layer || 'Not reported'}</dd></div><div><dt>Producer</dt><dd>{item.producer || 'Not reported'}</dd></div><div><dt>Source</dt><dd>{item.source || 'Not reported'}</dd></div><div><dt>Operation index</dt><dd>{item.operation_index}</dd></div></dl><div className="data-block"><small>Resolved data</small><pre>{JSON.stringify(item.data, null, 2)}</pre></div></>;
+}

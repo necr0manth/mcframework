@@ -15,11 +15,14 @@ def test_rejects_unsafe_paths(value: str) -> None:
         normalize_relative_path(value)
 
 
-def test_normalizes_backslashes_and_globs() -> None:
+def test_normalizes_backslashes_and_allows_glob_characters_in_concrete_paths() -> None:
     assert normalize_relative_path(r"mods\example.jar") == "mods/example.jar"
     assert normalize_relative_path("mods/*.jar", allow_glob=True) == "mods/*.jar"
-    with pytest.raises(UnsafePathError):
-        normalize_relative_path("mods/*.jar")
+    assert normalize_relative_path("mods/*.jar") == "mods/*.jar"
+    assert normalize_relative_path("config/file?.txt") == "config/file?.txt"
+    assert normalize_relative_path(".idea/shelf/[Changes]/mod.jar") == (
+        ".idea/shelf/[Changes]/mod.jar"
+    )
 
 
 def test_glob_semantics() -> None:
@@ -43,10 +46,20 @@ def test_confined_path_rejects_symlink_escape(tmp_path: Path) -> None:
 
 
 def test_loader_excludes_metadata_and_loads_payload(layer_factory, tmp_path: Path) -> None:
-    root = layer_factory("base", operations=[], payload={"config/a.txt": b"payload"})
+    root = layer_factory(
+        "base",
+        operations=[],
+        payload={
+            "config/a.txt": b"payload",
+            ".idea/shelf/Uncommitted_changes_[Changes]/mod.jar": b"jar",
+        },
+    )
     layer = WorkspaceLoader(tmp_path).load(root)
     assert layer.identity == "base"
-    assert layer.payload == {"config/a.txt": b"payload"}
+    assert layer.payload == {
+        ".idea/shelf/Uncommitted_changes_[Changes]/mod.jar": b"jar",
+        "config/a.txt": b"payload",
+    }
     assert not any(path.startswith(".pack") for path in layer.payload)
 
 

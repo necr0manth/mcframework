@@ -24,6 +24,18 @@ dev = [
 [project.scripts]
 mcpack = "mcframework.cli:main"
 
+[tool.hatch.build]
+artifacts = ["src/mcframework/web_static/**"]
+exclude = [
+  "/.idea",
+  "/.mcpack",
+  "/.pytest-*",
+  "/.tmp-*",
+  "/build",
+  "/dist",
+  "/web",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/mcframework"]
 
