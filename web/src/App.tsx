@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
-import { ApiClient, ApiError, runRevisionedMutation } from './api.js';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ApiClient, ApiError, createKeyedRequestLoader, createRevisionedDeltaLoader, mergeDeltaForRevision, runRevisionedMutation } from './api.js';
 import FileExplorer from './FileExplorer.js';
-import { allMembersActive, buildMetadataTree, canImportDelta, deltaPresentation, providerMatchFor } from './view-model.js';
+import { allMembersActive, buildMetadataTree, canImportDelta, deltaPresentation, paginateDelta, providerMatchFor } from './view-model.js';
 
 type View = 'pack' | 'delta' | 'files';
 type Activation = 'available' | 'enabled' | 'disabled' | 'transitive' | string;
+const DELTA_PAGE_SIZE = 200;
 
 type PackageItem = {
   id: string;
@@ -52,6 +53,7 @@ type DeltaItem = {
   desired_version: string;
   actual_version: string;
   editable: boolean;
+  enriched: boolean;
   capture_modes: string[];
   reason: string;
   desired_sha256?: string;
@@ -81,7 +83,7 @@ type Bootstrap = {
   groups: Group[];
   sections: Section[];
   metadata_files: MetadataFile[];
-  delta: { items: DeltaItem[]; summary: Record<string, unknown> };
+  delta: { items: DeltaItem[]; summary: Record<string, unknown>; loaded: boolean; complete: boolean; revision: number };
   writable_layers: Layer[];
   feature_candidates: string[];
   capabilities: Record<string, boolean>;
@@ -97,6 +99,7 @@ type Selected =
 
 type CaptureDraft = {
   item: DeltaItem;
+  revision: number;
   target: string;
   mode: 'capture' | 'import';
   providerKey: string;
@@ -140,21 +143,30 @@ function Toggle({ checked, disabled, label, onChange }: {
 }
 
 export default function App() {
+  const deltaLoader = useRef(createRevisionedDeltaLoader(() => client.delta())).current;
+  const detailLoader = useRef(createKeyedRequestLoader(
+    (id: string, revision: number) => client.deltaItem(id, revision),
+  )).current;
+  const detailKey = useRef('');
   const [data, setData] = useState<Bootstrap | null>(null);
   const [view, setView] = useState<View>('pack');
   const [selected, setSelected] = useState<Selected | null>(null);
   const [targetLayer, setTargetLayer] = useState('');
   const [captureDraft, setCaptureDraft] = useState<CaptureDraft | null>(null);
   const [captureError, setCaptureError] = useState('');
+  const [detailBusy, setDetailBusy] = useState('');
   const [featureDialog, setFeatureDialog] = useState(false);
   const [featureChoice, setFeatureChoice] = useState('');
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [stopped, setStopped] = useState(false);
+  const [deltaPageState, setDeltaPageState] = useState({ key: '', limit: DELTA_PAGE_SIZE });
+  const [compositionStaleRevision, setCompositionStaleRevision] = useState<number | null>(null);
 
   function applyBootstrap(next: Bootstrap) {
     setData(next);
+    setCompositionStaleRevision(null);
     if (!next.writable_layers.some((layer) => layer.id === targetLayer)) {
       setTargetLayer(next.writable_layers[0]?.id || '');
     }
@@ -187,6 +199,45 @@ export default function App() {
     }).catch((reason: Error) => live && setError(reason.message));
     return () => { live = false; };
   }, []);
+
+  useEffect(() => {
+    if (view !== 'delta' || !data || data.delta.loaded) return;
+    let live = true;
+    const revision = data.revision;
+    deltaLoader.load(revision).then((delta: Bootstrap['delta']) => {
+      if (!live) return;
+      setData((current) => mergeDeltaForRevision(current, revision, delta));
+    }).catch((reason: Error) => live && setError(reason.message));
+    return () => { live = false; };
+  }, [view, data?.delta.loaded, data?.revision, deltaLoader]);
+
+  useEffect(() => {
+    if (view !== 'pack' || compositionStaleRevision === null) return;
+    let live = true;
+    setBusy('refresh:pack');
+    client.bootstrap().then((next: Bootstrap) => {
+      if (!live) return;
+      applyBootstrap(next);
+    }).catch((reason: Error) => live && setError(reason.message))
+      .finally(() => live && setBusy(''));
+    return () => { live = false; };
+  }, [view, compositionStaleRevision]);
+
+  function applyCompactMutation(revision: number, success: string) {
+    setData((current) => current ? {
+      ...current,
+      revision,
+      delta: {
+        ...current.delta,
+        loaded: false,
+        complete: false,
+        revision,
+      },
+    } : current);
+    setCompositionStaleRevision(revision);
+    setError('');
+    setNotice(success);
+  }
 
   const metadataTree = useMemo(
     () => data ? buildMetadataTree(data) as MetadataTree[] : [],
@@ -266,39 +317,100 @@ export default function App() {
     );
   }
 
-  function openCapture(item: DeltaItem) {
+  async function openCapture(item: DeltaItem) {
+    if (!data) return;
+    const revision = data.revision;
+    const requestKey = `${revision}:${item.id}`;
     const canImport = canImportDelta(item) && data?.capabilities.package_import;
+    detailKey.current = requestKey;
+    setDetailBusy(requestKey);
     setCaptureError('');
     setCaptureDraft({
       item,
+      revision,
       target: targetLayer,
       mode: canImport ? 'import' : 'capture',
       providerKey: 'local',
       fuzzyConfirmed: false,
     });
+    try {
+      const detail = await detailLoader.load(requestKey, item.id, revision) as {
+        revision: number;
+        item: DeltaItem;
+      };
+      if (
+        detailKey.current !== requestKey
+        || detail.revision !== revision
+        || client.revision !== revision
+      ) return;
+      setData((current) => {
+        if (current?.revision !== revision) return current;
+        return {
+          ...current,
+          delta: {
+            ...current.delta,
+            items: current.delta.items.map((entry) =>
+              entry.id === item.id ? detail.item : entry
+            ),
+          },
+        };
+      });
+      setCaptureDraft((current) => {
+        if (current?.revision !== revision || current.item.id !== item.id) return current;
+        const detailCanImport = canImportDelta(detail.item) && data.capabilities.package_import;
+        return {
+          ...current,
+          item: detail.item,
+          mode: detailCanImport ? current.mode : 'capture',
+        };
+      });
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.code === 'revision_conflict') {
+        if (detailKey.current === requestKey) closeCapture();
+        await refreshAfterConflict(reason);
+        return;
+      }
+      if (detailKey.current === requestKey && client.revision === revision) {
+        setCaptureError(reason instanceof Error ? reason.message : 'Could not inspect this item');
+      }
+    } finally {
+      setDetailBusy((current) => current === requestKey ? '' : current);
+    }
+  }
+
+  function closeCapture() {
+    detailKey.current = '';
+    setDetailBusy('');
+    setCaptureDraft(null);
   }
 
   async function submitCapture() {
     if (!captureDraft) return;
     const { item, target, mode, providerKey, fuzzyConfirmed } = captureDraft;
+    if (!item.enriched) {
+      setCaptureError('Wait for item inspection to finish before capturing it');
+      return;
+    }
     if (mode === 'import') {
       const candidate = item.provider_candidates.find((entry) => candidateKey(entry) === providerKey);
       try {
         const providerMatch = providerMatchFor(candidate, fuzzyConfirmed);
-        setCaptureDraft(null);
+        detailLoader.invalidate(`${captureDraft.revision}:${item.id}`);
+        closeCapture();
         await act(
           `delta:${item.id}`,
-          () => client.importPackage(item.id, target, providerMatch),
+          () => client.importPackage(item.id, target, providerMatch, item.actual_sha256),
           `${item.logical_id || item.path || item.id} was imported.`,
         );
       } catch (reason) {
         setCaptureError(reason instanceof Error ? reason.message : 'Choose a verified provider match');
       }
     } else {
-      setCaptureDraft(null);
+      detailLoader.invalidate(`${captureDraft.revision}:${item.id}`);
+      closeCapture();
       await act(
         `delta:${item.id}`,
-        () => client.capture(item.id, target),
+        () => client.capture(item.id, target, item.actual_sha256),
         `${item.path || item.id} was captured.`,
       );
     }
@@ -349,6 +461,11 @@ export default function App() {
   const selectedCandidate = captureDraft?.item.provider_candidates.find(
     (candidate) => candidateKey(candidate) === captureDraft.providerKey,
   );
+  const deltaPageKey = `${data.revision}:${data.delta.loaded}:${data.delta.items.length}`;
+  const deltaLimit = deltaPageState.key === deltaPageKey
+    ? deltaPageState.limit
+    : DELTA_PAGE_SIZE;
+  const deltaPage = paginateDelta(data.delta.items, deltaLimit, DELTA_PAGE_SIZE);
 
   return (
     <div className="app-shell">
@@ -365,8 +482,8 @@ export default function App() {
         <nav aria-label="Instance views">
           <p className="eyebrow">Workspace</p>
           <button className={view === 'pack' ? 'nav-item active' : 'nav-item'} aria-current={view === 'pack' ? 'page' : undefined} onClick={() => setView('pack')}><span>▦</span><b>Pack</b><em>{data.packages.length}</em></button>
-          <button className={view === 'delta' ? 'nav-item active' : 'nav-item'} aria-current={view === 'delta' ? 'page' : undefined} onClick={() => setView('delta')}><span>≠</span><b>Instance delta</b><em>{data.delta.items.length}</em></button>
-          <button className={view === 'files' ? 'nav-item active' : 'nav-item'} aria-current={view === 'files' ? 'page' : undefined} onClick={() => setView('files')}><span>⌘</span><b>Files</b><em>{data.delta.items.length}</em></button>
+          <button className={view === 'delta' ? 'nav-item active' : 'nav-item'} aria-current={view === 'delta' ? 'page' : undefined} onClick={() => setView('delta')}><span>≠</span><b>Instance delta</b><em>{data.delta.loaded ? data.delta.items.length : '…'}</em></button>
+          <button className={view === 'files' ? 'nav-item active' : 'nav-item'} aria-current={view === 'files' ? 'page' : undefined} onClick={() => setView('files')}><span>⌘</span><b>Files</b><em>{data.delta.loaded ? data.delta.items.length : '…'}</em></button>
         </nav>
 
         <section className="feature-panel">
@@ -409,17 +526,17 @@ export default function App() {
         </> : view === 'delta' ? <>
           <div className="page-heading delta-heading"><div><p className="eyebrow">Semantic comparison</p><h1>Instance delta</h1><p>Package-aware changes, file changes and detected renames against the resolved layer.</p></div><TargetSelect layers={data.writable_layers} value={targetLayer} onChange={setTargetLayer} /></div>
 
-          <section className="delta-summary">{['add', 'remove', 'change', 'update', 'rename'].map((key) => <div key={key}><strong>{String(data.delta.summary[key] ?? data.delta.items.filter((item) => item.status === key).length)}</strong><span>{key}</span></div>)}</section>
+          <section className="delta-summary">{['add', 'remove', 'change', 'update', 'rename'].map((key) => <div key={key}><strong>{data.delta.loaded ? !data.delta.complete && ['change', 'update', 'rename'].includes(key) ? '?' : String(data.delta.summary[key] ?? data.delta.items.filter((item) => item.status === key).length) : '…'}</strong><span>{key}</span></div>)}</section>
 
-          {data.delta.items.length ? <div className="delta-list">{data.delta.items.map((item) => {
+          {!data.delta.loaded ? <Empty title="Loading instance delta">Inspecting local files and package metadata…</Empty> : data.delta.items.length ? <div className="delta-list"><p className="muted-copy" role="status">Showing {deltaPage.rendered} of {deltaPage.total} changes.</p>{deltaPage.items.map((item: DeltaItem) => {
             const presentation = deltaPresentation(item);
             const canReviewImport = canImportDelta(item) && data.capabilities.package_import;
-            return <article className={`delta-card delta-${item.kind}`} key={item.id}><span className={`change-kind ${presentation.tone}`}>{presentation.label}</span><div className="delta-copy"><div className="delta-title"><h2>{presentation.title}</h2><span>{item.kind}</span></div><code>{presentation.path}</code><p>{presentation.detail}</p>{(item.actual_version || item.desired_version) && item.status !== 'update' && <small>Local {item.actual_version || '?'} · desired {item.desired_version || '?'}</small>}{item.desired_sha256 && <small>Expected {item.desired_sha256.slice(0, 12)}…</small>}{item.actual_sha256 && <small>Local {item.actual_sha256.slice(0, 12)}…</small>}</div><div className="delta-actions">{!item.editable && <span className="readonly-pill">Read-only producer</span>}<button className="primary" disabled={!!busy || !item.editable || (!data.capabilities.capture && !data.capabilities.package_import) || !data.writable_layers.length} onClick={() => openCapture(item)}>{busy === `delta:${item.id}` ? 'Capturing…' : canReviewImport ? 'Review import' : 'Capture change'}</button></div></article>;
-          })}</div> : <Empty title="Instance matches the layer">There are no uncaptured semantic changes in this instance.</Empty>}
-        </> : <FileExplorer client={client} data={data} targetLayer={targetLayer} layers={data.writable_layers} onTargetLayer={setTargetLayer} onMutate={(label, action, success) => act(label, async () => await action() as Bootstrap, success)} onError={setError} />}
+            return <article className={`delta-card delta-${item.kind}`} key={item.id}><span className={`change-kind ${presentation.tone}`}>{presentation.label}</span><div className="delta-copy"><div className="delta-title"><h2>{presentation.title}</h2><span>{item.kind}</span></div><code>{presentation.path}</code><p>{presentation.detail}</p>{(item.actual_version || item.desired_version) && item.status !== 'update' && <small>Local {item.actual_version || '?'} · desired {item.desired_version || '?'}</small>}{item.desired_sha256 && <small>Expected {item.desired_sha256.slice(0, 12)}…</small>}{item.actual_sha256 && <small>Local {item.actual_sha256.slice(0, 12)}…</small>}</div><div className="delta-actions">{!item.editable && <span className="readonly-pill">Read-only producer</span>}<button className="primary" disabled={!!busy || !!detailBusy || !item.editable || (!data.capabilities.capture && !data.capabilities.package_import) || !data.writable_layers.length} onClick={() => void openCapture(item)}>{detailBusy === `${data.revision}:${item.id}` ? 'Inspecting…' : busy === `delta:${item.id}` ? 'Capturing…' : canReviewImport ? 'Review import' : 'Capture change'}</button></div></article>;
+          })}{deltaPage.rendered < deltaPage.total && <button className="secondary" onClick={() => setDeltaPageState({ key: deltaPageKey, limit: deltaPage.nextLimit })}>Load {Math.min(DELTA_PAGE_SIZE, deltaPage.total - deltaPage.rendered)} more</button>}</div> : <Empty title="Instance matches the layer">There are no uncaptured semantic changes in this instance.</Empty>}
+        </> : <FileExplorer client={client} data={data} targetLayer={targetLayer} layers={data.writable_layers} onTargetLayer={setTargetLayer} onMutate={(label, action, success) => act(label, async () => await action() as Bootstrap, success)} onCompactMutation={applyCompactMutation} onRevisionConflict={(reason) => refreshAfterConflict(reason as ApiError)} onError={setError} />}
       </main>
 
-      {captureDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setCaptureDraft(null)}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="capture-title"><header><div><p className="eyebrow">Semantic write</p><h2 id="capture-title">{deltaPresentation(captureDraft.item).title}</h2></div><button aria-label="Close" onClick={() => setCaptureDraft(null)}>×</button></header><div className="modal-body"><p>Only this semantic item will be written. Unrelated instance changes stay untouched.</p><TargetSelect layers={data.writable_layers} value={captureDraft.target} onChange={(target) => setCaptureDraft({ ...captureDraft, target })} />{canImportDelta(captureDraft.item) && data.capabilities.package_import && <fieldset><legend>Capture mode</legend><label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'import'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'import' })} /><span><strong>Import as package</strong><small>Use verified provider metadata or a local SHA-256 artifact.</small></span></label>{data.capabilities.capture && <label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'capture'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'capture' })} /><span><strong>Capture as file</strong><small>Preserve the change as a file operation.</small></span></label>}</fieldset>}{captureDraft.mode === 'import' && <ImportChoices draft={captureDraft} selectedCandidate={selectedCandidate} onChange={setCaptureDraft} />}{captureError && <div className="inline-error" role="alert">{captureError}</div>}</div><footer><button className="secondary" onClick={() => setCaptureDraft(null)}>Cancel</button><button className="primary" onClick={() => void submitCapture()}>{captureDraft.mode === 'import' ? 'Import package' : 'Capture change'}</button></footer></section></div>}
+      {captureDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeCapture()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="capture-title"><header><div><p className="eyebrow">Semantic write</p><h2 id="capture-title">{deltaPresentation(captureDraft.item).title}</h2></div><button aria-label="Close" onClick={closeCapture}>×</button></header><div className="modal-body"><p>Only this semantic item will be written. Unrelated instance changes stay untouched.</p><TargetSelect layers={data.writable_layers} value={captureDraft.target} onChange={(target) => setCaptureDraft({ ...captureDraft, target })} />{detailBusy && <div className="inline-error" role="status">Inspecting this file and checking package metadata…</div>}{!detailBusy && canImportDelta(captureDraft.item) && data.capabilities.package_import && <fieldset><legend>Capture mode</legend><label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'import'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'import' })} /><span><strong>Import as package</strong><small>Use verified provider metadata or a local SHA-256 artifact.</small></span></label>{data.capabilities.capture && <label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'capture'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'capture' })} /><span><strong>Capture as file</strong><small>Preserve the change as a file operation.</small></span></label>}</fieldset>}{!detailBusy && captureDraft.mode === 'import' && <ImportChoices draft={captureDraft} selectedCandidate={selectedCandidate} onChange={setCaptureDraft} />}{captureError && <div className="inline-error" role="alert"><span>{captureError}</span>{!captureDraft.item.enriched && <button className="secondary" onClick={() => void openCapture(captureDraft.item)}>Retry</button>}</div>}</div><footer><button className="secondary" onClick={closeCapture}>Cancel</button><button className="primary" disabled={!!detailBusy || !captureDraft.item.enriched} onClick={() => void submitCapture()}>{detailBusy ? 'Inspecting…' : captureDraft.mode === 'import' ? 'Import package' : 'Capture change'}</button></footer></section></div>}
 
       {featureDialog && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setFeatureDialog(false)}><section className="modal compact" role="dialog" aria-modal="true" aria-labelledby="feature-title"><header><div><p className="eyebrow">Temporary layer</p><h2 id="feature-title">Add feature</h2></div><button aria-label="Close" onClick={() => setFeatureDialog(false)}>×</button></header><div className="modal-body"><p>The instance will be relinked to a local temporary layer containing this feature.</p><label><span>Feature</span><select value={featureChoice} onChange={(event) => setFeatureChoice(event.target.value)}>{remainingFeatures.map((feature) => <option value={feature} key={feature}>{feature}</option>)}</select></label></div><footer><button className="secondary" onClick={() => setFeatureDialog(false)}>Cancel</button><button className="primary" disabled={!featureChoice} onClick={() => void addFeature()}>Add feature</button></footer></section></div>}
     </div>

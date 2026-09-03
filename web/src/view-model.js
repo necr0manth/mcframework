@@ -117,6 +117,16 @@ export function canImportDelta(item) {
     Boolean(item.jar_metadata?.mod_ids?.length);
 }
 
+export function paginateDelta(items, limit, pageSize = 200) {
+  const rendered = Math.min(items.length, limit);
+  return {
+    items: items.slice(0, rendered),
+    rendered,
+    total: items.length,
+    nextLimit: Math.min(items.length, rendered + pageSize),
+  };
+}
+
 export function providerMatchFor(candidate, fuzzyConfirmed) {
   if (!candidate) return undefined;
   if (candidate.confidence === 'fuzzy' && !fuzzyConfirmed) {

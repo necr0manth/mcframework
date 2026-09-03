@@ -93,7 +93,7 @@ function normalizeSection(item, index) {
   };
 }
 
-function normalizeDeltaItem(item, index) {
+export function normalizeDeltaItem(item, index = 0) {
   const value = asObject(item);
   const status = text(value.status ?? value.change ?? value.kind, 'changed').toLowerCase();
   const path = text(value.path ?? value.destination);
@@ -136,6 +136,7 @@ function normalizeDeltaItem(item, index) {
       };
     }),
     editable: value.editable !== false,
+    enriched: value.enriched !== false,
     capture_modes: Array.isArray(value.capture_modes) ? value.capture_modes.map(String) : [],
     reason: text(value.reason),
   };
@@ -201,6 +202,9 @@ export function normalizeBootstrap(payload) {
     delta: {
       items: asList(deltaValue.items).map(normalizeDeltaItem),
       summary: asObject(deltaValue.summary),
+      loaded: deltaValue.loaded !== false,
+      complete: deltaValue.complete !== false,
+      revision: Number(deltaValue.revision ?? root.revision ?? 0),
     },
     writable_layers: writableLayers,
     feature_candidates: Array.isArray(root.feature_candidates)
@@ -215,6 +219,48 @@ export function errorMessage(payload, fallback = 'Request failed') {
   return text(error.message, fallback);
 }
 
+export function createRevisionedDeltaLoader(loadDelta) {
+  let current = null;
+  return {
+    load(revision) {
+      if (current?.revision !== revision) {
+        const promise = Promise.resolve(loadDelta());
+        current = { revision, promise };
+        void promise.catch(() => {
+          if (current?.revision === revision && current.promise === promise) current = null;
+        });
+      }
+      return current.promise;
+    },
+  };
+}
+
+export function createKeyedRequestLoader(loadValue) {
+  const requests = new Map();
+  return {
+    load(key, ...args) {
+      if (!requests.has(key)) {
+        const promise = Promise.resolve(loadValue(...args));
+        requests.set(key, promise);
+        void promise.catch(() => {
+          if (requests.get(key) === promise) requests.delete(key);
+        });
+      }
+      return requests.get(key);
+    },
+    invalidate(key) {
+      requests.delete(key);
+    },
+  };
+}
+
+export function mergeDeltaForRevision(current, revision, delta) {
+  const responseRevision = Number(delta?.revision ?? revision);
+  return current?.revision === revision && responseRevision === revision
+    ? { ...current, delta }
+    : current;
+}
+
 export class ApiClient {
   constructor(fetchImpl = fetch) {
     this.fetchImpl = fetchImpl;
@@ -223,17 +269,18 @@ export class ApiClient {
   }
 
   async request(path, options = {}) {
+    const { revision = this.revision, ...requestOptions } = options;
     const headers = new Headers(options.headers || {});
     headers.set('Accept', 'application/json');
     if (options.body !== undefined) headers.set('Content-Type', 'application/json');
     if (this.csrf && options.method && options.method !== 'GET') {
       headers.set('X-Mcpack-CSRF', this.csrf);
-      if (this.revision === null) throw new Error('Bootstrap revision is unavailable');
-      headers.set('If-Match', `"${this.revision}"`);
+      if (revision === null) throw new Error('Bootstrap revision is unavailable');
+      headers.set('If-Match', `"${revision}"`);
     }
 
     const response = await this.fetchImpl(path, {
-      ...options,
+      ...requestOptions,
       headers,
       credentials: 'same-origin',
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
@@ -262,6 +309,22 @@ export class ApiClient {
     return this.remember(await this.request('/api/v1/bootstrap'));
   }
 
+  async delta() {
+    const payload = await this.request('/api/v1/delta');
+    return normalizeBootstrap({ delta: payload }).delta;
+  }
+
+  async deltaItem(id, revision) {
+    const query = new URLSearchParams({ revision: String(revision) });
+    const payload = asObject(await this.request(
+      `/api/v1/delta/${encodeURIComponent(id)}?${query}`,
+    ));
+    return {
+      revision: Number(payload.revision ?? 0),
+      item: normalizeDeltaItem(payload.item),
+    };
+  }
+
   async addFeature(feature) {
     return this.remember(await this.request('/api/v1/features', { method: 'POST', body: { feature } }));
   }
@@ -288,9 +351,10 @@ export class ApiClient {
     return this.remember(await this.request(`/api/v1/sections/${encodeURIComponent(id)}/activation`, { method: 'PATCH', body }));
   }
 
-  async capture(deltaId, targetLayer) {
+  async capture(deltaId, targetLayer, expectedSha256) {
     const body = {};
     if (targetLayer) body.target_layer = targetLayer;
+    if (expectedSha256) body.expected_sha256 = expectedSha256;
     return this.remember(await this.request(`/api/v1/delta/${encodeURIComponent(deltaId)}/capture`, { method: 'POST', body }));
   }
 
@@ -312,11 +376,42 @@ export class ApiClient {
     return this.request(`/api/v1/files/plan?${query}`);
   }
 
-  async capturePath(path, targetLayer, decisions = {}) {
-    const body = { path, decisions };
+  async autoCapturePath(path, targetLayer) {
+    const body = { path, auto_payload: true };
+    if (targetLayer) body.target_layer = targetLayer;
+    const payload = asObject(await this.request('/api/v1/files/capture', {
+      method: 'POST', body,
+    }));
+    const revision = Number(payload.revision);
+    if (!Number.isInteger(revision) || revision < 0) {
+      throw new Error('Capture response revision is invalid');
+    }
+    if (payload.applied !== true && payload.applied !== false) {
+      throw new Error('Capture response applied state is invalid');
+    }
+    const explorerPatch = asObject(payload.explorer_patch);
+    if (payload.applied && (
+      typeof explorerPatch.path !== 'string'
+      || !Number.isInteger(Number(explorerPatch.captured_count))
+      || Number(explorerPatch.captured_count) < 0
+    )) {
+      throw new Error('Capture response explorer patch is invalid');
+    }
+    this.revision = revision;
+    return {
+      ok: payload.ok === true,
+      applied: payload.applied,
+      revision,
+      explorer_patch: explorerPatch,
+      decision_required: asObject(payload.decision_required),
+    };
+  }
+
+  async capturePath(path, targetLayer, planRevision, decisions) {
+    const body = { path, plan_revision: planRevision, decisions };
     if (targetLayer) body.target_layer = targetLayer;
     return this.remember(await this.request('/api/v1/files/capture', {
-      method: 'POST', body,
+      method: 'POST', body, revision: planRevision,
     }));
   }
 
@@ -336,10 +431,11 @@ export class ApiClient {
     }));
   }
 
-  async importPackage(deltaId, targetLayer, providerMatch) {
+  async importPackage(deltaId, targetLayer, providerMatch, expectedSha256) {
     const body = { delta_id: deltaId };
     if (targetLayer) body.target_layer = targetLayer;
     if (providerMatch) body.provider_match = providerMatch;
+    if (expectedSha256) body.expected_sha256 = expectedSha256;
     return this.remember(await this.request('/api/v1/packages/import', { method: 'POST', body }));
   }
 
@@ -359,6 +455,32 @@ export class ApiError extends Error {
     this.status = status;
     this.code = code;
     this.details = details;
+  }
+}
+
+export async function runAutoCaptureFlow({
+  client,
+  path,
+  targetLayer,
+  onApplied,
+  onDecisionRequired,
+  onRevisionConflict,
+}) {
+  try {
+    const result = await client.autoCapturePath(path, targetLayer);
+    if (result.applied) {
+      await onApplied(result);
+      return { state: 'applied', result };
+    }
+    const plan = await client.filePlan(path, targetLayer);
+    await onDecisionRequired(plan, result);
+    return { state: 'decision_required', result, plan };
+  } catch (error) {
+    if (error instanceof ApiError && error.code === 'revision_conflict') {
+      await onRevisionConflict(error);
+      return { state: 'conflict', error };
+    }
+    throw error;
   }
 }
 

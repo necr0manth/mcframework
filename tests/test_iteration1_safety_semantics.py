@@ -20,6 +20,7 @@ from mcframework.package_inspect import (
     inspect_jar,
 )
 from mcframework.project import ProjectService
+from mcframework.transport import LocalFilesystemInstance
 
 
 def outside(project: Path, suffix: str = "game") -> Path:
@@ -294,6 +295,203 @@ def test_semantic_package_delta_rename_and_provider_candidates(
         "local",
         "modrinth",
     }
+
+
+def test_quick_delta_defers_bulk_jar_work_and_marks_unknown_semantics(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer_factory("client", operations=[])
+    game = outside(tmp_path)
+    (game / "mods").mkdir(parents=True)
+    for index in range(4):
+        (game / "mods" / f"extra-{index}.jar").write_bytes(b"not read")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("quick delta must not enrich actual-only files")
+
+    monkeypatch.setattr("mcframework.project.LocalFilesystemInstance.read", fail)
+    monkeypatch.setattr("mcframework.project.inspect_jar", fail)
+    monkeypatch.setattr(service, "_provider_candidates", fail)
+
+    delta = service.instance_diff(service.instance_context("dev"), enrich_actual=False)
+    assert delta["complete"] is False
+    assert delta["summary"]["change"] is None
+    assert delta["summary"]["rename"] is None
+    assert delta["summary"]["update"] is None
+    assert len(delta["items"]) == 4
+    assert all(item["kind"] == "package" for item in delta["items"])
+    assert all(item["capture_modes"] == ["package", "payload"] for item in delta["items"])
+    assert all(item["enriched"] is False for item in delta["items"])
+
+
+def test_quick_changed_package_count_is_unknown_until_detail(
+    layer_factory, tmp_path: Path
+) -> None:
+    desired = jar({"fabric.mod.json": '{"id":"mod","version":"1.0"}'})
+    actual = jar({"fabric.mod.json": '{"id":"mod","version":"2.0"}'})
+    (tmp_path / "mod.jar").write_bytes(desired)
+    layer_factory(
+        "client",
+        operations=[
+            {
+                "type": "package",
+                "id": "mod",
+                "version": "1.0",
+                "activation": "enabled",
+                "destination": "mods/mod.jar",
+                "source": {
+                    "provider": "local",
+                    "location": "mod.jar",
+                    "sha256": hashlib.sha256(desired).hexdigest(),
+                },
+            }
+        ],
+    )
+    game = outside(tmp_path)
+    (game / "mods").mkdir(parents=True)
+    (game / "mods/mod.jar").write_bytes(actual)
+    service = ProjectService(tmp_path, provider_matcher=NoMatch())
+    service.link("client", "dev", game)
+
+    quick = service.instance_diff(service.instance_context("dev"), enrich_actual=False)
+    assert quick["summary"]["change"] is None
+    assert quick["items"][0]["status"] == "change"
+    detail = service.delta_detail("dev", str(quick["items"][0]["id"]))
+    assert detail["status"] == "update"
+
+
+def test_full_rename_id_capture_preserves_offline_semantics(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer_factory("client", operations=[], payload={"old-name.txt": "same"})
+    game = outside(tmp_path)
+    game.mkdir()
+    (game / "new-name.txt").write_text("same")
+    (game / "unrelated.jar").write_bytes(b"not a jar")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+    full = service.instance_diff(service.instance_context("dev"))
+    rename = next(item for item in full["items"] if item["status"] == "rename")
+    original_read = LocalFilesystemInstance.read
+
+    def selected_only(transport: LocalFilesystemInstance, path: str) -> bytes:
+        assert path != "unrelated.jar"
+        return original_read(transport, path)
+
+    def fail(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("rename capture must not enrich unrelated actual files")
+
+    monkeypatch.setattr(LocalFilesystemInstance, "read", selected_only)
+    monkeypatch.setattr("mcframework.project.inspect_jar", fail)
+    monkeypatch.setattr(service, "_provider_candidates", fail)
+
+    service.capture_delta(
+        "dev",
+        str(rename["id"]),
+        rename_to_path=str(rename["to_path"]),
+    )
+
+    refreshed = service.instance_context("dev")
+    assert refreshed.files["new-name.txt"] == b"same"
+    assert "old-name.txt" not in refreshed.files
+    remaining_paths = {
+        item["path"]
+        for item in service.instance_diff(refreshed, enrich_actual=False)["items"]
+    }
+    assert remaining_paths.isdisjoint({"new-name.txt", "old-name.txt"})
+
+
+def test_delta_detail_enriches_only_selected_jar_and_preserves_id(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer_factory("client", operations=[])
+    game = outside(tmp_path)
+    (game / "mods").mkdir(parents=True)
+    selected = jar({"fabric.mod.json": '{"id":"selected","version":"1"}'})
+    unrelated = jar({"fabric.mod.json": '{"id":"unrelated","version":"1"}'})
+    (game / "mods/selected.jar").write_bytes(selected)
+    (game / "mods/unrelated.jar").write_bytes(unrelated)
+    matcher = ExactMatch()
+    service = ProjectService(tmp_path, provider_matcher=matcher)
+    service.link("client", "dev", game)
+    quick = service.instance_diff(service.instance_context("dev"), enrich_actual=False)
+    quick_item = next(item for item in quick["items"] if item["path"] == "mods/selected.jar")
+    reads: list[str] = []
+    original_read = LocalFilesystemInstance.read
+
+    def record_read(transport: LocalFilesystemInstance, path: str) -> bytes:
+        reads.append(path)
+        return original_read(transport, path)
+
+    monkeypatch.setattr(LocalFilesystemInstance, "read", record_read)
+    detail = service.delta_detail("dev", str(quick_item["id"]))
+
+    assert reads == ["mods/selected.jar"]
+    assert matcher.calls == 1
+    assert detail["id"] == quick_item["id"]
+    assert detail["enriched"] is True
+    assert detail["actual_sha256"] == hashlib.sha256(selected).hexdigest()
+    assert detail["jar_metadata"]["mod_ids"] == ["selected"]
+
+
+def test_capture_and_import_reject_stale_selected_sha_without_writes(
+    layer_factory, tmp_path: Path
+) -> None:
+    layer_factory("client", operations=[])
+    game = outside(tmp_path)
+    (game / "mods").mkdir(parents=True)
+    first = jar({"fabric.mod.json": '{"id":"first","version":"1"}'})
+    second = jar({"fabric.mod.json": '{"id":"second","version":"1"}'})
+    path = game / "mods/extra.jar"
+    path.write_bytes(first)
+    service = ProjectService(tmp_path, provider_matcher=NoMatch())
+    service.link("client", "dev", game)
+    quick = service.instance_diff(service.instance_context("dev"), enrich_actual=False)["items"][0]
+    detail = service.delta_detail("dev", str(quick["id"]))
+    path.write_bytes(second)
+
+    with pytest.raises(MetadataError, match="changed before mutation"):
+        service.capture_delta(
+            "dev",
+            str(quick["id"]),
+            expected_sha256=str(detail["actual_sha256"]),
+        )
+    with pytest.raises(MetadataError, match="changed before mutation"):
+        service.import_package(
+            "dev",
+            str(quick["id"]),
+            expected_sha256=str(detail["actual_sha256"]),
+        )
+    assert not service.state.feature_root("dev").exists()
+
+
+def test_capture_reconciliation_never_uses_full_enrichment(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer_factory("client", operations=[], payload={"config/value.txt": "old"})
+    game = outside(tmp_path)
+    (game / "config").mkdir(parents=True)
+    (game / "config/value.txt").write_text("new")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+    quick = service.instance_diff(service.instance_context("dev"), enrich_actual=False)["items"][0]
+    original_diff = service.instance_diff
+
+    def quick_only(context: object, **kwargs: object) -> dict[str, object]:
+        assert kwargs.get("enrich_actual") is False
+        return original_diff(context, **kwargs)  # type: ignore[arg-type,return-value]
+
+    monkeypatch.setattr(service, "instance_diff", quick_only)
+    service.capture_delta(
+        "dev",
+        str(quick["id"]),
+        expected_sha256=str(quick["actual_sha256"]),
+    )
+    assert service.instance_context("dev").files["config/value.txt"] == b"new"
 
 
 def test_import_defaults_local_but_accepts_explicit_exact_provider(

@@ -5,6 +5,7 @@ import json
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -13,10 +14,61 @@ from mcframework.errors import MetadataError
 from mcframework.local_state import LocalState
 from mcframework.project import ProjectService
 from mcframework.web_process import start_web, stop_web
+from mcframework.web_server import McpackServer
 
 
 def game_path(project: Path, name: str = "game") -> Path:
     return project.parent / f"{project.name}-{name}"
+
+
+def test_fast_bootstrap_skips_delta_and_server_delta_runs_full_diff_once(
+    layer_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layer_factory("client", operations=[])
+    game = game_path(tmp_path)
+    game.mkdir()
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+
+    def fail_diff(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("fast bootstrap must not calculate instance delta")
+
+    monkeypatch.setattr(service, "instance_diff", fail_diff)
+    bootstrap = service.bootstrap("dev", include_delta=False)
+    assert bootstrap["delta"] == {
+        "items": [],
+        "summary": {
+            "add": 0,
+            "remove": 0,
+            "change": 0,
+            "update": 0,
+            "rename": 0,
+            "ignored": 0,
+        },
+        "loaded": False,
+        "complete": False,
+    }
+
+    fake_service = Mock()
+    fake_service.bootstrap.return_value = {"delta": {}}
+    fake_service.instance_context.return_value = object()
+    fake_service.instance_diff.return_value = {"items": [], "summary": {}, "complete": False}
+    server = object.__new__(McpackServer)
+    server.service = fake_service
+    server.instance = "dev"
+    server.csrf = "csrf"
+    server.revision = 4
+
+    assert server.bootstrap()["delta"] == {}
+    fake_service.bootstrap.assert_called_once_with("dev", include_delta=False)
+    assert server.delta()["loaded"] is True
+    fake_service.instance_diff.assert_called_once_with(
+        fake_service.instance_context.return_value,
+        enrich_actual=False,
+    )
 
 
 def test_init_layer_creates_only_minimal_marker_and_refuses_existing_content(
@@ -228,7 +280,9 @@ def test_web_background_singleton_bootstrap_and_idempotent_stop(
     layer_factory("client", operations=[], payload={"config/a": "one"})
     layer_factory("optional", operations=[], payload={"config/b": "two"})
     service = ProjectService(tmp_path)
-    service.link("client", "dev", game_path(tmp_path))
+    game = game_path(tmp_path)
+    service.link("client", "dev", game)
+    (game / "extra.txt").write_text("extra")
     url = start_web(tmp_path, "dev")
     base = url.split("?", 1)[0]
     try:
@@ -239,6 +293,44 @@ def test_web_background_singleton_bootstrap_and_idempotent_stop(
             bootstrap = json.loads(response.read())
         assert bootstrap["instance"]["name"] == "dev"
         assert bootstrap["link"]["branch"] == "client"
+        with opener.open(base + "api/v1/delta", timeout=3) as response:
+            delta = json.loads(response.read())
+        assert delta["complete"] is False
+        assert delta["revision"] == bootstrap["revision"]
+        extra = next(item for item in delta["items"] if item["path"] == "extra.txt")
+        detail_url = (
+            base
+            + f"api/v1/delta/{extra['id']}?revision={bootstrap['revision']}"
+        )
+        with opener.open(detail_url, timeout=3) as response:
+            detail = json.loads(response.read())
+        assert detail["revision"] == bootstrap["revision"]
+        assert detail["item"]["actual_sha256"] == hashlib.sha256(b"extra").hexdigest()
+        with pytest.raises(urllib.error.HTTPError) as unauthorized_detail:
+            urllib.request.urlopen(detail_url, timeout=3)
+        assert unauthorized_detail.value.code == 401
+        with pytest.raises(urllib.error.HTTPError) as stale_detail:
+            opener.open(
+                base + f"api/v1/delta/{extra['id']}?revision=-1",
+                timeout=3,
+            )
+        assert stale_detail.value.code == 409
+        missing_sha = urllib.request.Request(
+            base + f"api/v1/delta/{extra['id']}/capture",
+            data=b"{}",
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Mcpack-CSRF": bootstrap["csrf"],
+                "If-Match": f'"{bootstrap["revision"]}"',
+                "Origin": base.rstrip("/"),
+            },
+        )
+        with pytest.raises(urllib.error.HTTPError) as missing_sha_response:
+            opener.open(missing_sha, timeout=3)
+        assert missing_sha_response.value.code == 400
+        assert (game / "extra.txt").read_text() == "extra"
+        assert not (service.state.feature_root("dev") / "extra.txt").exists()
         running = LocalState(tmp_path).read_web("dev")
         assert running is not None
         assert "browser_capability" not in running

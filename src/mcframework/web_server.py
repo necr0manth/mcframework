@@ -9,13 +9,14 @@ import secrets
 import sys
 import threading
 import time
+import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .errors import FrameworkError, MetadataError
-from .local_state import LocalState
+from .local_state import LocalState, WebServerLockContended
 from .project import ProjectService
 from .sync import Synchronizer
 from .transport import LocalFilesystemInstance
@@ -25,45 +26,61 @@ class McpackServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, project: Path, instance: str, nonce: str):
-        super().__init__(("127.0.0.1", 0), Handler)
         self.project = project
         self.instance = instance
         self.nonce = nonce
         self.state = LocalState(project)
-        self.service = ProjectService(project)
         reservation = self.state.read_web(instance)
         if reservation is None or reservation.get("status") != "starting":
             raise MetadataError("web reservation no longer exists")
         if reservation.get("nonce") != nonce:
             raise MetadataError("web reservation was replaced")
-        self.management_token = str(reservation["management_token"])
-        self.browser_capability: str | None = str(reservation["browser_capability"])
-        self.browser_session = secrets.token_urlsafe(32)
-        self.auth_lock = threading.Lock()
-        self.csrf = secrets.token_urlsafe(24)
-        self.revision = 0
-        self.expected_host = f"127.0.0.1:{self.server_port}"
-        with self.state.lock():
-            latest = self.state.read_web(instance)
-            if latest is None or latest.get("status") != "starting" or latest.get("nonce") != nonce:
-                raise MetadataError("web reservation changed before startup")
-            self.state.write_web(
-                instance,
-                {
-                    "status": "running",
-                    "nonce": nonce,
-                    "management_token": self.management_token,
-                    "csrf": self.csrf,
-                    "pid": os.getpid(),
-                    "port": self.server_port,
-                    "started_at": time.time(),
-                    "revision": self.revision,
-                },
-            )
+        super().__init__(("127.0.0.1", 0), Handler)
+        try:
+            self.service = ProjectService(project)
+            self.management_token = str(reservation["management_token"])
+            self.browser_capability: str | None = str(reservation["browser_capability"])
+            self.browser_session = secrets.token_urlsafe(32)
+            self.auth_lock = threading.Lock()
+            self.csrf = secrets.token_urlsafe(24)
+            self.revision = 0
+            self.expected_host = f"127.0.0.1:{self.server_port}"
+            with self.state.lock():
+                latest = self.state.read_web(instance)
+                if (
+                    latest is None
+                    or latest.get("status") != "starting"
+                    or latest.get("nonce") != nonce
+                ):
+                    raise MetadataError("web reservation changed before startup")
+                self.state.write_web(
+                    instance,
+                    {
+                        "status": "running",
+                        "nonce": nonce,
+                        "management_token": self.management_token,
+                        "csrf": self.csrf,
+                        "pid": os.getpid(),
+                        "port": self.server_port,
+                        "started_at": time.time(),
+                        "revision": self.revision,
+                    },
+                )
+        except Exception:
+            self.server_close()
+            raise
 
     def bootstrap(self) -> dict[str, object]:
-        result = self.service.bootstrap(self.instance)
+        result = self.service.bootstrap(self.instance, include_delta=False)
         result["csrf"] = self.csrf
+        result["revision"] = self.revision
+        return result
+
+    def delta(self) -> dict[str, object]:
+        context = self.service.instance_context(self.instance)
+        result = self.service.instance_diff(context, enrich_actual=False)
+        result["loaded"] = True
+        result["complete"] = False
         result["revision"] = self.revision
         return result
 
@@ -129,6 +146,23 @@ class Handler(BaseHTTPRequestHandler):
                 with self.server.state.mutation_lock(self.server.instance):
                     self._json(self.server.bootstrap())
                 return
+            if parsed.path == "/api/v1/delta":
+                with self.server.state.mutation_lock(self.server.instance):
+                    self._json(self.server.delta())
+                return
+            if parsed.path.startswith("/api/v1/delta/"):
+                delta_id = unquote(parsed.path.removeprefix("/api/v1/delta/"))
+                query = parse_qs(parsed.query)
+                expected_revision = self._query_integer(query, "revision", -1)
+                with self.server.state.mutation_lock(self.server.instance):
+                    if expected_revision != self.server.revision:
+                        raise RevisionConflict(expected_revision, self.server.revision)
+                item = self.server.service.delta_detail(self.server.instance, delta_id)
+                with self.server.state.mutation_lock(self.server.instance):
+                    if expected_revision != self.server.revision:
+                        raise RevisionConflict(expected_revision, self.server.revision)
+                self._json({"revision": expected_revision, "item": item})
+                return
             if parsed.path == "/api/v1/files":
                 query = parse_qs(parsed.query)
                 with self.server.state.mutation_lock(self.server.instance):
@@ -148,18 +182,26 @@ class Handler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 path = query.get("path", [""])[0]
                 with self.server.state.mutation_lock(self.server.instance):
-                    self._json(
-                        self.server.service.explorer_plan(
-                            self.server.instance,
-                            path,
-                            query.get("target_layer", [None])[0],
-                        )
+                    plan = self.server.service.explorer_plan(
+                        self.server.instance,
+                        path,
+                        query.get("target_layer", [None])[0],
                     )
+                    plan["revision"] = self.server.revision
+                    self._json(plan)
                 return
             self._static(parsed.path)
+        except RevisionConflict as exc:
+            self._error(
+                HTTPStatus.CONFLICT,
+                "revision_conflict",
+                str(exc),
+                {"expected": exc.expected, "actual": exc.actual},
+            )
         except FrameworkError as exc:
             self._error(HTTPStatus.BAD_REQUEST, "framework_error", str(exc))
         except Exception:
+            self.log_error("unexpected GET failure\n%s", traceback.format_exc())
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error", "internal server error")
 
     def do_POST(self) -> None:
@@ -180,10 +222,58 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._require_mutation_auth()
             with self.server.state.mutation_lock(self.server.instance):
-                self._require_revision()
+                request_revision = self._require_revision()
                 body = self._read_json()
+                if parsed.path == "/api/v1/files/capture":
+                    auto_payload = body.get("auto_payload", False)
+                    if not isinstance(auto_payload, bool):
+                        raise MetadataError("auto_payload must be a boolean")
+                    if auto_payload:
+                        result = self.server.service.capture_explorer_path(
+                            self.server.instance,
+                            self._string(body, "path"),
+                            self._optional_string(body, "target_layer"),
+                            auto_payload=True,
+                        )
+                        if not isinstance(result, dict):
+                            raise RuntimeError("auto payload capture returned no result")
+                        if result["applied"]:
+                            self.server.commit_revision()
+                            self._json(
+                                {
+                                    "ok": True,
+                                    "applied": True,
+                                    "revision": self.server.revision,
+                                    "explorer_patch": {
+                                        "path": result["path"],
+                                        "captured_count": result["captured_count"],
+                                    },
+                                }
+                            )
+                        else:
+                            self._json(
+                                {
+                                    "ok": True,
+                                    "applied": False,
+                                    "revision": self.server.revision,
+                                    "decision_required": {
+                                        "path": result["path"],
+                                        "items": result["items"],
+                                    },
+                                }
+                            )
+                        return
+                    plan_revision = body.get("plan_revision")
+                    if not isinstance(plan_revision, int) or isinstance(plan_revision, bool):
+                        raise MetadataError("plan_revision must be an integer")
+                    if plan_revision != request_revision or plan_revision != self.server.revision:
+                        raise RevisionConflict(plan_revision, self.server.revision)
                 should_shutdown = self._dispatch_mutation(method, parsed.path, body)
-                self.server.service.invalidate_explorer(self.server.instance)
+                if parsed.path not in {
+                    "/api/v1/files/capture",
+                    "/api/v1/files/ignore",
+                }:
+                    self.server.service.invalidate_explorer(self.server.instance)
                 self.server.commit_revision()
                 if should_shutdown:
                     self._json({"ok": True, "revision": self.server.revision})
@@ -202,6 +292,7 @@ class Handler(BaseHTTPRequestHandler):
         except (UnicodeError, json.JSONDecodeError) as exc:
             self._error(HTTPStatus.BAD_REQUEST, "invalid_json", str(exc))
         except Exception:
+            self.log_error("unexpected mutation failure\n%s", traceback.format_exc())
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "internal_error", "internal server error")
 
     def _dispatch_mutation(self, method: str, path: str, body: dict[str, object]) -> bool:
@@ -239,7 +330,11 @@ class Handler(BaseHTTPRequestHandler):
         elif method == "POST" and route.startswith("delta/") and route.endswith("/capture"):
             delta_id = unquote(route[len("delta/") : -len("/capture")])
             self.server.service.capture_delta(
-                self.server.instance, delta_id, self._optional_string(body, "target_layer")
+                self.server.instance,
+                delta_id,
+                self._optional_string(body, "target_layer"),
+                expected_sha256=self._optional_string(body, "expected_sha256"),
+                require_expected_sha256=True,
             )
         elif method == "POST" and route == "files/capture":
             self.server.service.capture_explorer_path(
@@ -267,6 +362,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._string(body, "delta_id"),
                 self._optional_string(body, "target_layer"),
                 self._optional_provider_match(body),
+                expected_sha256=self._string(body, "expected_sha256"),
             )
         elif method == "POST" and route == "sync":
             context = self.server.service.instance_context(self.server.instance)
@@ -292,7 +388,7 @@ class Handler(BaseHTTPRequestHandler):
         if origin != f"http://{self.server.expected_host}":
             raise MetadataError("invalid Origin header")
 
-    def _require_revision(self) -> None:
+    def _require_revision(self) -> int:
         value = self.headers.get("If-Match", "")
         if len(value) < 3 or not value.startswith('"') or not value.endswith('"'):
             raise RevisionConflict(-1, self.server.revision)
@@ -302,6 +398,7 @@ class Handler(BaseHTTPRequestHandler):
         expected = int(raw)
         if expected != self.server.revision:
             raise RevisionConflict(expected, self.server.revision)
+        return expected
 
     def _cookie_valid(self) -> bool:
         cookies = {}
@@ -415,18 +512,25 @@ def main(argv: list[str] | None = None) -> int:
     if len(arguments) != 3:
         return 2
     project, instance, nonce = Path(arguments[0]).resolve(), arguments[1], arguments[2]
+    state = LocalState(project)
     server: McpackServer | None = None
     try:
-        server = McpackServer(project, instance, nonce)
-        server.serve_forever(poll_interval=0.1)
-        return 0
-    except Exception as exc:
-        print(f"web server error: {exc}", file=sys.stderr)
-        return 2
-    finally:
-        if server is not None:
-            server.server_close()
-        state = LocalState(project)
+        with state.web_server_lock():
+            try:
+                server = McpackServer(project, instance, nonce)
+                server.serve_forever(poll_interval=0.1)
+                return 0
+            finally:
+                if server is not None:
+                    server.server_close()
+                try:
+                    with state.lock():
+                        current = state.read_web(instance)
+                        if current is not None and current.get("nonce") == nonce:
+                            state.web_path(instance).unlink(missing_ok=True)
+                except FrameworkError:
+                    pass
+    except WebServerLockContended as exc:
         try:
             with state.lock():
                 current = state.read_web(instance)
@@ -434,6 +538,11 @@ def main(argv: list[str] | None = None) -> int:
                     state.web_path(instance).unlink(missing_ok=True)
         except FrameworkError:
             pass
+        print(f"web server error: {exc}", file=sys.stderr)
+        return 2
+    except Exception as exc:
+        print(f"web server error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

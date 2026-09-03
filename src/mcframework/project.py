@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
-import shutil
+import stat
 import tempfile
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,7 +23,7 @@ from .artifacts import (
 )
 from .build import Builder
 from .errors import MetadataError
-from .explorer import ExplorerSnapshot, build_snapshot
+from .explorer import ExplorerSnapshot, build_snapshot, scan_generation_matches, scan_instance
 from .loader import MARKER_FILE, METADATA_DIR, WorkspaceLoader
 from .local_state import InstanceRecord, LinkRecord, LocalState, validate_name
 from .model import Activation, IgnoreSelector, PackState, Resolution, SelectorKind
@@ -262,10 +265,15 @@ class ProjectService:
         return InstanceContext(instances[name], link, features, parameters, resolution, files)
 
     def instance_diff(
-        self, context: InstanceContext, *, respect_ignore: bool = True
+        self,
+        context: InstanceContext,
+        *,
+        respect_ignore: bool = True,
+        enrich_actual: bool = True,
+        existing_files: frozenset[str] | set[str] | None = None,
     ) -> dict[str, Any]:
         transport = LocalFilesystemInstance(context.instance.path)
-        existing = set(transport.list_files())
+        existing = set(transport.list_files()) if existing_files is None else set(existing_files)
         desired = set(context.files)
         items: list[dict[str, Any]] = []
         summary = {
@@ -285,47 +293,51 @@ class ProjectService:
                 summary["ignored"] += 1
         desired_only = desired - existing - ignored
         actual_only = existing - desired - ignored
-        actual_content = {path: transport.read(path) for path in actual_only}
         desired_hashes = {
             path: hashlib.sha256(context.files[path]).hexdigest() for path in desired_only
         }
-        actual_hashes = {
-            path: hashlib.sha256(content).hexdigest() for path, content in actual_content.items()
-        }
-        used_actual: set[str] = set()
-        for path in sorted(tuple(desired_only)):
-            candidates = [
-                item
-                for item in actual_only - used_actual
-                if actual_hashes[item] == desired_hashes[path]
-            ]
-            reverse_count = sum(
-                1 for item in desired_only if desired_hashes[item] == desired_hashes[path]
-            )
-            if len(candidates) != 1 or reverse_count != 1:
-                continue
-            source_path = candidates[0]
-            used_actual.add(source_path)
-            desired_only.remove(path)
-            package = self._package_for_path(context, path)
-            item = self._delta_item(
-                context,
-                "rename",
-                source_path,
-                package_id=package.identity if package else None,
-            )
-            item.update(
-                {
-                    "from_path": source_path,
-                    "to_path": path,
-                    "desired_sha256": desired_hashes[path],
-                    "actual_sha256": actual_hashes[source_path],
-                    "capture_modes": ["rename"],
-                }
-            )
-            items.append(item)
-            summary["rename"] += 1
-        actual_only -= used_actual
+        actual_content: dict[str, bytes] = {}
+        actual_hashes: dict[str, str] = {}
+        if enrich_actual:
+            actual_content = {path: transport.read(path) for path in actual_only}
+            actual_hashes = {
+                path: hashlib.sha256(content).hexdigest()
+                for path, content in actual_content.items()
+            }
+            used_actual: set[str] = set()
+            for path in sorted(tuple(desired_only)):
+                candidates = [
+                    item
+                    for item in actual_only - used_actual
+                    if actual_hashes[item] == desired_hashes[path]
+                ]
+                reverse_count = sum(
+                    1 for item in desired_only if desired_hashes[item] == desired_hashes[path]
+                )
+                if len(candidates) != 1 or reverse_count != 1:
+                    continue
+                source_path = candidates[0]
+                used_actual.add(source_path)
+                desired_only.remove(path)
+                package = self._package_for_path(context, path)
+                item = self._delta_item(
+                    context,
+                    "rename",
+                    source_path,
+                    package_id=package.identity if package else None,
+                )
+                item.update(
+                    {
+                        "from_path": source_path,
+                        "to_path": path,
+                        "desired_sha256": desired_hashes[path],
+                        "actual_sha256": actual_hashes[source_path],
+                        "capture_modes": ["rename"],
+                    }
+                )
+                items.append(item)
+                summary["rename"] += 1
+            actual_only -= used_actual
 
         for path in sorted(desired_only):
             package = self._package_for_path(context, path)
@@ -337,18 +349,28 @@ class ProjectService:
             )
             item["desired_sha256"] = hashlib.sha256(context.files[path]).hexdigest()
             item["capture_modes"] = ["activation"] if package else ["remove"]
+            item["enriched"] = enrich_actual
             items.append(item)
             summary["remove"] += 1
 
         for path in sorted(actual_only):
             package_metadata = (
                 inspect_jar(context.instance.path / Path(path))
-                if path.lower().endswith(".jar")
+                if enrich_actual and path.lower().endswith(".jar")
                 else None
             )
             item = self._delta_item(context, "add", path)
-            item["actual_sha256"] = actual_hashes[path]
-            item["capture_modes"] = ["package", "payload"] if package_metadata else ["payload"]
+            if not enrich_actual and path.lower().endswith(".jar"):
+                item["kind"] = "package"
+            if enrich_actual:
+                item["actual_sha256"] = actual_hashes[path]
+            item["capture_modes"] = (
+                ["package", "payload"]
+                if package_metadata is not None
+                or (not enrich_actual and path.lower().endswith(".jar"))
+                else ["payload"]
+            )
+            item["enriched"] = enrich_actual
             if package_metadata is not None:
                 item["kind"] = "package"
                 item["jar_metadata"] = package_metadata.document()
@@ -364,7 +386,11 @@ class ProjectService:
             if desired_content == current_content:
                 continue
             package = self._package_for_path(context, path)
-            metadata = inspect_jar(context.instance.path / Path(path)) if package else None
+            metadata = (
+                inspect_jar(context.instance.path / Path(path))
+                if enrich_actual and package
+                else None
+            )
             status = "change"
             if (
                 package is not None
@@ -391,35 +417,126 @@ class ProjectService:
             item["desired_sha256"] = hashlib.sha256(desired_content).hexdigest()
             item["actual_sha256"] = hashlib.sha256(current_content).hexdigest()
             item["capture_modes"] = ["package"] if package else ["payload"]
+            item["enriched"] = enrich_actual or package is None
             if package is not None:
                 item["desired_version"] = package.version
                 item["logical_id"] = package.logical_identity
-                item["provider_candidates"] = self._provider_candidates(
-                    current_content,
-                    metadata.version if metadata is not None else None,
-                    allow_remote=metadata is not None,
-                )
+                if enrich_actual:
+                    item["provider_candidates"] = self._provider_candidates(
+                        current_content,
+                        metadata.version if metadata is not None else None,
+                        allow_remote=metadata is not None,
+                    )
             if metadata is not None:
                 item["jar_metadata"] = metadata.document()
                 item["actual_version"] = metadata.version
             items.append(item)
             summary[status] += 1
         items.sort(key=lambda item: (str(item.get("path", "")), str(item["status"])))
-        return {"items": items, "summary": summary}
+        summary_document: dict[str, int | None] = dict(summary)
+        if not enrich_actual:
+            summary_document["change"] = None
+            summary_document["update"] = None
+            summary_document["rename"] = None
+        return {
+            "items": items,
+            "summary": summary_document,
+            "loaded": True,
+            "complete": enrich_actual,
+        }
 
     def invalidate_explorer(self, instance: str) -> None:
         self._explorer_snapshots.pop(instance, None)
 
+    def _auto_payload_epoch_path(self, target: Path) -> Path:
+        canonical = str(target.resolve()).casefold().encode("utf-8")
+        identity = hashlib.sha256(canonical).hexdigest()
+        return self.state.root / "locks" / "layers" / f"{identity}.auto-payload.epoch"
+
+    def _auto_payload_epoch(self, target: Path) -> str | None:
+        path = self._auto_payload_epoch_path(target)
+        try:
+            return path.read_text(encoding="ascii").strip()
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeError) as exc:
+            raise MetadataError(f"cannot read physical layer epoch {path}: {exc}") from exc
+
+    def _context_auto_payload_epochs(
+        self, context: InstanceContext
+    ) -> tuple[tuple[str, str | None], ...]:
+        roots = {Path(trace.root).resolve() for trace in context.resolution.trace}
+        return tuple(
+            (str(root), self._auto_payload_epoch(root))
+            for root in sorted(roots, key=lambda value: str(value).casefold())
+        )
+
+    def _snapshot_auto_payload_epochs_match(self, snapshot: ExplorerSnapshot) -> bool:
+        return all(
+            self._auto_payload_epoch(Path(root)) == expected
+            for root, expected in snapshot.auto_payload_epochs
+        )
+
+    @staticmethod
+    def _context_fingerprint(context: InstanceContext) -> str:
+        digest = hashlib.sha256()
+        for path, content in sorted(context.files.items()):
+            digest.update(path.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(hashlib.sha256(content).digest())
+        digest.update(
+            json.dumps(
+                {
+                    "ignore": [item.document() for item in context.resolution.state.ignore],
+                    "exclusions": list(context.resolution.state.exclusions),
+                    "trace": [
+                        {
+                            "root": trace.root,
+                            "producers": [
+                                {
+                                    "source": producer.source,
+                                    "operations": [
+                                        operation_to_json(operation)
+                                        for operation in producer.operations
+                                    ],
+                                }
+                                for producer in trace.producers
+                            ],
+                        }
+                        for trace in context.resolution.trace
+                    ],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        return digest.hexdigest()
+
     def explorer_snapshot(self, instance: str, *, refresh: bool = False) -> ExplorerSnapshot:
-        if not refresh and instance in self._explorer_snapshots:
-            return self._explorer_snapshots[instance]
+        cached = self._explorer_snapshots.get(instance)
+        if not refresh and cached is not None:
+            desired_paths = {path for path, entry in cached.entries.items() if entry["desired"]}
+            if self._snapshot_auto_payload_epochs_match(cached) and scan_generation_matches(
+                cached.scan, desired_paths
+            ):
+                return cached
+            self.invalidate_explorer(instance)
         context = self.instance_context(instance)
-        underlying = self.instance_diff(context, respect_ignore=False)
+        physical = scan_instance(context.instance.path)
+        underlying = self.instance_diff(
+            context,
+            respect_ignore=False,
+            enrich_actual=False,
+            existing_files=physical.files,
+        )
         snapshot = build_snapshot(
             context.instance.path,
             context.files,
             underlying["items"],
             context.resolution.state.ignore,
+            scan=physical,
+            context_fingerprint=self._context_fingerprint(context),
+            auto_payload_epochs=self._context_auto_payload_epochs(context),
         )
         self._explorer_snapshots[instance] = snapshot
         return snapshot
@@ -450,15 +567,21 @@ class ProjectService:
     ) -> dict[str, Any]:
         normalized = normalize_relative_path(path)
         snapshot = self.explorer_snapshot(instance)
+        if not snapshot.context_verified:
+            snapshot = self.explorer_snapshot(instance, refresh=True)
         selected = snapshot.entries.get(normalized)
         if selected is None:
             raise MetadataError(f"explorer path does not exist: {normalized!r}")
         prefix = normalized + "/"
         context = self.instance_context(instance)
+        if snapshot.context_fingerprint != self._context_fingerprint(context):
+            self.invalidate_explorer(instance)
+            raise MetadataError("explorer snapshot changed; refresh the file plan")
         physical_target = self._target_path(instance, context, target_layer)
+        transport = LocalFilesystemInstance(context.instance.path)
         items = []
         seen: set[str] = set()
-        for item in self.instance_diff(context, respect_ignore=False)["items"]:
+        for item in snapshot.delta_items:
             item_path = normalize_relative_path(str(item["path"]))
             destination = str(item.get("to_path", ""))
             in_scope = item_path == normalized or item_path.startswith(prefix)
@@ -472,6 +595,12 @@ class ProjectService:
             if in_scope and str(item["id"]) not in seen:
                 seen.add(str(item["id"]))
                 planned = dict(item)
+                source_entry = snapshot.entries.get(item_path)
+                if source_entry is not None and source_entry["actual"]:
+                    content = transport.read(item_path)
+                    planned["expected_sha256"] = hashlib.sha256(content).hexdigest()
+                else:
+                    planned["expected_absent"] = True
                 reason = self._same_layer_capture_reason(physical_target, item)
                 if item["status"] == "add" and any(
                     matches(str(item["path"]), pattern)
@@ -546,14 +675,24 @@ class ProjectService:
         if kind is SelectorKind.GLOB:
             raise MetadataError("new explorer ignore rules must be exact or subtree")
         selector = IgnoreSelector(kind, path)
-        with self.state.target_layer_lock(target), _BeforeImageJournal(self, target):
+        journal_paths = [
+            target / METADATA_DIR / MARKER_FILE,
+            target / METADATA_DIR / "local-edits.json",
+            self.state.links_path,
+        ]
+        with self.state.target_layer_lock(target), _BeforeImageJournal(self, target, journal_paths):
             editable = self._editable_target(instance, context, target_layer)
             self._append_operation(
                 editable,
                 {"type": "ignore", "selector": selector.document()},
             )
-            self.instance_context(instance)
-        self.invalidate_explorer(instance)
+            refreshed = self.instance_context(instance)
+        cached = self._explorer_snapshots.get(instance)
+        if cached is not None:
+            self._explorer_snapshots[instance] = cached.reproject(
+                refreshed.resolution.state.ignore,
+                context_fingerprint=self._context_fingerprint(refreshed),
+            )
 
     def remove_ignore(
         self,
@@ -575,7 +714,7 @@ class ProjectService:
             raise MetadataError("ignore rule identity has an invalid operation index")
         with self.state.target_layer_lock(target):
             path = target / METADATA_DIR / "local-edits.json"
-            with _BeforeImageJournal(self, target):
+            with _BeforeImageJournal(self, target, [target / METADATA_DIR / "local-edits.json"]):
                 try:
                     document = json.loads(path.read_text(encoding="utf-8"))
                     operations = document["operations"]
@@ -605,8 +744,13 @@ class ProjectService:
                     path,
                     (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode(),
                 )
-                self.instance_context(instance)
-        self.invalidate_explorer(instance)
+                refreshed = self.instance_context(instance)
+        cached = self._explorer_snapshots.get(instance)
+        if cached is not None:
+            self._explorer_snapshots[instance] = cached.reproject(
+                refreshed.resolution.state.ignore,
+                context_fingerprint=self._context_fingerprint(refreshed),
+            )
 
     def capture_explorer_path(
         self,
@@ -614,20 +758,20 @@ class ProjectService:
         path: str,
         target_layer: str | None = None,
         decisions: object = None,
-    ) -> None:
+        *,
+        auto_payload: bool = False,
+    ) -> dict[str, Any] | None:
+        if auto_payload:
+            return self._capture_explorer_auto_payload(instance, path, target_layer)
         normalized = normalize_relative_path(path)
-        context = self.instance_context(instance)
-        target = self._target_path(instance, context, target_layer)
-        snapshot = self.explorer_snapshot(instance, refresh=True)
+        snapshot = self._explorer_snapshots.get(instance)
+        if snapshot is None or not snapshot.context_verified:
+            snapshot = self.explorer_snapshot(instance, refresh=snapshot is not None)
         selected = snapshot.entries.get(normalized)
         if selected is None:
             raise MetadataError(f"explorer path does not exist: {normalized!r}")
         prefix = normalized + "/"
-        scoped_entries = [
-            item
-            for item in snapshot.entries.values()
-            if item["path"] == normalized or item["path"].startswith(prefix)
-        ]
+        scoped_entries = self._entries_in_scope(snapshot.entries.values(), normalized)
         unsupported = next(
             (item for item in scoped_entries if item["changed"] and not item["actionable"]),
             None,
@@ -635,93 +779,664 @@ class ProjectService:
         if unsupported is not None:
             reason = unsupported["reason"] or "unsupported entry"
             raise MetadataError(f"cannot capture {unsupported['path']!r}: {reason}")
-        delta_by_id: dict[str, dict[str, Any]] = {}
-        underlying = self.instance_diff(context, respect_ignore=False)["items"]
-        for item in underlying:
-            item_path = normalize_relative_path(str(item["path"]))
-            target_path = str(item.get("to_path", ""))
-            if (
-                item_path == normalized
-                or item_path.startswith(prefix)
-                or (
-                    target_path
-                    and (
-                        normalize_relative_path(target_path) == normalized
-                        or normalize_relative_path(target_path).startswith(prefix)
-                    )
-                )
-            ):
-                delta_by_id[str(item["id"])] = item
+        delta_by_id = {
+            str(item["id"]): dict(item)
+            for item in snapshot.delta_items
+            if self._delta_in_scope(item, normalized)
+        }
         if not delta_by_id:
             raise MetadataError(f"explorer path has no changed descendants: {normalized!r}")
-        decision_map = decisions if isinstance(decisions, dict) else {}
-        plan: list[tuple[dict[str, Any], str, object]] = []
-        for item in sorted(delta_by_id.values(), key=lambda value: str(value["path"])):
-            item_id = str(item["id"])
-            raw_decision = decision_map.get(item_id)
-            modes = [str(value) for value in item.get("capture_modes", [])]
-            mode = modes[0] if len(modes) == 1 else ""
-            provider_match: object = None
-            if "package" in modes:
-                if not isinstance(raw_decision, dict) or not isinstance(
-                    raw_decision.get("mode"), str
-                ):
+        if not isinstance(decisions, dict):
+            raise MetadataError("folder capture decisions must be an object")
+        decision_map = decisions
+        if set(decision_map) != set(delta_by_id):
+            raise MetadataError("folder capture decisions must match every planned delta exactly")
+        for item_id, raw in decision_map.items():
+            if not isinstance(raw, dict):
+                raise MetadataError(f"delta {item_id} decision must be an object")
+            has_sha = "expected_sha256" in raw
+            has_absent = "expected_absent" in raw
+            if has_sha == has_absent:
+                raise MetadataError(
+                    f"delta {item_id} requires exactly one expected_sha256 or expected_absent"
+                )
+            if has_sha and not isinstance(raw["expected_sha256"], str):
+                raise MetadataError(f"delta {item_id} expected_sha256 must be a string")
+            if has_absent and raw["expected_absent"] is not True:
+                raise MetadataError(f"delta {item_id} expected_absent must be true")
+        provisional_target = self._provisional_target(instance, target_layer)
+        final_context: InstanceContext | None = None
+        pure_payload_committed = False
+
+        with self.state.target_layer_lock(provisional_target):
+            context = self.instance_context(instance)
+            target = self._target_path(instance, context, target_layer)
+            if target.resolve() != provisional_target.resolve():
+                raise MetadataError("selected physical target changed before capture")
+            if snapshot.context_fingerprint != self._context_fingerprint(context):
+                raise MetadataError("file plan changed before capture; refresh it")
+            if not scan_generation_matches(snapshot.scan, ()):
+                raise MetadataError("instance directory changed before capture; refresh it")
+
+            expected_inventory = {
+                path: entry["type"]
+                for path, entry in snapshot.scan.entries.items()
+                if path == normalized or path.startswith(prefix)
+            }
+            current_inventory = self._scan_scope(context.instance.path, normalized)
+            if current_inventory != expected_inventory:
+                raise MetadataError("instance folder changed before capture; refresh its plan")
+
+            transport = LocalFilesystemInstance(context.instance.path)
+            prepared: list[tuple[dict[str, Any], dict[str, Any], str, str]] = []
+            for item in sorted(delta_by_id.values(), key=lambda value: str(value["path"])):
+                item_id = str(item["id"])
+                raw = decision_map.get(item_id, {})
+                if not isinstance(raw, dict):
+                    raise MetadataError(f"delta {item_id} decision must be an object")
+                modes = [str(value) for value in item.get("capture_modes", [])]
+                if len(modes) > 1 and not isinstance(raw.get("mode"), str):
                     raise MetadataError(
                         f"delta {item_id} requires an explicit package or payload decision"
                     )
-                mode = str(raw_decision["mode"])
-                provider_match = raw_decision.get("provider_match")
-            if mode not in modes:
-                raise MetadataError(f"capture mode {mode!r} is not available for {item['path']!r}")
-            same_layer_reason = self._same_layer_capture_reason(target, item)
-            if same_layer_reason is not None:
-                raise MetadataError(
-                    f"cannot capture {item['path']!r} into its owning layer: {same_layer_reason}"
-                )
-            if item["status"] == "add" and any(
-                matches(str(item["path"]), pattern)
-                for pattern in context.resolution.state.exclusions
-            ):
-                raise MetadataError(
-                    f"cannot capture {item['path']!r}: inherited remove_paths excludes it"
-                )
-            plan.append((item, mode, provider_match))
-
-        with self.state.target_layer_lock(target), _BeforeImageJournal(self, target):
-            for original, mode, provider_match in plan:
-                refreshed = self.instance_context(instance)
-                current = next(
-                    (
-                        item
-                        for item in self.instance_diff(refreshed, respect_ignore=False)["items"]
-                        if item["id"] == original["id"]
-                    ),
-                    None,
-                )
-                if current is None:
+                mode = str(raw.get("mode", modes[0] if len(modes) == 1 else ""))
+                if mode not in modes:
                     raise MetadataError(
-                        f"delta changed while capture was being planned: {original['path']!r}"
+                        f"capture mode {mode!r} is not available for {item['path']!r}"
                     )
-                if mode == "package" and current.get("package_id") is None:
-                    self.import_package(
-                        instance,
-                        str(current["id"]),
-                        target_layer,
-                        provider_match,
+                provider_match = raw.get("provider_match")
+                provider_is_local = provider_match is None or provider_match == "local"
+                if isinstance(provider_match, dict):
+                    provider_is_local = provider_match.get("provider") == "local"
+                if not provider_is_local:
+                    raise MetadataError(
+                        "folder package capture cannot use remote provider enrichment; "
+                        "import the package individually"
                     )
+                item_path = normalize_relative_path(str(item["path"]))
+                prepared.append((item, raw, mode, item_path))
+
+            source_paths = [
+                item_path
+                for _, _, _, item_path in prepared
+                if (
+                    (physical := snapshot.scan.entries.get(item_path)) is not None
+                    and physical["type"] == "file"
+                )
+            ]
+            with ThreadPoolExecutor(max_workers=min(32, max(1, len(source_paths)))) as pool:
+                source_content = dict(
+                    zip(source_paths, pool.map(transport.read, source_paths), strict=True)
+                )
+
+            captured: list[tuple[dict[str, Any], str, bytes | None]] = []
+            for item, raw, mode, item_path in prepared:
+                item_id = str(item["id"])
+                physical = snapshot.scan.entries.get(item_path)
+                content: bytes | None = None
+                if physical is not None and physical["type"] == "file":
+                    content = source_content[item_path]
+                    actual_sha256 = hashlib.sha256(content).hexdigest()
+                    expected_sha256 = raw.get("expected_sha256")
+                    if not isinstance(expected_sha256, str):
+                        raise MetadataError(
+                            f"delta {item_id} requires expected_sha256 from its file plan"
+                        )
+                    if expected_sha256 is not None and expected_sha256 != actual_sha256:
+                        raise MetadataError(
+                            f"instance delta file changed before mutation: {item_path!r}"
+                        )
                 else:
-                    self.capture_delta(instance, str(current["id"]), target_layer)
-            final_context = self.instance_context(instance)
-            remaining = self.instance_diff(final_context, respect_ignore=False)["items"]
-            if any(
-                str(item["path"]) == normalized
-                or str(item["path"]).startswith(prefix)
-                or str(item.get("to_path", "")) == normalized
-                or str(item.get("to_path", "")).startswith(prefix)
-                for item in remaining
+                    if raw.get("expected_absent") is not True:
+                        raise MetadataError(
+                            f"delta {item_id} requires expected_absent from its file plan"
+                        )
+                self._revalidate_batch_item(context, target, item, content)
+                if (
+                    mode == "package"
+                    and item.get("package_id") is None
+                    and (content is None or self._inspect_jar_content(content) is None)
+                ):
+                    raise MetadataError(f"package capture requires a valid JAR: {item_path!r}")
+                captured.append((item, mode, content))
+
+            payload_writes: dict[Path, bytes] = {}
+            artifact_writes: dict[Path, bytes] = {}
+            additions: list[dict[str, Any]] = []
+            reserved_ids = set(context.resolution.state.packages)
+            reconciliations: dict[str, bytes | None] = {}
+            for item, mode, content in captured:
+                item_path = normalize_relative_path(str(item["path"]))
+                reconciliations[item_path] = content
+                package_id = item.get("package_id")
+                if package_id is not None and content is not None:
+                    artifact, operation = self._batch_existing_package(
+                        context, target, str(package_id), item_path, content
+                    )
+                    artifact_writes[artifact] = content
+                    additions.append(operation)
+                elif package_id is not None:
+                    additions.append({"type": "activation", "id": package_id, "state": "disabled"})
+                elif content is None:
+                    additions.append({"type": "remove", "path": item_path})
+                elif mode == "package":
+                    artifact, operation = self._batch_local_package(
+                        target, item_path, content, reserved_ids
+                    )
+                    artifact_writes[artifact] = content
+                    additions.append(operation)
+                else:
+                    payload_writes[self._bounded_target_path(target, item_path)] = content
+
+            operations_path = target / METADATA_DIR / "local-edits.json"
+            pure_payload_fast_path = (
+                not additions
+                and not artifact_writes
+                and len(payload_writes) == len(captured)
+                and self._payload_target_has_final_precedence(instance, context, target)
+            )
+            journal_paths = [
+                target / METADATA_DIR / MARKER_FILE,
+                operations_path,
+                self.state.links_path,
+                *payload_writes,
+                *artifact_writes,
+            ]
+            with _BeforeImageJournal(self, target, journal_paths):
+                editable = self._editable_target(instance, context, target_layer)
+                if editable.resolve() != target.resolve():
+                    raise MetadataError("editable target changed before capture")
+                writes = [*payload_writes.items(), *artifact_writes.items()]
+
+                def write(item: tuple[Path, bytes]) -> None:
+                    self._batch_atomic_write(*item)
+
+                with ThreadPoolExecutor(max_workers=min(32, max(1, len(writes)))) as pool:
+                    tuple(pool.map(write, writes))
+                if additions:
+                    self._append_operations(target, additions)
+                if pure_payload_fast_path:
+                    expected_writes = {
+                        self._bounded_target_path(target, item_path): actual_content
+                        for item_path, actual_content in reconciliations.items()
+                        if actual_content is not None
+                    }
+                    if expected_writes != payload_writes:
+                        raise MetadataError("pure payload batch write set did not reconcile")
+                    pure_payload_committed = True
+                else:
+                    final_context = self.instance_context(instance)
+                    for item_path, actual_content in reconciliations.items():
+                        if final_context.files.get(item_path) != actual_content:
+                            raise MetadataError(
+                                f"captured folder did not reconcile changed path {item_path!r}"
+                            )
+
+        if pure_payload_committed:
+            # Creating an overlay changes the resolution trace. The payload write itself is
+            # proven above, but retaining the old snapshot would make later plans stale.
+            self.invalidate_explorer(instance)
+            return None
+
+        if final_context is None:
+            raise RuntimeError("batch capture completed without a final context")
+        outside_before = {
+            path: content
+            for path, content in context.files.items()
+            if path != normalized and not path.startswith(prefix)
+        }
+        outside_after = {
+            path: content
+            for path, content in final_context.files.items()
+            if path != normalized and not path.startswith(prefix)
+        }
+        if outside_before == outside_after:
+            remaining_items = [
+                dict(item)
+                for item in snapshot.delta_items
+                if not self._delta_in_scope(item, normalized)
+            ]
+            self._explorer_snapshots[instance] = build_snapshot(
+                final_context.instance.path,
+                final_context.files,
+                remaining_items,
+                final_context.resolution.state.ignore,
+                scan=snapshot.scan,
+                context_fingerprint=self._context_fingerprint(final_context),
+                auto_payload_epochs=self._context_auto_payload_epochs(final_context),
+            )
+        else:
+            self.invalidate_explorer(instance)
+
+        return None
+
+    def _capture_explorer_auto_payload(
+        self,
+        instance: str,
+        path: str,
+        target_layer: str | None,
+    ) -> dict[str, Any]:
+        """Capture an unambiguous raw-payload scope without building an explorer plan."""
+        normalized = normalize_relative_path(path)
+        prefix = normalized + "/"
+        provisional_target = self._provisional_target(instance, target_layer)
+
+        with self.state.target_layer_lock(provisional_target):
+            context = self.instance_context(instance)
+            target = self._target_path(instance, context, target_layer)
+            if target.resolve() != provisional_target.resolve():
+                raise MetadataError("selected physical target changed before capture")
+            cached = self._explorer_snapshots.get(instance)
+            cache_candidate = cached
+            if cache_candidate is not None and (
+                not cache_candidate.context_verified
+                or cache_candidate.context_fingerprint != self._context_fingerprint(context)
+                or cache_candidate.scan.root != context.instance.path.resolve()
+                or not self._snapshot_auto_payload_epochs_match(cache_candidate)
+                or not scan_generation_matches(cache_candidate.scan, context.files)
             ):
-                raise MetadataError("captured folder did not reconcile all changed descendants")
-        self.invalidate_explorer(instance)
+                cache_candidate = None
+
+            before = self._scan_scope_state(context.instance.path, normalized)
+            source_paths = sorted(
+                item_path for item_path, generation in before.items() if generation[0] == "file"
+            )
+            transport = LocalFilesystemInstance(context.instance.path)
+            with ThreadPoolExecutor(max_workers=min(32, max(1, len(source_paths)))) as pool:
+                source_content = dict(
+                    zip(source_paths, pool.map(transport.read, source_paths), strict=True)
+                )
+
+            actual_files = set(source_content)
+            desired_files = {
+                item_path
+                for item_path in context.files
+                if item_path == normalized or item_path.startswith(prefix)
+            }
+            items: list[dict[str, Any]] = []
+            contents: dict[str, bytes] = {}
+
+            for item_path, generation in sorted(before.items()):
+                if generation[0] in {"file", "directory"}:
+                    continue
+                item = self._delta_item(context, "add", item_path)
+                item.update(
+                    {
+                        "supported": False,
+                        "reason": f"instance path type {generation[0]!r} cannot be captured",
+                        "expected_absent": True,
+                    }
+                )
+                items.append(item)
+
+            for item_path in sorted(desired_files - actual_files):
+                package = self._package_for_path(context, item_path)
+                item = self._delta_item(
+                    context,
+                    "remove",
+                    item_path,
+                    package_id=package.identity if package else None,
+                )
+                item["desired_sha256"] = hashlib.sha256(context.files[item_path]).hexdigest()
+                item["capture_modes"] = ["activation"] if package else ["remove"]
+                item["enriched"] = False
+                item["expected_absent"] = True
+                items.append(item)
+
+            for item_path in sorted(actual_files):
+                content = source_content[item_path]
+                desired = context.files.get(item_path)
+                if desired == content:
+                    continue
+                package = self._package_for_path(context, item_path)
+                status = "add" if desired is None else "change"
+                item = self._delta_item(
+                    context,
+                    status,
+                    item_path,
+                    package_id=package.identity if package else None,
+                )
+                digest = hashlib.sha256(content).hexdigest()
+                item["actual_sha256"] = digest
+                item["expected_sha256"] = digest
+                item["enriched"] = package is None and not item_path.lower().endswith(".jar")
+                if desired is not None:
+                    item["desired_sha256"] = hashlib.sha256(desired).hexdigest()
+                if package is not None:
+                    item["capture_modes"] = ["package"]
+                    item["desired_version"] = package.version
+                    item["logical_id"] = package.logical_identity
+                elif item_path.lower().endswith(".jar"):
+                    item["kind"] = "package"
+                    item["capture_modes"] = ["package", "payload"]
+                else:
+                    item["capture_modes"] = ["payload"]
+                contents[item_path] = content
+                items.append(item)
+
+            target_reason: str | None = None
+            if not target.is_dir() or not (target / METADATA_DIR / MARKER_FILE).is_file():
+                target_reason = "auto payload capture requires an existing writable layer"
+            elif not self._payload_target_has_final_precedence(instance, context, target):
+                target_reason = "auto payload capture requires the final-precedence layer"
+
+            eligible = bool(items) and target_reason is None
+            for item in items:
+                modes = item.get("capture_modes")
+                reason = target_reason or self._same_layer_capture_reason(target, item)
+                item_path = normalize_relative_path(str(item["path"]))
+                if item.get("status") == "add" and any(
+                    matches(item_path, pattern) for pattern in context.resolution.state.exclusions
+                ):
+                    reason = "inherited remove_paths excludes this path"
+                if modes != ["payload"]:
+                    eligible = False
+                if reason is not None:
+                    item["supported"] = False
+                    item["reason"] = reason
+                    eligible = False
+                else:
+                    item["supported"] = True
+
+            items.sort(key=lambda item: (str(item.get("path", "")), str(item["status"])))
+            if not eligible:
+                return {"applied": False, "path": normalized, "items": items}
+
+            payload_writes = {
+                self._bounded_target_path(target, item_path): contents[item_path]
+                for item_path in sorted(contents)
+            }
+            if len(payload_writes) != len(items):
+                raise MetadataError("auto payload write set did not reconcile")
+            captured_ids = {str(item["id"]) for item in items}
+            if len(captured_ids) != len(items):
+                cache_candidate = None
+            if cache_candidate is not None:
+                cached_items = {str(item["id"]): item for item in cache_candidate.delta_items}
+                for item in items:
+                    cached_item = cached_items.get(str(item["id"]))
+                    cached_entry = cache_candidate.entries.get(str(item["path"]))
+                    cached_generation = cache_candidate.scan.entry_generations.get(
+                        str(item["path"])
+                    )
+                    if (
+                        cached_item is None
+                        or any(
+                            cached_item.get(key) != item.get(key)
+                            for key in ("path", "status", "capture_modes")
+                        )
+                        or not (
+                            cached_entry is not None
+                            and cached_entry["actual"]
+                            and cached_entry["type"] == "file"
+                            and cached_generation is not None
+                            and cached_generation[0] == "file"
+                        )
+                    ):
+                        cache_candidate = None
+                        break
+            if self._scan_scope_state(context.instance.path, normalized) != before:
+                raise MetadataError("instance folder changed during auto payload capture")
+            patched_snapshot: ExplorerSnapshot | None = None
+            epoch_path = self._auto_payload_epoch_path(target)
+            next_epoch = os.urandom(16).hex()
+            with _BeforeImageJournal(self, target, [*payload_writes, epoch_path]):
+
+                def write(item: tuple[Path, bytes]) -> None:
+                    self._batch_atomic_write(*item)
+
+                writes = list(payload_writes.items())
+                with ThreadPoolExecutor(max_workers=min(32, max(1, len(writes)))) as pool:
+                    tuple(pool.map(write, writes))
+
+                for destination, content in writes:
+                    destination_stat = destination.stat(follow_symlinks=False)
+                    if not stat.S_ISREG(destination_stat.st_mode) or (
+                        destination_stat.st_size != len(content)
+                    ):
+                        raise MetadataError(f"auto payload target did not reconcile {destination}")
+
+                atomic_write(epoch_path, f"{next_epoch}\n".encode("ascii"))
+
+                if cache_candidate is not None:
+                    patched_files = dict(context.files)
+                    patched_files.update(contents)
+                    if scan_generation_matches(cache_candidate.scan, patched_files):
+                        remaining_items = [
+                            dict(item)
+                            for item in cache_candidate.delta_items
+                            if str(item["id"]) not in captured_ids
+                        ]
+                        patched_context = InstanceContext(
+                            context.instance,
+                            context.link,
+                            context.features,
+                            context.parameters,
+                            context.resolution,
+                            patched_files,
+                        )
+                        patched_snapshot = build_snapshot(
+                            patched_context.instance.path,
+                            patched_files,
+                            remaining_items,
+                            patched_context.resolution.state.ignore,
+                            scan=cache_candidate.scan,
+                            context_fingerprint=self._context_fingerprint(patched_context),
+                            context_verified=False,
+                            auto_payload_epochs=self._context_auto_payload_epochs(patched_context),
+                        )
+
+        for cached_instance in tuple(self._explorer_snapshots):
+            if cached_instance != instance:
+                self.invalidate_explorer(cached_instance)
+        if (
+            patched_snapshot is None
+            or cache_candidate is None
+            or self._explorer_snapshots.get(instance) is not cache_candidate
+        ):
+            self.invalidate_explorer(instance)
+        else:
+            self._explorer_snapshots[instance] = patched_snapshot
+        return {
+            "applied": True,
+            "path": normalized,
+            "captured_count": len(items),
+        }
+
+    @staticmethod
+    def _entries_in_scope(
+        entries: Iterable[dict[str, Any]], normalized: str
+    ) -> list[dict[str, Any]]:
+        prefix = normalized + "/"
+        return [
+            item
+            for item in entries
+            if item["path"] == normalized or item["path"].startswith(prefix)
+        ]
+
+    @staticmethod
+    def _delta_in_scope(item: dict[str, Any], normalized: str) -> bool:
+        prefix = normalized + "/"
+        paths = [normalize_relative_path(str(item["path"]))]
+        if item.get("to_path"):
+            paths.append(normalize_relative_path(str(item["to_path"])))
+        return any(path == normalized or path.startswith(prefix) for path in paths)
+
+    def _provisional_target(self, instance: str, target_layer: str | None) -> Path:
+        overlay = self.state.feature_root(instance).resolve()
+        if target_layer is None or target_layer == self._layer_reference(overlay):
+            return overlay
+        return self.branch_root(target_layer)
+
+    @staticmethod
+    def _scan_scope(root: Path, normalized: str) -> dict[str, str]:
+        return {
+            path: generation[0]
+            for path, generation in ProjectService._scan_scope_state(root, normalized).items()
+        }
+
+    @staticmethod
+    def _scan_scope_state(root: Path, normalized: str) -> dict[str, tuple[str, int, int, int, int]]:
+        target = root.joinpath(*normalized.split("/"))
+        result: dict[str, tuple[str, int, int, int, int]] = {}
+
+        def visit(path: Path, relative: str) -> None:
+            try:
+                item_stat = path.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            generation = (
+                item_stat.st_mtime_ns,
+                item_stat.st_ctime_ns,
+                item_stat.st_size,
+                item_stat.st_ino,
+            )
+            if stat.S_ISLNK(item_stat.st_mode):
+                result[relative] = ("symlink", *generation)
+            elif stat.S_ISDIR(item_stat.st_mode):
+                result[relative] = ("directory", *generation)
+                try:
+                    values = list(os.scandir(path))
+                except OSError as exc:
+                    raise MetadataError(f"cannot list instance directory {path}: {exc}") from exc
+                for entry in values:
+                    child = f"{relative}/{entry.name}"
+                    visit(Path(entry.path), child)
+            elif stat.S_ISREG(item_stat.st_mode):
+                result[relative] = ("file", *generation)
+            else:
+                result[relative] = ("special", *generation)
+
+        visit(target, normalized)
+        return result
+
+    def _revalidate_batch_item(
+        self,
+        context: InstanceContext,
+        target: Path,
+        item: dict[str, Any],
+        content: bytes | None,
+    ) -> None:
+        path = normalize_relative_path(str(item["path"]))
+        desired = context.files.get(path)
+        if content is None:
+            current_status = "remove" if desired is not None else "unchanged"
+        elif desired is None:
+            current_status = "add"
+        else:
+            current_status = "unchanged" if content == desired else "change"
+        if current_status == "unchanged":
+            raise MetadataError(f"delta changed while capture was being planned: {path!r}")
+        expected_status = "change" if item["status"] == "update" else item["status"]
+        if current_status != expected_status:
+            raise MetadataError(f"delta changed while capture was being planned: {path!r}")
+        reason = self._same_layer_capture_reason(target, item)
+        if reason is not None:
+            raise MetadataError(f"cannot capture {path!r} into its owning layer: {reason}")
+        if current_status == "add" and any(
+            matches(path, pattern) for pattern in context.resolution.state.exclusions
+        ):
+            raise MetadataError(f"cannot capture {path!r}: inherited remove_paths excludes it")
+
+    def _bounded_target_path(self, target: Path, relative: str) -> Path:
+        normalized = normalize_relative_path(relative)
+        destination = target.resolve()
+        for part in normalized.split("/"):
+            destination /= part
+            if destination.is_symlink():
+                raise MetadataError(f"layer payload path contains a symlink: {relative!r}")
+        return destination
+
+    def _payload_target_has_final_precedence(
+        self, instance: str, context: InstanceContext, target: Path
+    ) -> bool:
+        overlay = self.state.feature_root(instance).resolve()
+        if target.resolve() == overlay:
+            return True
+        if not context.resolution.trace:
+            return False
+        return Path(context.resolution.trace[-1].root).resolve() == target.resolve()
+
+    @staticmethod
+    def _batch_atomic_write(path: Path, content: bytes) -> None:
+        """Atomic replace for a pre-journaled batch path with no redundant success unlink."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.batch-tmp")
+        try:
+            temporary.write_bytes(content)
+            os.replace(temporary, path)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    def _batch_existing_package(
+        self,
+        context: InstanceContext,
+        target: Path,
+        package_id: str,
+        destination: str,
+        content: bytes,
+    ) -> tuple[Path, dict[str, Any]]:
+        package = context.resolution.state.packages[package_id]
+        digest = hashlib.sha256(content).hexdigest()
+        artifact = target / METADATA_DIR / "artifacts" / f"{digest}.jar"
+        operation: dict[str, Any] = {
+            "type": "package",
+            "id": package.identity,
+            "logical_id": package.logical_identity,
+            "kind": package.kind,
+            "activation": (
+                "enabled"
+                if package.activation in {Activation.ENABLED, Activation.TRANSITIVE}
+                else package.activation.value
+            ),
+            "destination": destination,
+            "source": {
+                "provider": "local",
+                "location": artifact.relative_to(self.project).as_posix(),
+                "sha256": digest,
+            },
+            "update_policy": package.update_policy.value,
+            "automatic_requires": list(package.automatic_requires),
+        }
+        if package.alias is not None:
+            operation["alias"] = package.alias
+        if package.version is not None:
+            operation["version"] = package.version
+        return artifact, operation
+
+    def _batch_local_package(
+        self,
+        target: Path,
+        destination: str,
+        content: bytes,
+        reserved_ids: set[str],
+    ) -> tuple[Path, dict[str, Any]]:
+        digest = hashlib.sha256(content).hexdigest()
+        artifact = target / METADATA_DIR / "artifacts" / f"{digest}.jar"
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(destination).stem).strip("-")
+        package_id = stem or f"imported-{digest[:12]}"
+        if package_id in reserved_ids:
+            package_id = f"{package_id}-{digest[:8]}"
+        suffix = 2
+        candidate = package_id
+        while candidate in reserved_ids:
+            candidate = f"{package_id}-{suffix}"
+            suffix += 1
+        package_id = candidate
+        reserved_ids.add(package_id)
+        return artifact, {
+            "type": "package",
+            "id": package_id,
+            "activation": "enabled",
+            "destination": destination,
+            "source": {
+                "provider": "local",
+                "location": artifact.relative_to(self.project).as_posix(),
+                "sha256": digest,
+            },
+            "update_policy": "fixed",
+        }
 
     def _same_layer_capture_reason(self, target: Path, item: dict[str, Any]) -> str | None:
         """Reject raw writes that conflict with a structured producer in the target."""
@@ -839,7 +1554,7 @@ class ProjectService:
     ) -> dict[str, Any]:
         del context
         item: dict[str, Any] = {
-            "id": hashlib.sha256(f"{status}\0{path}".encode()).hexdigest()[:20],
+            "id": ProjectService._delta_id(path),
             "kind": "package" if package_id is not None else "file",
             "status": status,
             "path": path,
@@ -850,9 +1565,147 @@ class ProjectService:
             item["package_id"] = package_id
         return item
 
-    def bootstrap(self, name: str) -> dict[str, Any]:
+    @staticmethod
+    def _delta_id(path: str) -> str:
+        return hashlib.sha256(path.encode()).hexdigest()[:20]
+
+    def _quick_delta_selection(
+        self,
+        context: InstanceContext,
+        delta_id: str,
+        *,
+        respect_ignore: bool = True,
+        expected_sha256: str | None = None,
+    ) -> tuple[dict[str, Any], bytes | None]:
+        transport = LocalFilesystemInstance(context.instance.path)
+        existing = set(transport.list_files())
+        desired = set(context.files)
+        matches_id = [path for path in existing | desired if self._delta_id(path) == delta_id]
+        if len(matches_id) != 1:
+            raise MetadataError(f"instance delta item does not exist: {delta_id!r}")
+        path = matches_id[0]
+        if respect_ignore and any(
+            selector.contains(path) for selector in context.resolution.state.ignore
+        ):
+            raise MetadataError(f"instance delta item does not exist: {delta_id!r}")
+        package = self._package_for_path(context, path)
+        content = transport.read(path) if path in existing else None
+        digest = hashlib.sha256(content).hexdigest() if content is not None else None
+        if expected_sha256 is not None and digest != expected_sha256:
+            raise MetadataError(f"instance delta file changed before mutation: {path!r}")
+        if path not in existing:
+            item = self._delta_item(
+                context,
+                "remove",
+                path,
+                package_id=package.identity if package else None,
+            )
+            item["desired_sha256"] = hashlib.sha256(context.files[path]).hexdigest()
+            item["capture_modes"] = ["activation"] if package else ["remove"]
+            item["enriched"] = False
+            return item, None
+        if path not in desired:
+            item = self._delta_item(context, "add", path)
+            if path.lower().endswith(".jar"):
+                item["kind"] = "package"
+                item["capture_modes"] = ["package", "payload"]
+            else:
+                item["capture_modes"] = ["payload"]
+            item["enriched"] = False
+            return item, content
+        if content == context.files[path]:
+            raise MetadataError(f"instance delta item does not exist: {delta_id!r}")
+        item = self._delta_item(
+            context,
+            "change",
+            path,
+            package_id=package.identity if package else None,
+        )
+        item["desired_sha256"] = hashlib.sha256(context.files[path]).hexdigest()
+        item["actual_sha256"] = digest
+        item["capture_modes"] = ["package"] if package else ["payload"]
+        item["enriched"] = package is None
+        if package is not None:
+            item["desired_version"] = package.version
+            item["logical_id"] = package.logical_identity
+        return item, content
+
+    @staticmethod
+    def _inspect_jar_content(content: bytes) -> Any:
+        with tempfile.TemporaryDirectory(prefix="mcpack-jar-inspect-") as directory:
+            path = Path(directory) / "selected.jar"
+            path.write_bytes(content)
+            return inspect_jar(path)
+
+    def delta_detail(self, instance: str, delta_id: str) -> dict[str, Any]:
+        context = self.instance_context(instance)
+        selected, content = self._quick_delta_selection(context, delta_id)
+        item = dict(selected)
+        if content is None:
+            item["enriched"] = True
+            return item
+        item["actual_sha256"] = hashlib.sha256(content).hexdigest()
+        path = normalize_relative_path(str(item["path"]))
+        package = self._package_for_path(context, path)
+        if not path.lower().endswith(".jar"):
+            item["enriched"] = True
+            return item
+        metadata = self._inspect_jar_content(content)
+        if metadata is None and package is None:
+            item["kind"] = "file"
+            item["capture_modes"] = ["payload"]
+            item["enriched"] = True
+            return item
+        item["kind"] = "package"
+        item["capture_modes"] = ["package"] if package is not None else ["package", "payload"]
+        item["provider_candidates"] = self._provider_candidates(
+            content,
+            metadata.version if metadata is not None else None,
+            allow_remote=metadata is not None,
+        )
+        if metadata is not None:
+            item["jar_metadata"] = metadata.document()
+            item["actual_version"] = metadata.version
+        if package is not None:
+            item["desired_version"] = package.version
+            item["logical_id"] = package.logical_identity
+            if (
+                metadata is not None
+                and metadata.version is not None
+                and package.version is not None
+                and _version_is_newer(metadata.version, package.version)
+                and (
+                    {
+                        package.identity,
+                        package.logical_identity,
+                        *(tuple([package.alias]) if package.alias is not None else ()),
+                    }
+                    & set(metadata.mod_ids)
+                )
+            ):
+                item["status"] = "update"
+        item["enriched"] = True
+        return item
+
+    def bootstrap(self, name: str, *, include_delta: bool = True) -> dict[str, Any]:
         context = self.instance_context(name)
-        delta = self.instance_diff(context)
+        delta = (
+            self.instance_diff(context)
+            if include_delta
+            else {
+                "items": [],
+                "summary": {
+                    "add": 0,
+                    "remove": 0,
+                    "change": 0,
+                    "update": 0,
+                    "rename": 0,
+                    "ignored": 0,
+                },
+                "loaded": False,
+                "complete": False,
+            }
+        )
         declarations: list[dict[str, Any]] = []
         for trace in context.resolution.trace:
             for producer in trace.producers:
@@ -1146,34 +1999,77 @@ class ProjectService:
             self._restore_file(path, before)
             raise
 
-    def capture_delta(self, instance: str, delta_id: str, target_layer: str | None = None) -> None:
+    def capture_delta(
+        self,
+        instance: str,
+        delta_id: str,
+        target_layer: str | None = None,
+        *,
+        expected_sha256: str | None = None,
+        require_expected_sha256: bool = False,
+        rename_to_path: str | None = None,
+    ) -> None:
         context = self.instance_context(instance)
-        item = next(
-            (entry for entry in self.instance_diff(context)["items"] if entry["id"] == delta_id),
-            None,
+        item, content = self._quick_delta_selection(
+            context,
+            delta_id,
+            expected_sha256=expected_sha256,
         )
-        if item is None:
-            raise MetadataError(f"instance delta item does not exist: {delta_id!r}")
+        if require_expected_sha256 and content is not None and expected_sha256 is None:
+            raise MetadataError("expected_sha256 is required for an existing delta file")
+        if rename_to_path is not None:
+            desired_path = normalize_relative_path(rename_to_path)
+            existing = set(LocalFilesystemInstance(context.instance.path).list_files())
+            if (
+                item["status"] != "add"
+                or content is None
+                or desired_path not in context.files
+                or desired_path in existing
+                or hashlib.sha256(content).digest()
+                != hashlib.sha256(context.files[desired_path]).digest()
+                or any(
+                    selector.contains(desired_path) for selector in context.resolution.state.ignore
+                )
+            ):
+                raise MetadataError("rename hint does not match the selected delta file")
+            source_path = normalize_relative_path(str(item["path"]))
+            package = self._package_for_path(context, desired_path)
+            item = self._delta_item(
+                context,
+                "rename",
+                source_path,
+                package_id=package.identity if package else None,
+            )
+            item.update(
+                {
+                    "from_path": source_path,
+                    "to_path": desired_path,
+                    "desired_sha256": hashlib.sha256(context.files[desired_path]).hexdigest(),
+                    "actual_sha256": hashlib.sha256(content).hexdigest(),
+                    "capture_modes": ["rename"],
+                    "enriched": True,
+                }
+            )
         target = self._editable_target(instance, context, target_layer)
         path = normalize_relative_path(item["path"])
-        source = context.instance.path / Path(path)
         package_id = item.get("package_id")
-        if package_id is not None and source.is_file():
-            self._capture_package_artifact(
-                context, target, str(package_id), path, source.read_bytes()
-            )
+        if package_id is not None and content is not None:
+            self._capture_package_artifact(context, target, str(package_id), path, content)
             return
-        if item["status"] == "rename" and source.is_file():
+        if item["status"] == "rename" and content is not None:
             desired_path = normalize_relative_path(str(item["to_path"]))
             payload_path = target.joinpath(*path.split("/"))
             payload_before = payload_path.read_bytes() if payload_path.exists() else None
             operations_path = target / METADATA_DIR / "local-edits.json"
             operations_before = operations_path.read_bytes() if operations_path.exists() else None
-            atomic_write(payload_path, source.read_bytes())
+            atomic_write(payload_path, content)
             self._append_operation(target, {"type": "remove", "path": desired_path})
             try:
                 refreshed = self.instance_context(instance)
-                remaining = {entry.get("path") for entry in self.instance_diff(refreshed)["items"]}
+                remaining = {
+                    entry.get("path")
+                    for entry in self.instance_diff(refreshed, enrich_actual=False)["items"]
+                }
                 if path in remaining or desired_path in remaining:
                     raise MetadataError(f"captured rename did not reconcile {path!r}")
             except Exception:
@@ -1187,20 +2083,23 @@ class ProjectService:
             self._append_operation(
                 target, {"type": "activation", "id": package_id, "state": "disabled"}
             )
-        elif source.is_file():
+        elif content is not None:
             changed_path = target.joinpath(*path.split("/"))
             before = changed_path.read_bytes() if changed_path.exists() else None
-            atomic_write(changed_path, source.read_bytes())
+            atomic_write(changed_path, content)
         else:
             changed_path = target / METADATA_DIR / "local-edits.json"
             before = changed_path.read_bytes() if changed_path.exists() else None
             self._append_operation(target, {"type": "remove", "path": path})
         try:
             refreshed = self.instance_context(instance)
-            if any(entry["path"] == path for entry in self.instance_diff(refreshed)["items"]):
+            if any(
+                entry["path"] == path
+                for entry in self.instance_diff(refreshed, enrich_actual=False)["items"]
+            ):
                 raise MetadataError(f"captured change did not reconcile {path!r}")
         except Exception:
-            if package_id is None or not source.is_file():
+            if package_id is None or content is None:
                 self._restore_file(changed_path, before)
             raise
 
@@ -1210,16 +2109,20 @@ class ProjectService:
         delta_id: str,
         target_layer: str | None = None,
         provider_match: object = None,
+        *,
+        expected_sha256: str | None = None,
     ) -> None:
         context = self.instance_context(instance)
-        item = next(
-            (entry for entry in self.instance_diff(context)["items"] if entry["id"] == delta_id),
-            None,
+        item, content = self._quick_delta_selection(
+            context,
+            delta_id,
+            expected_sha256=expected_sha256,
         )
-        if item is None or item["status"] == "remove" or not item["path"].lower().endswith(".jar"):
+        if item["status"] == "remove" or not item["path"].lower().endswith(".jar"):
             raise MetadataError("package import requires an existing changed or extra JAR")
         target = self._editable_target(instance, context, target_layer)
-        content = (context.instance.path / Path(item["path"])).read_bytes()
+        if content is None or self._inspect_jar_content(content) is None:
+            raise MetadataError("package import requires a valid changed or extra JAR")
         digest = hashlib.sha256(content).hexdigest()
         match = None
         if (
@@ -1274,7 +2177,8 @@ class ProjectService:
         try:
             refreshed = self.instance_context(instance)
             if any(
-                entry["path"] == item["path"] for entry in self.instance_diff(refreshed)["items"]
+                entry["path"] == item["path"]
+                for entry in self.instance_diff(refreshed, enrich_actual=False)["items"]
             ):
                 raise MetadataError(f"imported package did not reconcile {item['path']!r}")
         except Exception:
@@ -1512,7 +2416,8 @@ class ProjectService:
         try:
             refreshed = self.instance_context(context.instance.name)
             if any(
-                entry["path"] == destination for entry in self.instance_diff(refreshed)["items"]
+                entry["path"] == destination
+                for entry in self.instance_diff(refreshed, enrich_actual=False)["items"]
             ):
                 raise MetadataError(f"captured package did not reconcile {destination!r}")
         except Exception:
@@ -1600,65 +2505,78 @@ class ProjectService:
 
 
 class _BeforeImageJournal:
-    """Temporary request-scoped filesystem before-images for bounded layer edits."""
+    """Request-scoped before-images for a declared, bounded write set."""
 
-    def __init__(self, service: ProjectService, target: Path):
+    def __init__(
+        self,
+        service: ProjectService,
+        target: Path,
+        paths: list[Path] | tuple[Path, ...] = (),
+    ):
         self.service = service
         self.target = target.resolve()
-        self.temporary: tempfile.TemporaryDirectory[str] | None = None
-        self.root: Path | None = None
-        self.target_existed = False
-        self.cache_existed = False
-        self.links_before: bytes | None = None
-        self.absent_ancestors: list[Path] = []
+        self.paths = tuple(Path(os.path.abspath(path)) for path in paths)
+        self.before: dict[Path, tuple[str, bytes | str | None]] = {}
+        self.absent_directories: set[Path] = set()
+        self.target_existed = self.target.exists()
 
     def __enter__(self) -> _BeforeImageJournal:
-        self.service.state.root.mkdir(parents=True, exist_ok=True)
-        state_root = self.service.state.root.resolve()
-        if self.target.is_relative_to(state_root):
-            ancestor = self.target.parent
-            while ancestor != state_root:
-                if not ancestor.exists():
-                    self.absent_ancestors.append(ancestor)
-                ancestor = ancestor.parent
-        self.temporary = tempfile.TemporaryDirectory(
-            prefix="explorer-journal-", dir=self.service.state.root
-        )
-        self.root = Path(self.temporary.name)
-        self.target_existed = self.target.is_dir()
-        if self.target_existed:
-            shutil.copytree(self.target, self.root / "target", symlinks=True)
-        cache = self.service.state.root / "cache"
-        self.cache_existed = cache.is_dir()
-        if self.cache_existed:
-            shutil.copytree(cache, self.root / "cache", symlinks=True)
-        links = self.service.state.links_path
-        self.links_before = links.read_bytes() if links.exists() else None
+        for path in self.paths:
+            self.record(path)
         return self
+
+    def record(self, path: Path) -> None:
+        normalized = Path(os.path.abspath(path))
+        if normalized in self.before:
+            return
+        if not self.target_existed and normalized.is_relative_to(self.target):
+            self.before[normalized] = ("absent", None)
+            ancestor = normalized.parent
+            while not ancestor.exists():
+                self.absent_directories.add(ancestor)
+                ancestor = ancestor.parent
+            return
+        try:
+            mode = os.lstat(normalized).st_mode
+        except FileNotFoundError:
+            self.before[normalized] = ("absent", None)
+            ancestor = normalized.parent
+            while not ancestor.exists():
+                self.absent_directories.add(ancestor)
+                ancestor = ancestor.parent
+        else:
+            if stat.S_ISLNK(mode):
+                self.before[normalized] = ("symlink", os.readlink(normalized))
+            elif stat.S_ISREG(mode):
+                self.before[normalized] = ("file", normalized.read_bytes())
+            else:
+                raise MetadataError(f"journal write target is not a file: {normalized}")
 
     def __exit__(self, error_type: object, error: object, traceback: object) -> None:
         del error, traceback
-        try:
-            if error_type is not None:
-                self._restore_tree(self.target, "target", self.target_existed)
-                self._restore_tree(self.service.state.root / "cache", "cache", self.cache_existed)
-                self.service._restore_file(self.service.state.links_path, self.links_before)
-                for ancestor in self.absent_ancestors:
-                    if ancestor.is_dir() and next(ancestor.iterdir(), None) is None:
-                        ancestor.rmdir()
-        finally:
-            if self.temporary is not None:
-                self.temporary.cleanup()
-
-    def _restore_tree(self, destination: Path, name: str, existed: bool) -> None:
-        if destination.is_symlink() or destination.is_file():
-            destination.unlink()
-        elif destination.is_dir():
-            shutil.rmtree(destination)
-        if existed:
-            if self.root is None:
-                raise RuntimeError("journal was not entered")
-            shutil.copytree(self.root / name, destination, symlinks=True)
+        if error_type is None:
+            return
+        for path, (kind, value) in reversed(tuple(self.before.items())):
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            elif path.is_dir():
+                if next(path.iterdir(), None) is not None:
+                    raise MetadataError(f"cannot roll back non-empty write target: {path}")
+                path.rmdir()
+            if kind == "file":
+                if not isinstance(value, bytes):
+                    raise RuntimeError("invalid file before-image")
+                atomic_write(path, value)
+            elif kind == "symlink":
+                if not isinstance(value, str):
+                    raise RuntimeError("invalid symlink before-image")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(value, path)
+        for directory in sorted(
+            self.absent_directories, key=lambda item: len(item.parts), reverse=True
+        ):
+            if directory.is_dir() and next(directory.iterdir(), None) is None:
+                directory.rmdir()
 
 
 def _intersects(left: Path, right: Path) -> bool:

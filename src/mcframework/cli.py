@@ -215,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
                         arguments.instance,
                         item["id"],
                         arguments.target_layer,
+                        rename_to_path=item.get("to_path"),
                     )
                 imported += 1
             print(f"imported={imported}")

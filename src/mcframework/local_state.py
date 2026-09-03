@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -44,6 +45,10 @@ class LinkRecord:
     effective_layer: str
 
 
+class WebServerLockContended(MetadataError):
+    """Raised when another process owns the project-wide web-server lock."""
+
+
 class LocalState:
     """Own all untracked project state under the root ``.mcpack`` directory."""
 
@@ -70,6 +75,43 @@ class LocalState:
 
     def web_log_path(self, instance: str) -> Path:
         return self.root / "web" / "logs" / f"{validate_name(instance, 'instance name')}.log"
+
+    @property
+    def web_server_lock_path(self) -> Path:
+        return self.root / "web" / "server.lock"
+
+    @contextmanager
+    def web_server_lock(self) -> Iterator[None]:
+        """Acquire the project-wide server lifetime lock without waiting."""
+        path = self.web_server_lock_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            handle = path.open("a+b")
+        except OSError as exc:
+            raise MetadataError(f"cannot open web server lock {path}: {exc}") from exc
+        try:
+            try:
+                _lock_file(handle)
+            except OSError as exc:
+                if _is_lock_contention(exc):
+                    raise WebServerLockContended(
+                        "web server is already running for this project"
+                    ) from None
+                raise MetadataError(f"cannot acquire web server lock {path}: {exc}") from exc
+            try:
+                yield
+            finally:
+                _unlock_file(handle)
+        finally:
+            handle.close()
+
+    def probe_web_server_lock(self) -> bool:
+        """Return whether the lifetime lock can be acquired immediately."""
+        try:
+            with self.web_server_lock():
+                return True
+        except WebServerLockContended:
+            return False
 
     @contextmanager
     def lock(self, timeout: float = 10.0) -> Iterator[None]:
@@ -297,3 +339,11 @@ def _unlock_file(handle: Any) -> None:
         import fcntl
 
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+
+
+def _is_lock_contention(exc: OSError) -> bool:
+    return (
+        isinstance(exc, BlockingIOError)
+        or exc.errno in {errno.EACCES, errno.EAGAIN}
+        or getattr(exc, "winerror", None) in {33, 36}
+    )
