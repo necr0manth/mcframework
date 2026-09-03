@@ -7,6 +7,7 @@ import {
   refreshExplorerState,
 } from './file-explorer-model.js';
 import { runAutoCaptureFlow } from './api.js';
+import type { CaptureChoice, CaptureDecisions } from './file-explorer-model.js';
 
 type Entry = {
   path: string; name: string; type: string; actual: boolean; desired: boolean;
@@ -23,7 +24,7 @@ type PlanItem = {
   expected_sha256?: string; expected_absent?: boolean;
   provider_candidates?: Array<Record<string, unknown>>;
 };
-type Choice = { mode: string; provider_match?: Record<string, unknown>; fuzzyConfirmed?: boolean };
+type Choice = CaptureChoice;
 type ExplorerPage = {
   parent: string; items: Entry[]; next_cursor: number | null; ignore_rules: Rule[];
 };
@@ -39,7 +40,7 @@ type ExplorerClient = {
     explorer_patch: { path?: unknown; captured_count?: unknown };
   }>;
   capturePath: (
-    path: string, target: string, planRevision: number, decisions: Record<string, unknown>,
+    path: string, target: string, planRevision: number, decisions: CaptureDecisions,
   ) => Promise<unknown>;
   ignorePath: (path: string, kind: string, target: string) => Promise<unknown>;
   removeIgnore: (identity: Record<string, unknown>, target: string) => Promise<unknown>;
