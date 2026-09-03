@@ -293,3 +293,132 @@ def test_bare_modrinth_request_does_not_implicitly_accept_fuzzy_match(
     target = service.state.feature_root("dev")
     operation = json.loads((target / ".pack/local-edits.json").read_text())["operations"][0]
     assert operation["source"]["provider"] == "local"
+
+
+@pytest.mark.parametrize("filename", ["operations.json", "packages.json", "local-edits.json"])
+@pytest.mark.parametrize(
+    ("provider", "fail_reconciliation", "artifact_preexisting"),
+    [
+        ("exact", False, False),
+        ("local", False, False),
+        ("exact", True, False),
+        ("local", True, False),
+        ("local", True, True),
+    ],
+)
+def test_import_updates_owning_package_declaration_and_rolls_back(
+    layer_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    filename: str,
+    fail_reconciliation: bool,
+    artifact_preexisting: bool,
+) -> None:
+    original = jar("1.0")
+    (tmp_path / "original.jar").write_bytes(original)
+    declaration = {
+        "type": "package",
+        "id": "declared-id",
+        "logical_id": "selected",
+        "alias": "mod-alias",
+        "kind": "mod",
+        "activation": "enabled",
+        "version": "1.0",
+        "destination": "mods/selected.jar",
+        "automatic_requires": ["dependency"],
+        "source": {
+            "provider": "local",
+            "location": "original.jar",
+            "sha256": hashlib.sha256(original).hexdigest(),
+        },
+        "custom_metadata": {"notes": ["preserve this declaration"]},
+    }
+    before_op = {"type": "ignore", "glob": "logs/**"}
+    after_op = {"type": "ignore", "glob": "screenshots/**"}
+    target = layer_factory(
+        "client",
+        metadata_files={filename: [before_op, declaration, after_op]},
+        payload={"unrelated.txt": "preserve"},
+    )
+    owner = target / ".pack" / filename
+    document = json.loads(owner.read_text())
+    owner_before = (json.dumps(document, indent=4) + "\n").encode()
+    owner.write_bytes(owner_before)
+    game = tmp_path.parent / f"{tmp_path.name}-game"
+    (game / "mods").mkdir(parents=True)
+    content = jar("2.0")
+    (game / "mods/selected.jar").write_bytes(content)
+    service = ProjectService(
+        tmp_path, provider_matcher=Matcher("exact" if provider == "exact" else None)
+    )
+    service.link("client", "dev", game)
+    entry = service.explorer_snapshot("dev").entries["mods/selected.jar"]
+    detail = service.delta_detail("dev", entry["delta_id"])
+    context_before = service.instance_context("dev")
+    package = context_before.resolution.state.packages["declared-id"]
+    assert Path(package.source_file) == owner
+    assert package.source_index == 1
+    artifact = target / ".pack/artifacts" / f"{hashlib.sha256(content).hexdigest()}.jar"
+    if artifact_preexisting:
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(content)
+
+    def import_selected():
+        service.import_package(
+            "dev",
+            detail["id"],
+            "client",
+            detail["provider_candidates"][-1],
+            expected_sha256=detail["actual_sha256"],
+        )
+
+    if fail_reconciliation:
+        calls = 0
+
+        def fail_after_mutation(instance: str):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise MetadataError("simulated reconciliation failure")
+            return context_before
+
+        with monkeypatch.context() as patch:
+            patch.setattr(service, "instance_context", fail_after_mutation)
+            with pytest.raises(MetadataError, match="simulated"):
+                import_selected()
+        assert owner.read_bytes() == owner_before
+        assert artifact.exists() is artifact_preexisting
+        if artifact_preexisting:
+            assert artifact.read_bytes() == content
+        assert service.instance_context("dev").files["mods/selected.jar"] == original
+    else:
+        import_selected()
+        changed = json.loads(owner.read_text())
+        updated = changed["operations"][1]
+        expected_source = {
+            "provider": "direct_url" if provider == "exact" else "local",
+            "location": "https://cdn.example.invalid/selected.jar"
+            if provider == "exact"
+            else artifact.relative_to(tmp_path).as_posix(),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+        assert updated == {
+            **declaration,
+            "source": expected_source,
+            "version": "2.0",
+            "update_policy": "latest_compatible" if provider == "exact" else "fixed",
+        }
+        assert changed == {**document, "operations": [before_op, updated, after_op]}
+        context = service.instance_context("dev")
+        assert list(context.resolution.state.packages) == ["declared-id"]
+        package = context.resolution.state.packages["declared-id"]
+        assert Path(package.source_file) == owner
+        assert package.source_index == 1
+        assert context.files["mods/selected.jar"] == content
+        if provider == "local":
+            assert artifact.read_bytes() == content
+    if filename != "local-edits.json":
+        assert not (target / ".pack/local-edits.json").exists()
+    assert (target / "unrelated.txt").read_text() == "preserve"
+    assert (tmp_path / "original.jar").read_bytes() == original

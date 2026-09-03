@@ -2139,10 +2139,10 @@ class ProjectService:
             match = confirmed_provider_match(provider_match, content)
         artifact: Path | None = None
         artifact_existed = False
+        cached: Path | None = None
         if match is None:
             artifact = target / METADATA_DIR / "artifacts" / f"{digest}.jar"
             artifact_existed = artifact.exists()
-            atomic_write(artifact, content)
             source = {
                 "provider": "local",
                 "location": artifact.relative_to(self.project).as_posix(),
@@ -2155,7 +2155,6 @@ class ProjectService:
                 "sha256": digest,
             }
             cached = self.state.root / "cache" / "sha256" / digest[:2] / digest
-            atomic_write(cached, content)
         stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(item["path"]).stem).strip("-")
         existing_package = self._package_for_path(context, str(item["path"]))
         package_id = (
@@ -2170,7 +2169,38 @@ class ProjectService:
             or (existing_package.version if existing_package is not None else None)
         )
         operations_path = target / METADATA_DIR / "local-edits.json"
+        owns_declaration = (
+            existing_package is not None
+            and existing_package.source_file is not None
+            and Path(existing_package.source_file).resolve().parent
+            == (target / METADATA_DIR).resolve()
+        )
+        if owns_declaration:
+            assert existing_package is not None and existing_package.source_file is not None
+            operations_path = Path(existing_package.source_file)
         operations_before = operations_path.read_bytes() if operations_path.exists() else None
+        declaration_document = None
+        if owns_declaration:
+            assert existing_package is not None
+            if existing_package.source_index is None or existing_package.source_index < 0:
+                raise MetadataError(f"package declaration has no source index: {package_id!r}")
+            if operations_before is None:
+                raise MetadataError(f"cannot locate package declaration {package_id!r}")
+            try:
+                declaration_document = json.loads(operations_before)
+                declaration = declaration_document["operations"][existing_package.source_index]
+            except (UnicodeError, ValueError, KeyError, IndexError, TypeError) as exc:
+                raise MetadataError(f"cannot locate package declaration {package_id!r}") from exc
+            if (
+                not isinstance(declaration, dict)
+                or declaration.get("type") != "package"
+                or declaration.get("id") != package_id
+            ):
+                raise MetadataError(f"package declaration moved for {package_id!r}")
+            declaration["source"] = source
+            declaration["update_policy"] = "latest_compatible" if match is not None else "fixed"
+            if version:
+                declaration["version"] = version
         operations: list[dict[str, Any]] = []
         payload_path = target.joinpath(*str(item["path"]).split("/"))
         payload_before: bytes | None = None
@@ -2200,9 +2230,17 @@ class ProjectService:
             },
         )
         try:
+            if artifact is not None:
+                atomic_write(artifact, content)
+            if cached is not None:
+                atomic_write(cached, content)
             if payload_before is not None:
                 payload_path.unlink()
-            self._append_operations(target, operations)
+            if declaration_document is not None:
+                rendered = json.dumps(declaration_document, indent=2, ensure_ascii=False) + "\n"
+                atomic_write(operations_path, rendered.encode())
+            else:
+                self._append_operations(target, operations)
             refreshed = self.instance_context(instance)
             if any(
                 entry["path"] == item["path"]
