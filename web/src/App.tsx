@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ApiClient, ApiError, createKeyedRequestLoader, createRevisionedDeltaLoader, mergeDeltaForRevision, runRevisionedMutation } from './api.js';
 import FileExplorer from './FileExplorer.js';
-import { allMembersActive, buildMetadataTree, canImportDelta, deltaPresentation, featureSidebarSummary, paginateDelta, providerMatchFor } from './view-model.js';
+import { allMembersActive, buildMetadataTree, canImportDelta, deltaPresentation, featureSidebarSummary, packageActivationTarget, paginateDelta, providerMatchFor } from './view-model.js';
 
 type View = 'pack' | 'delta' | 'files';
 type Activation = 'available' | 'enabled' | 'disabled' | 'transitive' | string;
@@ -291,9 +291,10 @@ export default function App() {
 
   function togglePackage(item: PackageItem) {
     const state = active(item.activation) ? 'disabled' : 'enabled';
+    const target = packageActivationTarget(item, data?.writable_layers || [], targetLayer);
     void act(
       `activation:${item.id}`,
-      () => client.setActivation(item.id, state, targetLayer),
+      () => client.setActivation(item.id, state, target),
       `${item.id} is now ${state}.`,
     );
   }

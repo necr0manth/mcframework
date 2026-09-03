@@ -8,6 +8,15 @@ export function featureSidebarSummary(link) {
   return `${prefix}The instance resolves from ${link.effective_layer} on branch ${link.branch}.`;
 }
 
+export function packageActivationTarget(item, writableLayers, selectedTarget) {
+  const source = String(item.source_file || '').replaceAll('\\', '/');
+  const owner = writableLayers.find((layer) => {
+    const root = String(layer.path || '').replaceAll('\\', '/').replace(/\/+$/, '');
+    return layer.local && layer.virtual && root && source.startsWith(`${root}/`);
+  });
+  return owner?.id ?? selectedTarget;
+}
+
 export function allMembersActive(packages, members) {
   return members.length > 0 && members.every((member) => {
     const item = packages.find(

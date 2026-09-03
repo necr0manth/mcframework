@@ -2023,8 +2023,7 @@ class ProjectService:
         target = self._editable_target(instance, context, target_layer)
         before: bytes | None
         if (
-            target_layer is not None
-            and package.source_file is not None
+            package.source_file is not None
             and Path(package.source_file).resolve().is_relative_to(target)
         ):
             path = Path(package.source_file)
