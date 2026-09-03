@@ -7,11 +7,13 @@ import {
   refreshExplorerState,
 } from './file-explorer-model.js';
 import { runAutoCaptureFlow } from './api.js';
+import { singleFileImportItem } from './semantic-import.js';
 
 type Entry = {
   path: string; name: string; type: string; actual: boolean; desired: boolean;
   synthetic: boolean; ignored: boolean; status: string; changed: boolean;
   changed_count: number; actionable: boolean; reason: string; depth?: number;
+  delta_id?: string | null; capture_modes?: string[];
 };
 type Rule = {
   id: string; selector: { kind: string; path: string }; layer: string; source: string;
@@ -21,9 +23,8 @@ type PlanItem = {
   id: string; path: string; status: string; capture_modes: string[];
   supported?: boolean; reason?: string;
   expected_sha256?: string; expected_absent?: boolean;
-  provider_candidates?: Array<Record<string, unknown>>;
 };
-type Choice = { mode: string; provider_match?: Record<string, unknown>; fuzzyConfirmed?: boolean };
+type Choice = { mode: string };
 type ExplorerPage = {
   parent: string; items: Entry[]; next_cursor: number | null; ignore_rules: Rule[];
 };
@@ -45,7 +46,7 @@ type ExplorerClient = {
   removeIgnore: (identity: Record<string, unknown>, target: string) => Promise<unknown>;
 };
 
-export default function FileExplorer({ client, data, targetLayer, layers, onTargetLayer, onMutate, onCompactMutation, onRevisionConflict, onError }: {
+export default function FileExplorer({ client, data, targetLayer, layers, onTargetLayer, onMutate, onCompactMutation, onRevisionConflict, onReviewImport, onError }: {
   client: ExplorerClient; data: { revision: number }; targetLayer: string;
   layers: Array<{ id: string; local: boolean }>;
   onTargetLayer: (value: string) => void;
@@ -54,6 +55,7 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   ) => Promise<boolean>;
   onCompactMutation: (revision: number, success: string) => void;
   onRevisionConflict: (reason: unknown) => Promise<void>;
+  onReviewImport: (item: NonNullable<ReturnType<typeof singleFileImportItem>>, revision: number) => Promise<void>;
   onError: (message: string) => void;
 }) {
   const [mode, setMode] = useState('all');
@@ -214,6 +216,11 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
     const label = `capture:auto:${item.path}`;
     setBusy(label);
     try {
+      const semanticItem = singleFileImportItem(item);
+      if (semanticItem) {
+        await onReviewImport(semanticItem, data.revision);
+        return;
+      }
       await runAutoCaptureFlow({
         client,
         path: item.path,
@@ -292,6 +299,6 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
       {next[''] !== null && next[''] !== undefined && <button className="load-more" disabled={!!busy} onClick={() => void load('', next[''] || 0)}>Load more</button>}
       {Object.entries(next).filter(([parent, cursor]) => parent && cursor !== null).map(([parent, cursor]) => <button className="load-more" disabled={!!busy} key={parent} onClick={() => void load(parent, cursor || 0)}>Load more in {parent}</button>)}
     </section><aside className="ignore-inspector"><p className="eyebrow">Selected layer</p><h2>Ignore rules</h2>{rules.length ? rules.map((rule) => <article key={rule.id}><code>{rule.selector.kind}: {rule.selector.path}</code><small>{rule.own ? 'Own rule' : `Inherited from ${rule.layer}`}</small>{rule.removable && <button disabled={!!busy} onClick={() => void removeRule(rule)}>Remove</button>}</article>) : <p>No ignore rules apply in this composition.</p>}</aside></div>
-    {plan && <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true"><header><div><p className="eyebrow">Atomic folder capture</p><h2>Choose package handling</h2></div><button onClick={() => setPlan(null)}>×</button></header><div className="modal-body"><p>Every changed descendant must have a valid decision before anything is written.</p>{plan.items.filter((item) => item.capture_modes.includes('package') && item.capture_modes.length > 1).map((item) => <fieldset key={item.id}><legend>{item.path}</legend>{item.capture_modes.includes('payload') && <label className="choice"><input type="radio" checked={choices[item.id]?.mode === 'payload'} onChange={() => setChoices({ ...choices, [item.id]: { mode: 'payload' } })} /><span><strong>Raw file</strong><small>Capture this JAR as ordinary payload.</small></span></label>}<label className="choice"><input type="radio" checked={choices[item.id]?.mode === 'package' && !choices[item.id]?.provider_match} onChange={() => setChoices({ ...choices, [item.id]: { mode: 'package' } })} /><span><strong>Local package</strong><small>Store a verified local SHA-256 artifact.</small></span></label>{(item.provider_candidates || []).filter((candidate) => candidate.provider !== 'local').map((candidate) => <label className="choice" key={`${candidate.provider}:${candidate.version_id}`}><input type="radio" checked={choices[item.id]?.provider_match === candidate} onChange={() => setChoices({ ...choices, [item.id]: { mode: 'package', provider_match: candidate } })} /><span><strong>{String(candidate.provider)} · {String(candidate.version || candidate.version_id)}</strong><small>{String(candidate.confidence)} provider match</small></span></label>)}{choices[item.id]?.provider_match?.confidence === 'fuzzy' && <label><input type="checkbox" checked={choices[item.id]?.fuzzyConfirmed || false} onChange={(event) => setChoices({ ...choices, [item.id]: { ...choices[item.id], fuzzyConfirmed: event.target.checked } })} /> I reviewed and confirm this fuzzy match</label>}</fieldset>)}</div><footer><button onClick={() => setPlan(null)}>Cancel</button><button className="primary" disabled={!!busy} onClick={() => void submitPlan()}>Send all atomically</button></footer></section></div>}
+    {plan && <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true"><header><div><p className="eyebrow">Atomic folder capture</p><h2>Choose package handling</h2></div><button onClick={() => setPlan(null)}>×</button></header><div className="modal-body"><p>Every changed descendant must have a valid decision before anything is written.</p>{plan.items.filter((item) => item.capture_modes.includes('package') && item.capture_modes.length > 1).map((item) => <fieldset key={item.id}><legend>{item.path}</legend>{item.capture_modes.includes('payload') && <label className="choice"><input type="radio" checked={choices[item.id]?.mode === 'payload'} onChange={() => setChoices({ ...choices, [item.id]: { mode: 'payload' } })} /><span><strong>Raw file</strong><small>Capture this JAR as ordinary payload.</small></span></label>}<label className="choice"><input type="radio" checked={choices[item.id]?.mode === 'package'} onChange={() => setChoices({ ...choices, [item.id]: { mode: 'package' } })} /><span><strong>Local package</strong><small>Store a verified local SHA-256 artifact.</small></span></label></fieldset>)}</div><footer><button onClick={() => setPlan(null)}>Cancel</button><button className="primary" disabled={!!busy} onClick={() => void submitPlan()}>Send all atomically</button></footer></section></div>}
   </>;
 }

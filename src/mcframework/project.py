@@ -2121,7 +2121,8 @@ class ProjectService:
         if item["status"] == "remove" or not item["path"].lower().endswith(".jar"):
             raise MetadataError("package import requires an existing changed or extra JAR")
         target = self._editable_target(instance, context, target_layer)
-        if content is None or self._inspect_jar_content(content) is None:
+        metadata = self._inspect_jar_content(content) if content is not None else None
+        if content is None or metadata is None:
             raise MetadataError("package import requires a valid changed or extra JAR")
         digest = hashlib.sha256(content).hexdigest()
         match = None
@@ -2156,25 +2157,52 @@ class ProjectService:
             cached = self.state.root / "cache" / "sha256" / digest[:2] / digest
             atomic_write(cached, content)
         stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(item["path"]).stem).strip("-")
-        package_id = stem or f"imported-{digest[:12]}"
+        existing_package = self._package_for_path(context, str(item["path"]))
+        package_id = (
+            existing_package.identity if existing_package else stem or f"imported-{digest[:12]}"
+        )
         existing_ids = set(context.resolution.state.packages)
-        if package_id in existing_ids:
+        if existing_package is None and package_id in existing_ids:
             package_id = f"{package_id}-{digest[:8]}"
+        version = (
+            (match.version if match is not None else None)
+            or metadata.version
+            or (existing_package.version if existing_package is not None else None)
+        )
         operations_path = target / METADATA_DIR / "local-edits.json"
         operations_before = operations_path.read_bytes() if operations_path.exists() else None
-        self._append_operation(
-            target,
+        operations: list[dict[str, Any]] = []
+        payload_path = target.joinpath(*str(item["path"]).split("/"))
+        payload_before: bytes | None = None
+        if item["path"] in context.resolution.state.files:
+            operations.append({"type": "remove", "path": item["path"]})
+            if payload_path.is_file():
+                payload_before = payload_path.read_bytes()
+        operations.append(
             {
                 "type": "package",
                 "id": package_id,
+                **(
+                    {
+                        "logical_id": existing_package.logical_identity,
+                        "kind": existing_package.kind,
+                        "automatic_requires": list(existing_package.automatic_requires),
+                        **({"alias": existing_package.alias} if existing_package.alias else {}),
+                    }
+                    if existing_package is not None
+                    else {}
+                ),
                 "activation": "enabled",
                 "destination": item["path"],
                 "source": source,
                 "update_policy": "latest_compatible" if match is not None else "fixed",
-                **({"version": match.version} if match is not None and match.version else {}),
+                **({"version": version} if version else {}),
             },
         )
         try:
+            if payload_before is not None:
+                payload_path.unlink()
+            self._append_operations(target, operations)
             refreshed = self.instance_context(instance)
             if any(
                 entry["path"] == item["path"]
@@ -2183,6 +2211,8 @@ class ProjectService:
                 raise MetadataError(f"imported package did not reconcile {item['path']!r}")
         except Exception:
             self._restore_file(operations_path, operations_before)
+            if payload_before is not None:
+                self._restore_file(payload_path, payload_before)
             if artifact is not None and not artifact_existed and artifact.exists():
                 artifact.unlink()
             raise
