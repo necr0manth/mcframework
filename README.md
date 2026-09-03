@@ -180,6 +180,11 @@ manifest is written there. Extra files are deleted only when they match resolved
 selectors. `ignore` selectors hide development-diff noise only; they never suppress writes or
 prune deletion.
 
+Layers describe only the managed portion of an instance. `remove` drops an inherited file
+from the composition; an existing instance copy remains and appears as an `add` in delta
+(unless ignored). To delete that copy during sync, also declare a matching `prune` rule.
+Files outside the desired composition and prune rules are preserved.
+
 `import <instance>` captures changed and extra instance files into the instance-local layer;
 extra JARs become exact-hash local package declarations. Fabric, Quilt, Forge, and NeoForge
 metadata is inspected without executing the JAR. Local SHA-256 capture is the default. An
