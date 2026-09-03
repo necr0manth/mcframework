@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ApiClient, ApiError, createKeyedRequestLoader, createRevisionedDeltaLoader, mergeDeltaForRevision, runRevisionedMutation } from './api.js';
 import FileExplorer from './FileExplorer.js';
-import { allMembersActive, buildMetadataTree, canImportDelta, deltaPresentation, paginateDelta, providerMatchFor } from './view-model.js';
+import { allMembersActive, buildMetadataTree, canImportDelta, deltaPresentation, featureSidebarSummary, paginateDelta, providerMatchFor } from './view-model.js';
 
 type View = 'pack' | 'delta' | 'files';
 type Activation = 'available' | 'enabled' | 'disabled' | 'transitive' | string;
@@ -488,7 +488,8 @@ export default function App() {
 
         <section className="feature-panel">
           <div className="panel-title"><div><p className="eyebrow">Temporary layer</p><h2>Features</h2></div>{data.capabilities.features && remainingFeatures.length > 0 && <button aria-label="Add feature" onClick={() => { setFeatureChoice(remainingFeatures[0] || ''); setFeatureDialog(true); }}>+</button>}</div>
-          {data.link.features.length ? <ul>{data.link.features.map((feature) => <li key={feature}><span>{feature}</span>{data.capabilities.features && <button disabled={!!busy} aria-label={`Remove ${feature}`} onClick={() => void act(`feature:${feature}`, () => client.removeFeature(feature), `Feature ${feature} was removed.`)}>×</button>}</li>)}</ul> : <p className="muted-copy">No features are active. The instance resolves directly from <strong>{data.link.branch}</strong>.</p>}
+          {data.link.features.length > 0 && <ul>{data.link.features.map((feature) => <li key={feature}><span>{feature}</span>{data.capabilities.features && <button disabled={!!busy} aria-label={`Remove ${feature}`} onClick={() => void act(`feature:${feature}`, () => client.removeFeature(feature), `Feature ${feature} was removed.`)}>×</button>}</li>)}</ul>}
+          <p className="muted-copy">{featureSidebarSummary(data.link)}</p>
         </section>
 
         <div className="path-card"><p className="eyebrow">Minecraft directory</p><code title={data.instance.path}>{data.instance.path || 'Path unavailable'}</code></div>

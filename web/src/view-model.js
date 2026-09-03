@@ -3,6 +3,11 @@ function declarationTarget(declaration) {
   return String(data.id ?? data.source ?? data.target ?? '');
 }
 
+export function featureSidebarSummary(link) {
+  const prefix = link.features.length ? '' : 'No features are active. ';
+  return `${prefix}The instance resolves from ${link.effective_layer} on branch ${link.branch}.`;
+}
+
 export function allMembersActive(packages, members) {
   return members.length > 0 && members.every((member) => {
     const item = packages.find(
