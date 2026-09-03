@@ -25,6 +25,7 @@ import {
   buildMetadataTree,
   canImportDelta,
   deltaPresentation,
+  packageActivationTarget,
   paginateDelta,
   providerMatchFor,
 } from '../src/view-model.js';
@@ -347,6 +348,68 @@ test('provider confirmation preserves URL and hashes required by the backend', (
     hashes: { sha512: 'verified-hash' },
     confidence: 'exact',
   });
+});
+
+test('package toggle targets the local overlay owner instead of a stale base selection', async () => {
+  const overlay = {
+    id: '.mcpack/features/dev', path: 'C:\\project\\.mcpack\\features\\dev\\',
+    local: true, virtual: true,
+  };
+  const layers = [
+    { id: 'base', path: 'C:/project/base', local: false, virtual: false },
+    overlay,
+  ];
+  const calls = [];
+  const client = new ApiClient(async (url, options) => {
+    calls.push({ url, options });
+    return response({ ...completeBootstrap, revision: 8 + calls.length });
+  });
+  const item = {
+    id: 'extra', source_file: 'C:/project/.mcpack/features/dev/.pack/local-edits.json',
+  };
+  for (const state of ['disabled', 'enabled', 'disabled', 'enabled']) {
+    await client.setActivation(item.id, state, packageActivationTarget(item, layers, 'base'));
+  }
+  assert.deepEqual(calls.map((call) => call.url), Array(4).fill('/api/v1/packages/extra/activation'));
+  assert.deepEqual(calls.map((call) => JSON.parse(call.options.body)), [
+    { state: 'disabled', target_layer: overlay.id },
+    { state: 'enabled', target_layer: overlay.id },
+    { state: 'disabled', target_layer: overlay.id },
+    { state: 'enabled', target_layer: overlay.id },
+  ]);
+  assert.equal(packageActivationTarget(item, layers, overlay.id), overlay.id);
+  assert.equal(packageActivationTarget(item, layers, ''), overlay.id);
+});
+
+test('package toggle preserves inherited targets and requires a local virtual path boundary', async () => {
+  const layers = [
+    { id: 'base', path: '/project/base', local: false, virtual: false },
+    { id: 'feature', path: '/project/feature', local: false, virtual: false },
+    { id: 'local-real', path: '/project/local-real', local: true, virtual: false },
+    { id: 'remote-virtual', path: '/project/remote', local: false, virtual: true },
+    { id: 'overlay', path: '/project/.mcpack/features/dev/', local: true, virtual: true },
+  ];
+  const calls = [];
+  const client = new ApiClient(async (url, options) => {
+    calls.push(JSON.parse(options.body));
+    return response(completeBootstrap);
+  });
+  for (const source of [
+    '/project/base/.pack/operations.json',
+    '/project/feature/.pack/operations.json',
+    '/project/local-real/.pack/operations.json',
+    '/project/remote/.pack/operations.json',
+    '/project/.mcpack/features/dev-other/.pack/local-edits.json',
+    '',
+  ]) {
+    const item = { id: 'inherited', source_file: source };
+    for (const selected of ['base', 'feature', 'overlay', '']) {
+      assert.equal(packageActivationTarget(item, layers, selected), selected);
+    }
+    await client.setActivation(item.id, 'disabled', packageActivationTarget(item, layers, 'feature'));
+  }
+  assert.deepEqual(calls, Array(6).fill({ state: 'disabled', target_layer: 'feature' }));
+  assert.equal(packageActivationTarget({}, [], 'base'), 'base');
 });
 
 test('API actions send quoted If-Match and all batch routes', async () => {

@@ -3,6 +3,15 @@ function declarationTarget(declaration) {
   return String(data.id ?? data.source ?? data.target ?? '');
 }
 
+export function packageActivationTarget(item, writableLayers, selectedTarget) {
+  const source = String(item.source_file || '').replaceAll('\\', '/');
+  const owner = writableLayers.find((layer) => {
+    const root = String(layer.path || '').replaceAll('\\', '/').replace(/\/+$/, '');
+    return layer.local && layer.virtual && root && source.startsWith(`${root}/`);
+  });
+  return owner?.id ?? selectedTarget;
+}
+
 export function allMembersActive(packages, members) {
   return members.length > 0 && members.every((member) => {
     const item = packages.find(
