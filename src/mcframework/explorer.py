@@ -12,6 +12,8 @@ from .errors import MetadataError
 from .model import IgnoreSelector
 from .paths import normalize_relative_path
 
+type SourceGenerations = tuple[tuple[Path, tuple[int, int, int, int] | None], ...]
+
 
 @dataclass(frozen=True)
 class ExplorerScan:
@@ -33,6 +35,7 @@ class ExplorerSnapshot:
     context_fingerprint: str
     context_verified: bool = True
     auto_payload_epochs: tuple[tuple[str, str | None], ...] = ()
+    source_generations: SourceGenerations = ()
 
     def page(
         self,
@@ -86,7 +89,11 @@ class ExplorerSnapshot:
         }
 
     def reproject(
-        self, selectors: tuple[IgnoreSelector, ...], *, context_fingerprint: str | None = None
+        self,
+        selectors: tuple[IgnoreSelector, ...],
+        *,
+        context_fingerprint: str | None = None,
+        source_generations: SourceGenerations | None = None,
     ) -> ExplorerSnapshot:
         entries = {path: dict(entry) for path, entry in self.entries.items()}
         for path, entry in entries.items():
@@ -101,6 +108,7 @@ class ExplorerSnapshot:
             context_fingerprint or self.context_fingerprint,
             self.context_verified,
             self.auto_payload_epochs,
+            self.source_generations if source_generations is None else source_generations,
         )
 
 
@@ -219,6 +227,7 @@ def build_snapshot(
     context_fingerprint: str = "",
     context_verified: bool = True,
     auto_payload_epochs: tuple[tuple[str, str | None], ...] = (),
+    source_generations: SourceGenerations = (),
 ) -> ExplorerSnapshot:
     root = root.resolve()
     physical = scan or scan_instance(root)
@@ -352,6 +361,7 @@ def build_snapshot(
         context_fingerprint,
         context_verified,
         auto_payload_epochs,
+        source_generations,
     )
 
 

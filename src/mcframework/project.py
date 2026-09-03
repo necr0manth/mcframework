@@ -23,7 +23,13 @@ from .artifacts import (
 )
 from .build import Builder
 from .errors import MetadataError
-from .explorer import ExplorerSnapshot, build_snapshot, scan_generation_matches, scan_instance
+from .explorer import (
+    ExplorerSnapshot,
+    SourceGenerations,
+    build_snapshot,
+    scan_generation_matches,
+    scan_instance,
+)
 from .loader import MARKER_FILE, METADATA_DIR, WorkspaceLoader
 from .local_state import InstanceRecord, LinkRecord, LocalState, validate_name
 from .model import Activation, IgnoreSelector, PackState, Resolution, SelectorKind
@@ -508,6 +514,55 @@ class ProjectService:
         )
 
     @staticmethod
+    def _source_generation(path: Path) -> tuple[int, int, int, int] | None:
+        try:
+            current = path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        return (current.st_mode, current.st_mtime_ns, current.st_size, current.st_ino)
+
+    def _context_source_generations(self, context: InstanceContext) -> SourceGenerations:
+        paths = {
+            self.state.instances_path,
+            self.state.links_path,
+            self.state.parameters_path(context.instance.name),
+        }
+        for root in {Path(trace.root).resolve() for trace in context.resolution.trace}:
+            pending = [root]
+            while pending:
+                directory = pending.pop()
+                paths.add(directory)
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        path = Path(entry.path)
+                        paths.add(path)
+                        if path == root / METADATA_DIR:
+                            # Only top-level JSON metadata is consumed by WorkspaceLoader.
+                            # Artifact storage and other metadata internals are not payload.
+                            paths.add(path.resolve())
+                            for metadata in path.glob("*.json"):
+                                paths.add(metadata)
+                                if metadata.is_symlink():
+                                    paths.add(metadata.resolve())
+                        elif entry.is_dir(follow_symlinks=False):
+                            pending.append(path)
+        return tuple(
+            (path, self._source_generation(path))
+            for path in sorted(paths, key=lambda value: str(value))
+        )
+
+    def _snapshot_source_generations_match(self, snapshot: ExplorerSnapshot) -> bool:
+        # Recheck saved files and directories without rereading payload or resolving layers.
+        # Directory stats detect additions as well as changes to the already-known files.
+        try:
+            return all(
+                self._source_generation(path) == expected
+                for path, expected in snapshot.source_generations
+            )
+        except OSError:
+            return False
+
+    @staticmethod
     def _context_fingerprint(context: InstanceContext) -> str:
         digest = hashlib.sha256()
         for path, content in sorted(context.files.items()):
@@ -546,8 +601,10 @@ class ProjectService:
         cached = self._explorer_snapshots.get(instance)
         if not refresh and cached is not None:
             desired_paths = {path for path, entry in cached.entries.items() if entry["desired"]}
-            if self._snapshot_auto_payload_epochs_match(cached) and scan_generation_matches(
-                cached.scan, desired_paths
+            if (
+                self._snapshot_auto_payload_epochs_match(cached)
+                and self._snapshot_source_generations_match(cached)
+                and scan_generation_matches(cached.scan, desired_paths)
             ):
                 return cached
             self.invalidate_explorer(instance)
@@ -567,6 +624,7 @@ class ProjectService:
             scan=physical,
             context_fingerprint=self._context_fingerprint(context),
             auto_payload_epochs=self._context_auto_payload_epochs(context),
+            source_generations=self._context_source_generations(context),
         )
         self._explorer_snapshots[instance] = snapshot
         return snapshot
@@ -697,6 +755,10 @@ class ProjectService:
         target_layer: str | None = None,
     ) -> None:
         context = self.instance_context(instance)
+        cached = self._explorer_snapshots.get(instance)
+        if cached is not None and not self._snapshot_source_generations_match(cached):
+            self.invalidate_explorer(instance)
+            cached = None
         target = self._target_path(instance, context, target_layer)
         try:
             kind = SelectorKind(selector_kind)
@@ -717,11 +779,11 @@ class ProjectService:
                 {"type": "ignore", "selector": selector.document()},
             )
             refreshed = self.instance_context(instance)
-        cached = self._explorer_snapshots.get(instance)
         if cached is not None:
             self._explorer_snapshots[instance] = cached.reproject(
                 refreshed.resolution.state.ignore,
                 context_fingerprint=self._context_fingerprint(refreshed),
+                source_generations=self._context_source_generations(refreshed),
             )
 
     def remove_ignore(
@@ -733,6 +795,10 @@ class ProjectService:
         if not isinstance(identity, dict):
             raise MetadataError("ignore rule identity must be an object")
         context = self.instance_context(instance)
+        cached = self._explorer_snapshots.get(instance)
+        if cached is not None and not self._snapshot_source_generations_match(cached):
+            self.invalidate_explorer(instance)
+            cached = None
         target = self._target_path(instance, context, target_layer)
         expected_target = self._layer_reference(target)
         if identity.get("target") != expected_target:
@@ -775,11 +841,11 @@ class ProjectService:
                     (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode(),
                 )
                 refreshed = self.instance_context(instance)
-        cached = self._explorer_snapshots.get(instance)
         if cached is not None:
             self._explorer_snapshots[instance] = cached.reproject(
                 refreshed.resolution.state.ignore,
                 context_fingerprint=self._context_fingerprint(refreshed),
+                source_generations=self._context_source_generations(refreshed),
             )
 
     def capture_explorer_path(
@@ -1034,6 +1100,7 @@ class ProjectService:
                 scan=snapshot.scan,
                 context_fingerprint=self._context_fingerprint(final_context),
                 auto_payload_epochs=self._context_auto_payload_epochs(final_context),
+                source_generations=self._context_source_generations(final_context),
             )
         else:
             self.invalidate_explorer(instance)
@@ -1254,6 +1321,7 @@ class ProjectService:
                             context_fingerprint=self._context_fingerprint(patched_context),
                             context_verified=False,
                             auto_payload_epochs=self._context_auto_payload_epochs(patched_context),
+                            source_generations=self._context_source_generations(patched_context),
                         )
 
         for cached_instance in tuple(self._explorer_snapshots):
