@@ -126,15 +126,9 @@ def resolve_dependencies(
                 else:
                     groups[target] = replace(groups[target], activation=Activation.TRANSITIVE)
 
-    if automatic_dependencies:
-        auto_queue = [identity for identity in sorted(active_nodes) if identity in packages]
-        visited: set[str] = set()
-        while auto_queue:
-            source_id = auto_queue.pop(0)
-            if source_id in visited:
-                continue
-            visited.add(source_id)
-            for logical_id in packages[source_id].automatic_requires:
+        # Newly activated packages must traverse both kinds of dependency edges.
+        if automatic_dependencies and source in packages:
+            for logical_id in packages[source].automatic_requires:
                 candidates = [
                     package
                     for package in packages.values()
@@ -160,7 +154,7 @@ def resolve_dependencies(
                     packages[selected.identity] = replace(
                         selected, activation=Activation.TRANSITIVE
                     )
-                    auto_queue.append(selected.identity)
+                    queue.append(selected.identity)
 
     active = tuple(packages[item] for item in sorted(active_nodes) if item in packages)
     destinations: dict[str, str] = {}
