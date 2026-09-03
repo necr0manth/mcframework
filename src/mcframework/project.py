@@ -2218,7 +2218,8 @@ class ProjectService:
         if item["status"] == "remove" or not item["path"].lower().endswith(".jar"):
             raise MetadataError("package import requires an existing changed or extra JAR")
         target = self._editable_target(instance, context, target_layer)
-        if content is None or self._inspect_jar_content(content) is None:
+        metadata = self._inspect_jar_content(content) if content is not None else None
+        if content is None or metadata is None:
             raise MetadataError("package import requires a valid changed or extra JAR")
         digest = hashlib.sha256(content).hexdigest()
         match = None
@@ -2235,10 +2236,10 @@ class ProjectService:
             match = confirmed_provider_match(provider_match, content)
         artifact: Path | None = None
         artifact_existed = False
+        cached: Path | None = None
         if match is None:
             artifact = target / METADATA_DIR / "artifacts" / f"{digest}.jar"
             artifact_existed = artifact.exists()
-            atomic_write(artifact, content)
             source = {
                 "provider": "local",
                 "location": artifact.relative_to(self.project).as_posix(),
@@ -2251,27 +2252,92 @@ class ProjectService:
                 "sha256": digest,
             }
             cached = self.state.root / "cache" / "sha256" / digest[:2] / digest
-            atomic_write(cached, content)
         stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(item["path"]).stem).strip("-")
-        package_id = stem or f"imported-{digest[:12]}"
+        existing_package = self._package_for_path(context, str(item["path"]))
+        package_id = (
+            existing_package.identity if existing_package else stem or f"imported-{digest[:12]}"
+        )
         existing_ids = set(context.resolution.state.packages)
-        if package_id in existing_ids:
+        if existing_package is None and package_id in existing_ids:
             package_id = f"{package_id}-{digest[:8]}"
+        version = (
+            (match.version if match is not None else None)
+            or metadata.version
+            or (existing_package.version if existing_package is not None else None)
+        )
         operations_path = target / METADATA_DIR / "local-edits.json"
+        owns_declaration = (
+            existing_package is not None
+            and existing_package.source_file is not None
+            and Path(existing_package.source_file).resolve().parent
+            == (target / METADATA_DIR).resolve()
+        )
+        if owns_declaration:
+            assert existing_package is not None and existing_package.source_file is not None
+            operations_path = Path(existing_package.source_file)
         operations_before = operations_path.read_bytes() if operations_path.exists() else None
-        self._append_operation(
-            target,
+        declaration_document = None
+        if owns_declaration:
+            assert existing_package is not None
+            if existing_package.source_index is None or existing_package.source_index < 0:
+                raise MetadataError(f"package declaration has no source index: {package_id!r}")
+            if operations_before is None:
+                raise MetadataError(f"cannot locate package declaration {package_id!r}")
+            try:
+                declaration_document = json.loads(operations_before)
+                declaration = declaration_document["operations"][existing_package.source_index]
+            except (UnicodeError, ValueError, KeyError, IndexError, TypeError) as exc:
+                raise MetadataError(f"cannot locate package declaration {package_id!r}") from exc
+            if (
+                not isinstance(declaration, dict)
+                or declaration.get("type") != "package"
+                or declaration.get("id") != package_id
+            ):
+                raise MetadataError(f"package declaration moved for {package_id!r}")
+            declaration["source"] = source
+            declaration["update_policy"] = "latest_compatible" if match is not None else "fixed"
+            if version:
+                declaration["version"] = version
+        operations: list[dict[str, Any]] = []
+        payload_path = target.joinpath(*str(item["path"]).split("/"))
+        payload_before: bytes | None = None
+        if item["path"] in context.resolution.state.files:
+            operations.append({"type": "remove", "path": item["path"]})
+            if payload_path.is_file():
+                payload_before = payload_path.read_bytes()
+        operations.append(
             {
                 "type": "package",
                 "id": package_id,
+                **(
+                    {
+                        "logical_id": existing_package.logical_identity,
+                        "kind": existing_package.kind,
+                        "automatic_requires": list(existing_package.automatic_requires),
+                        **({"alias": existing_package.alias} if existing_package.alias else {}),
+                    }
+                    if existing_package is not None
+                    else {}
+                ),
                 "activation": "enabled",
                 "destination": item["path"],
                 "source": source,
                 "update_policy": "latest_compatible" if match is not None else "fixed",
-                **({"version": match.version} if match is not None and match.version else {}),
+                **({"version": version} if version else {}),
             },
         )
         try:
+            if artifact is not None:
+                atomic_write(artifact, content)
+            if cached is not None:
+                atomic_write(cached, content)
+            if payload_before is not None:
+                payload_path.unlink()
+            if declaration_document is not None:
+                rendered = json.dumps(declaration_document, indent=2, ensure_ascii=False) + "\n"
+                atomic_write(operations_path, rendered.encode())
+            else:
+                self._append_operations(target, operations)
             refreshed = self.instance_context(instance)
             if any(
                 entry["path"] == item["path"]
@@ -2280,6 +2346,8 @@ class ProjectService:
                 raise MetadataError(f"imported package did not reconcile {item['path']!r}")
         except Exception:
             self._restore_file(operations_path, operations_before)
+            if payload_before is not None:
+                self._restore_file(payload_path, payload_before)
             if artifact is not None and not artifact_existed and artifact.exists():
                 artifact.unlink()
             raise
