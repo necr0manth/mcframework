@@ -185,21 +185,51 @@ class ProjectService:
             old_record = instances.pop(old)
             instances[new] = InstanceRecord(new, old_record.path)
             links = self.state.links()
+            moves = []
+            metadata_updates: dict[Path, bytes] = {}
+            old_overlay = self.state.feature_root(old)
+            new_overlay = self.state.feature_root(new)
+            before_paths = [self.state.instances_path, self.state.links_path]
             if old in links:
                 old_link = links.pop(old)
                 effective = old_link.effective_layer
-                old_overlay = self.state.feature_root(old)
-                new_overlay = self.state.feature_root(new)
                 if old_overlay.exists():
-                    new_overlay.parent.mkdir(parents=True, exist_ok=True)
-                    old_overlay.rename(new_overlay)
+                    metadata_updates = self._renamed_overlay_sources(old_overlay, new_overlay)
+                    before_paths.extend(metadata_updates)
+                    before_paths.append(old_overlay / METADATA_DIR / MARKER_FILE)
+                    moves.append((old_overlay, new_overlay))
                     effective = self._layer_reference(new_overlay)
-                    self._rewrite_overlay_identity(new, new_overlay)
                 links[new] = LinkRecord(new, old_link.branch, effective)
-            self.state.write_instances(instances)
-            self.state.write_links(links)
-            self._rename_optional(self.state.parameters_path(old), self.state.parameters_path(new))
-            self._rename_optional(self.state.web_log_path(old), self.state.web_log_path(new))
+            moves.extend(
+                (source, destination)
+                for source, destination in (
+                    (self.state.parameters_path(old), self.state.parameters_path(new)),
+                    (self.state.web_log_path(old), self.state.web_log_path(new)),
+                )
+                if source.exists()
+            )
+            for _, destination in moves:
+                if destination.exists() or destination.is_symlink():
+                    raise MetadataError(
+                        f"instance rename destination already exists: {destination}"
+                    )
+            with _BeforeImageJournal(self, self.state.root, before_paths):
+                completed_moves = []
+                try:
+                    for source, destination in moves:
+                        self._rename_optional(source, destination)
+                        completed_moves.append((source, destination))
+                        if source == old_overlay:
+                            self._rewrite_overlay_identity(new, new_overlay)
+                            for path, content in metadata_updates.items():
+                                atomic_write(new_overlay / path.relative_to(old_overlay), content)
+                    self.state.write_instances(instances)
+                    self.state.write_links(links)
+                except Exception:
+                    # Restore directory names before replaying their metadata before-images.
+                    for source, destination in reversed(completed_moves):
+                        destination.rename(source)
+                    raise
 
     def delete_instance(self, name: str) -> None:
         self._require_web_stopped(name)
@@ -2466,6 +2496,42 @@ class ProjectService:
             overlay / METADATA_DIR / MARKER_FILE,
             (json.dumps(marker, indent=2, sort_keys=True) + "\n").encode(),
         )
+
+    def _renamed_overlay_sources(self, old: Path, new: Path) -> dict[Path, bytes]:
+        updates = {}
+        for path in sorted((old / METADATA_DIR).glob("*.json")):
+            if path.name == MARKER_FILE:
+                continue
+            document = WorkspaceLoader._read_object(path)
+            operations = document.get("operations", [])
+            if not isinstance(operations, list):
+                raise MetadataError(f"{path}: operations must be an array")
+            changed = False
+            for operation in operations:
+                if not isinstance(operation, dict) or operation.get("type") != "package":
+                    continue
+                source = operation.get("source")
+                if not isinstance(source, dict) or source.get("provider") != "local":
+                    continue
+                location = source.get("location")
+                if not isinstance(location, str):
+                    continue
+                original = Path(location)
+                source_path = self.project / original
+                absolute = Path(os.path.abspath(source_path))
+                if not absolute.is_relative_to(old):
+                    continue
+                resolved = source_path.resolve()
+                if not resolved.is_relative_to(old):
+                    continue
+                renamed = new / resolved.relative_to(old)
+                source["location"] = (
+                    str(renamed) if original.is_absolute() else self._layer_reference(renamed)
+                )
+                changed = True
+            if changed:
+                updates[path] = (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode()
+        return updates
 
     def _require_web_stopped(self, instance: str) -> None:
         from .web_process import web_is_alive
