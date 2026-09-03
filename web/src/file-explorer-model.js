@@ -105,7 +105,33 @@ export function applyExplorerCapturePatch(state, patch, mode = 'all') {
   return { ...state, children };
 }
 
+/**
+ * @typedef {Object} CaptureChoice
+ * @property {string} mode
+ * @property {Record<string, unknown>} [provider_match]
+ * @property {boolean} [fuzzyConfirmed]
+ *
+ * @typedef {Object} CapturePlanItem
+ * @property {string} id
+ * @property {string} path
+ * @property {string[]} capture_modes
+ * @property {string} [expected_sha256]
+ * @property {boolean} [expected_absent]
+ *
+ * @typedef {{ mode: string, provider_match?: Record<string, unknown> } & (
+ *   { expected_sha256: string, expected_absent?: never } |
+ *   { expected_absent: true, expected_sha256?: never }
+ * )} CaptureDecision
+ * @typedef {Record<string, CaptureDecision>} CaptureDecisions
+ */
+
+/**
+ * @param {CapturePlanItem[]} items
+ * @param {Record<string, CaptureChoice>} choices
+ * @returns {CaptureDecisions}
+ */
 export function decisionsForPlan(items, choices) {
+  /** @type {CaptureDecisions} */
   const decisions = {};
   for (const item of items) {
     const modes = item.capture_modes || [];
