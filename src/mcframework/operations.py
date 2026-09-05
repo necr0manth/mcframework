@@ -639,6 +639,19 @@ def operation_to_json(
     operation: Operation, *, file_digest: Callable[[bytes], str] | None = None
 ) -> dict[str, Any]:
     """Stable diagnostic representation used by manifests and CLI output."""
+    if isinstance(operation, RoutingRule):
+        write: dict[str, Any] = {
+            "file": {"path": operation.file, "path_mode": operation.path_mode}
+        }
+        if operation.section is not None:
+            write["section"] = operation.section
+        return {
+            "type": "routing_rule",
+            "id": operation.identity,
+            "priority": operation.priority,
+            "when": dict(operation.when),
+            "write": write,
+        }
     if isinstance(operation, PutFile):
         return {
             "type": "put",
