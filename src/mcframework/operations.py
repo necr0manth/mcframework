@@ -25,6 +25,89 @@ from .paths import matches, normalize_relative_path
 
 
 @dataclass(frozen=True)
+class RoutingRule:
+    """A declarative destination rule for newly produced metadata operations.
+
+    Rules are intentionally kept separate from executable operations.  They are
+    nevertheless serialized in the same ``operations`` array using
+    ``type: routing_rule``.
+    """
+
+    identity: str
+    priority: int = 0
+    when: Mapping[str, Any] = field(default_factory=frozen_map)
+    file: str = ".pack/local-edits.json"
+    section: str | None = None
+    path_mode: str = "layer"
+    source_file: str | None = None
+
+    def writes(self) -> tuple[Resource, ...]:
+        return ()
+
+    def reads(self) -> tuple[Resource, ...]:
+        return ()
+
+    def writes(self) -> tuple[ResourceDomain, ...]:
+        return ()
+
+    def reads(self) -> tuple[ResourceDomain, ...]:
+        return ()
+
+    def resolve_file(self, declaration_file: str | None = None) -> str:
+        """Resolve destination to a layer-root relative, repository-safe path."""
+        mode = self.path_mode.lower()
+        if mode not in {"layer", "local"}:
+            raise ResolutionError(f"invalid routing path_mode {self.path_mode!r}")
+        value = self.file.replace("\\", "/")
+        if mode == "local":
+            base = declaration_file or self.source_file
+            if not base:
+                raise ResolutionError("local routing path requires declaration file")
+            base = base.replace("\\", "/")
+            value = "/".join(base.split("/")[:-1] + [value])
+        return normalize_relative_path(value)
+
+
+def routing_rule_from_json(raw: Mapping[str, Any], *, source: str, index: int = 0) -> RoutingRule:
+    """Parse a routing rule record from the unified metadata document."""
+    identity = required_string(raw, "id", source)
+    priority = raw.get("priority", 0)
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        raise ResolutionError(f"{source}: routing_rule priority must be an integer")
+    when = raw.get("when", {})
+    if not isinstance(when, dict):
+        raise ResolutionError(f"{source}: routing_rule when must be an object")
+    write = raw.get("write", {})
+    if not isinstance(write, dict):
+        raise ResolutionError(f"{source}: routing_rule write must be an object")
+    file_spec = write.get("file", write.get("path", ".pack/local-edits.json"))
+    if isinstance(file_spec, dict):
+        path = file_spec.get("path", ".pack/local-edits.json")
+        path_mode = file_spec.get("path_mode", "layer")
+    else:
+        path, path_mode = file_spec, write.get("path_mode", "layer")
+    if not isinstance(path, str) or not path:
+        raise ResolutionError(f"{source}: routing_rule destination file must be a string")
+    if not isinstance(path_mode, str) or path_mode not in {"layer", "local"}:
+        raise ResolutionError(f"{source}: routing_rule path_mode must be layer or local")
+    section = write.get("section")
+    if section is not None and (not isinstance(section, str) or not section):
+        raise ResolutionError(f"{source}: routing_rule section must be a string")
+    rule = RoutingRule(identity, priority, frozen_map(when), path, section, path_mode, source)
+    rule.resolve_file(source)
+    return rule
+
+
+def merge_routing_rules(*layers: Iterable[RoutingRule]) -> tuple[RoutingRule, ...]:
+    """Merge inherited rules; child identity replaces parent, priority orders output."""
+    merged: dict[str, RoutingRule] = {}
+    for rules in layers:
+        for rule in rules:
+            merged[rule.identity] = rule
+    return tuple(sorted(merged.values(), key=lambda item: (-item.priority, item.identity)))
+
+
+@dataclass(frozen=True)
 class Resource:
     kind: str
     identity: tuple[str, ...]
@@ -224,6 +307,8 @@ def operation_from_json(
     raw: Mapping[str, Any], *, source: str, index: int, layer_precedence: int = 0
 ) -> Operation:
     kind = required_string(raw, "type", source)
+    if kind == "routing_rule":
+        return routing_rule_from_json(raw, source=source, index=index)
     if kind == "put":
         path = normalize_relative_path(required_string(raw, "path", source))
         if "content_base64" in raw:
@@ -395,7 +480,8 @@ def apply_local_operations(
     parent: PackState, operations: tuple[Operation, ...], precedence: int
 ) -> PackState:
     """Merge operations as an unordered local delta, then apply it to parent."""
-    validate_same_layer(operations)
+    domain_operations = tuple(op for op in operations if not isinstance(op, RoutingRule))
+    validate_same_layer(domain_operations)
     files = dict(parent.files)
     exclusions = list(parent.exclusions)
     packages = dict(parent.packages)
@@ -408,7 +494,7 @@ def apply_local_operations(
     # Every structured patch reads the unmodified parent state.
     patched: dict[str, bytes] = {}
     grouped_patches: dict[str, list[PatchProperties]] = {}
-    for operation in operations:
+    for operation in domain_operations:
         if isinstance(operation, PatchProperties):
             grouped_patches.setdefault(operation.path, []).append(operation)
     for path, patches in grouped_patches.items():
@@ -432,6 +518,8 @@ def apply_local_operations(
             )
 
     for operation in operations:
+        if isinstance(operation, RoutingRule):
+            continue
         if isinstance(operation, RemovePaths):
             exclusions.append(operation.pattern)
             for path in tuple(files):
