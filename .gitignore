@@ -13,3 +13,8 @@
 /src/*.egg-info/
 __pycache__/
 *.py[cod]
+
+# Local development and generated tooling artifacts
+/.idea/
+/.pytest-*/
+/web/.openai/
