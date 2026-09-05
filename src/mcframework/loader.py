@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from .errors import MetadataError, UnsafePathError
+from .generations import Generation, generation
 from .model import LayerDefinition, ParentReference, frozen_map
-from .operations import DeclarePackage, operation_from_json, producer_for_operations
+from .operations import DeclarePackage, PutFile, operation_from_json, producer_for_operations
 from .paths import normalize_relative_path
 
 METADATA_DIR = ".pack"
@@ -20,15 +23,67 @@ MARKER_FILE = "layer.json"
 class WorkspaceLoader:
     """Load layer directories using the initial, intentionally small JSON frontend."""
 
-    def __init__(self, workspace: Path | str):
+    def __init__(self, workspace: Path | str, *, refresh: bool = False):
         self.workspace = Path(workspace).resolve()
         self._cache: dict[Path, LayerDefinition] = {}
+        self._refresh = refresh
+        self._generations: dict[Path, dict[Path, Generation]] = {}
+        self._visited: set[Path] = set()
+
+    def begin(self) -> None:
+        self._visited.clear()
+
+    def finish(self) -> None:
+        """Retain only the graph used by the last successful resolution."""
+        self._cache = {root: item for root, item in self._cache.items() if root in self._visited}
+        self._generations = {
+            root: item for root, item in self._generations.items() if root in self._visited
+        }
+
+    def fresh(self) -> bool:
+        return all(
+            generation(path) == expected
+            for entries in self._generations.values()
+            for path, expected in entries.items()
+        )
+
+    @staticmethod
+    def _sources(root: Path) -> dict[Path, Generation]:
+        # Record directory membership generations before enumerating. A concurrent
+        # addition may enter the loaded payload, but cannot become an unwatched hit.
+        sources = {root: generation(root)}
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    path = Path(entry.path)
+                    sources[path] = generation(path)
+                    if path == root / METADATA_DIR:
+                        target = path.resolve()
+                        sources.setdefault(target, generation(target))
+                        for metadata in path.glob("*.json"):
+                            sources[metadata] = generation(metadata)
+                            if metadata.is_symlink():
+                                target = metadata.resolve()
+                                sources[target] = generation(target)
+                    elif entry.is_dir(follow_symlinks=False):
+                        pending.append(path)
+        return sources
 
     def load(self, layer: Path | str) -> LayerDefinition:
         root = self._resolve_layer_path(layer)
         cached = self._cache.get(root)
-        if cached is not None:
+        visited = root in self._visited
+        self._visited.add(root)
+        previous = self._generations.get(root, {})
+        if cached is not None and (
+            not self._refresh
+            or visited
+            or all(generation(path) == expected for path, expected in previous.items())
+        ):
             return cached
+        sources = self._sources(root) if self._refresh else {}
         marker = root / METADATA_DIR / MARKER_FILE
         if not marker.is_file():
             raise MetadataError(f"layer marker does not exist: {marker}")
@@ -57,8 +112,17 @@ class WorkspaceLoader:
 
         producers = []
         metadata_root = root / METADATA_DIR
+        previous_producers = {item.source: item for item in cached.producers} if cached else {}
         for metadata_file in sorted(metadata_root.glob("*.json"), key=lambda item: item.name):
             if metadata_file.name == MARKER_FILE:
+                continue
+            source = f"{METADATA_DIR}/{metadata_file.name}"
+            previous_producer = previous_producers.get(source)
+            metadata_paths = {metadata_file, metadata_file.resolve()}
+            if previous_producer is not None and all(
+                path in previous and previous[path] == sources.get(path) for path in metadata_paths
+            ):
+                producers.append(previous_producer)
                 continue
             document = self._read_object(metadata_file)
             unknown = set(document) - {"operations"}
@@ -68,12 +132,18 @@ class WorkspaceLoader:
             if not isinstance(raw_operations, list):
                 raise MetadataError(f"{metadata_file}: operations must be an array")
             operations = []
-            source = f"{METADATA_DIR}/{metadata_file.name}"
             for index, raw in enumerate(raw_operations):
                 if not isinstance(raw, dict):
                     raise MetadataError(f"{metadata_file}: operation {index} must be an object")
                 try:
                     operation = operation_from_json(raw, source=source, index=index)
+                    if (
+                        isinstance(operation, PutFile)
+                        and previous_producer is not None
+                        and index < len(previous_producer.operations)
+                        and operation == previous_producer.operations[index]
+                    ):
+                        operation = previous_producer.operations[index]
                     if isinstance(operation, DeclarePackage):
                         operation = replace(
                             operation,
@@ -87,18 +157,47 @@ class WorkspaceLoader:
             producers.append(producer_for_operations(metadata_file.stem, source, tuple(operations)))
 
         payload: dict[str, bytes] = {}
-        for file in sorted(root.rglob("*")):
-            if file == metadata_root or metadata_root in file.parents:
-                continue
-            if file.is_symlink():
+        if self._refresh:
+            payload_paths = sorted(
+                path
+                for path in sources
+                if path != root
+                and path.is_relative_to(root)
+                and path.relative_to(root).parts[0] != METADATA_DIR
+            )
+        else:
+            payload_paths = sorted(root.rglob("*"))
+        for file in payload_paths:
+            if self._refresh:
+                stamp = sources[file]
+                if stamp is None:
+                    continue
+                is_symlink = stat.S_ISLNK(stamp[0])
+                is_file = stat.S_ISREG(stamp[0])
+            else:
+                if file == metadata_root or metadata_root in file.parents:
+                    continue
+                is_symlink = file.is_symlink()
+                is_file = file.is_file()
+            if is_symlink:
                 raise UnsafePathError(f"payload symlinks are not supported: {file}")
-            if file.is_file():
+            if is_file:
                 relative = normalize_relative_path(file.relative_to(root).as_posix())
-                payload[relative] = file.read_bytes()
+                if (
+                    cached is not None
+                    and relative in cached.payload
+                    and file in previous
+                    and previous[file] == sources.get(file)
+                ):
+                    payload[relative] = cached.payload[relative]
+                else:
+                    payload[relative] = file.read_bytes()
         definition = LayerDefinition(
             identity, str(root), tuple(parents), tuple(producers), frozen_map(payload)
         )
         self._cache[root] = definition
+        if self._refresh:
+            self._generations[root] = sources
         return definition
 
     def resolve_parent(self, owner: LayerDefinition, reference: ParentReference) -> LayerDefinition:

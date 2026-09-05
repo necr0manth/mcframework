@@ -12,7 +12,7 @@ from .errors import MetadataError
 from .model import IgnoreSelector
 from .paths import normalize_relative_path
 
-type SourceGenerations = tuple[tuple[Path, tuple[int, int, int, int] | None], ...]
+type SourceGenerations = tuple[tuple[Path, tuple[int, int, int, int, int] | None], ...]
 
 
 @dataclass(frozen=True)

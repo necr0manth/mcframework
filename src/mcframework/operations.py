@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
@@ -547,10 +547,16 @@ def render_properties(properties: Mapping[str, str]) -> bytes:
     return "".join(f"{key}={properties[key]}\n" for key in sorted(properties)).encode("utf-8")
 
 
-def operation_to_json(operation: Operation) -> dict[str, Any]:
+def operation_to_json(
+    operation: Operation, *, file_digest: Callable[[bytes], str] | None = None
+) -> dict[str, Any]:
     """Stable diagnostic representation used by manifests and CLI output."""
     if isinstance(operation, PutFile):
-        return {"type": "put", "path": operation.path, "sha256": _sha(operation.content)}
+        return {
+            "type": "put",
+            "path": operation.path,
+            "sha256": (file_digest or _sha)(operation.content),
+        }
     if isinstance(operation, RemoveFile):
         return {"type": "remove", "path": operation.path}
     if isinstance(operation, RemovePaths):

@@ -8,9 +8,11 @@ import os
 import re
 import stat
 import tempfile
+import threading
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -30,9 +32,10 @@ from .explorer import (
     scan_generation_matches,
     scan_instance,
 )
+from .generations import Generation, generation
 from .loader import MARKER_FILE, METADATA_DIR, WorkspaceLoader
 from .local_state import InstanceRecord, LinkRecord, LocalState, validate_name
-from .model import Activation, IgnoreSelector, PackState, Resolution, SelectorKind
+from .model import Activation, IgnoreSelector, PackState, Resolution, SelectorKind, frozen_map
 from .operations import AddIgnoreSelector, operation_from_json, operation_to_json
 from .package_inspect import (
     ModrinthMatcher,
@@ -42,6 +45,7 @@ from .package_inspect import (
     inspect_jar,
 )
 from .paths import atomic_write, matches, normalize_relative_path
+from .preparation import ContentDigests, IncrementalPreparer, content_digest
 from .resolver import Resolver
 from .transport import LocalFilesystemInstance
 
@@ -54,6 +58,15 @@ class InstanceContext:
     parameters: dict[str, Any]
     resolution: Resolution
     files: dict[str, bytes]
+    content_digests: ContentDigests = field(default_factory=dict, repr=False, compare=False)
+
+
+@dataclass
+class _ContextCache:
+    loader: WorkspaceLoader
+    preparer: IncrementalPreparer = field(default_factory=IncrementalPreparer)
+    context: InstanceContext | None = None
+    generations: tuple[tuple[Path, Generation], ...] = ()
 
 
 class ProjectService:
@@ -68,6 +81,8 @@ class ProjectService:
         self.provider_matcher = provider_matcher or ModrinthMatcher()
         self._provider_matches: dict[str, list[dict[str, object]]] = {}
         self._explorer_snapshots: dict[str, ExplorerSnapshot] = {}
+        self._context_lock = threading.RLock()
+        self._contexts: dict[str, _ContextCache] = {}
 
     def init_layer(self, layer: str) -> Path:
         validate_name(layer, "layer name")
@@ -282,23 +297,97 @@ class ProjectService:
         return self._change_features(instance, context, features)
 
     def instance_context(self, name: str, *, prepare: bool = True) -> InstanceContext:
+        # Cache publication is atomic across threaded HTTP readers. The public context
+        # retains mutable files/parameters for compatibility without exposing cached maps.
+        with self._context_lock:
+            context = self._instance_context(name, prepare=prepare)
+            resolution = replace(
+                context.resolution,
+                trace=tuple(
+                    replace(trace, parameters=frozen_map(deepcopy(dict(trace.parameters))))
+                    for trace in context.resolution.trace
+                ),
+            )
+            if not prepare:
+                resolution = replace(resolution, artifacts=(), manifest=())
+            return replace(
+                context,
+                files=dict(context.files) if prepare else {},
+                parameters=deepcopy(context.parameters),
+                resolution=resolution,
+            )
+
+    def _instance_context(self, name: str, *, prepare: bool) -> InstanceContext:
+        # Pair parsed registry data with generations observed before the read. If an
+        # external writer races the read, the next lookup cannot bless the old data.
+        source_paths = (
+            self.state.instances_path,
+            self.state.links_path,
+            self.state.parameters_path(name),
+        )
+        sources = tuple((path, generation(path)) for path in source_paths)
         instances = self.state.instances()
         links = self.state.links()
         if name not in instances:
             raise MetadataError(f"instance does not exist: {name!r}")
         if name not in links:
             raise MetadataError(f"instance is not linked: {name!r}")
+        self._contexts = {key: value for key, value in self._contexts.items() if key in instances}
+        cached = self._contexts.setdefault(
+            name, _ContextCache(WorkspaceLoader(self.project, refresh=True))
+        )
+        current = cached.context
+        prepared = cached.preparer.current
+        if (
+            current is not None
+            and sources == cached.generations
+            and cached.loader.fresh()
+            and (
+                not prepare
+                or (
+                    prepared is not None
+                    and prepared.resolution is current.resolution
+                    and prepared.fresh()
+                )
+            )
+        ):
+            return current
+        # Parsing new source generations must not make an older successful context
+        # appear fresh after a failed prepare or a logical-only refresh.
+        cached.context = None
         link = links[name]
         self._validate_instance_path(instances[name].path)
         parameters, _ = self.state.parameters(name)
         layer = self._effective_root(name, link)
         features = self._overlay_features(name, link)
-        resolution = Resolver(WorkspaceLoader(self.project)).resolve(layer, parameters)
+        cached.loader.begin()
+        try:
+            resolution = Resolver(cached.loader).resolve(layer, parameters)
+        finally:
+            cached.loader.finish()
         files: dict[str, bytes] = {}
+        digests: ContentDigests = {}
         if prepare:
             _, _, builder = self.artifact_components()
-            resolution, files = builder.prepare(resolution)
-        return InstanceContext(instances[name], link, features, parameters, resolution, files)
+            prepared = cached.preparer.prepare(resolution, builder)
+            resolution = prepared.resolution
+            files = (
+                current.files
+                if current is not None
+                and len(prepared.files) == len(current.files)
+                and all(
+                    current.files.get(path) is content for path, content in prepared.files.items()
+                )
+                else dict(prepared.files)
+            )
+            digests = prepared.digests
+        context = InstanceContext(
+            instances[name], link, features, parameters, resolution, files, digests
+        )
+        # A logical-only check must not evict successfully prepared bytes.
+        cached.context = context
+        cached.generations = sources
+        return context
 
     def instance_diff(
         self,
@@ -514,12 +603,8 @@ class ProjectService:
         )
 
     @staticmethod
-    def _source_generation(path: Path) -> tuple[int, int, int, int] | None:
-        try:
-            current = path.stat(follow_symlinks=False)
-        except FileNotFoundError:
-            return None
-        return (current.st_mode, current.st_mtime_ns, current.st_size, current.st_ino)
+    def _source_generation(path: Path) -> Generation:
+        return generation(path)
 
     def _context_source_generations(self, context: InstanceContext) -> SourceGenerations:
         paths = {
@@ -568,7 +653,7 @@ class ProjectService:
         for path, content in sorted(context.files.items()):
             digest.update(path.encode("utf-8"))
             digest.update(b"\0")
-            digest.update(hashlib.sha256(content).digest())
+            digest.update(bytes.fromhex(content_digest(content, context.content_digests)))
         digest.update(
             json.dumps(
                 {
@@ -581,7 +666,12 @@ class ProjectService:
                                 {
                                     "source": producer.source,
                                     "operations": [
-                                        operation_to_json(operation)
+                                        operation_to_json(
+                                            operation,
+                                            file_digest=lambda content: content_digest(
+                                                content, context.content_digests
+                                            ),
+                                        )
                                         for operation in producer.operations
                                     ],
                                 }
@@ -1311,6 +1401,7 @@ class ProjectService:
                             context.parameters,
                             context.resolution,
                             patched_files,
+                            context.content_digests,
                         )
                         patched_snapshot = build_snapshot(
                             patched_context.instance.path,
@@ -1808,7 +1899,12 @@ class ProjectService:
         for trace in context.resolution.trace:
             for producer in trace.producers:
                 for index, operation in enumerate(producer.operations):
-                    data = operation_to_json(operation)
+                    data = operation_to_json(
+                        operation,
+                        file_digest=lambda content: content_digest(
+                            content, context.content_digests
+                        ),
+                    )
                     declarations.append(
                         {
                             "id": hashlib.sha256(
@@ -1984,7 +2080,12 @@ class ProjectService:
         for trace in context.resolution.trace:
             for producer in trace.producers:
                 for index, operation in enumerate(producer.operations):
-                    data = operation_to_json(operation)
+                    data = operation_to_json(
+                        operation,
+                        file_digest=lambda content: content_digest(
+                            content, context.content_digests
+                        ),
+                    )
                     if is_relevant(data):
                         provenance.append(
                             {
@@ -2022,9 +2123,8 @@ class ProjectService:
         package = context.resolution.state.packages[package_id]
         target = self._editable_target(instance, context, target_layer)
         before: bytes | None
-        if (
-            package.source_file is not None
-            and Path(package.source_file).resolve().is_relative_to(target)
+        if package.source_file is not None and Path(package.source_file).resolve().is_relative_to(
+            target
         ):
             path = Path(package.source_file)
             before = path.read_bytes()
