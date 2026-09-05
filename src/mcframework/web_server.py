@@ -369,7 +369,7 @@ class Handler(BaseHTTPRequestHandler):
             Synchronizer().sync(
                 context.files,
                 LocalFilesystemInstance(context.instance.path),
-                context.resolution.state.prune,
+                context.resolution.state.content.prune,
             )
         elif method == "POST" and route == "shutdown":
             return True

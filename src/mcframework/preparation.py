@@ -41,6 +41,8 @@ class IncrementalPreparer:
 
     def prepare(self, resolution: Resolution, builder: Builder) -> PreparedState:
         previous = self.current
+        content_state = resolution.state.content
+        previous_content = previous.resolution.state.content if previous is not None else None
         files: Mapping[str, bytes]
         generations: dict[Path, Generation] = {}
         if previous is None:
@@ -51,10 +53,10 @@ class IncrementalPreparer:
                     raise ArtifactError("artifact changed during preparation")
                 generations[Path(artifact.cache_path)] = stamp
         elif (
-            len(resolution.state.files) == len(previous.resolution.state.files)
+            len(content_state.files) == len(previous_content.files)
             and all(
-                previous.resolution.state.files.get(path) is content
-                for path, content in resolution.state.files.items()
+                previous_content.files.get(path) is content
+                for path, content in content_state.files.items()
             )
             and len(resolution.active_packages) == len(previous.resolution.artifacts)
             and all(
@@ -86,9 +88,9 @@ class IncrementalPreparer:
             old_artifacts = {
                 item.declaration.identity: item for item in previous.resolution.artifacts
             }
-            contents = dict(resolution.state.files)
+            contents = dict(content_state.files)
             entries: list[ManifestEntry] = []
-            for path, content in resolution.state.files.items():
+            for path, content in content_state.files.items():
                 entries.append(
                     ManifestEntry(path, content_digest(content, previous.digests), len(content))
                 )

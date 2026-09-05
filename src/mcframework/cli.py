@@ -125,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
             report = Synchronizer().sync(
                 context.files,
                 LocalFilesystemInstance(context.instance.path),
-                context.resolution.state.prune,
+                context.resolution.state.content.prune,
             )
             print_report(report)
         elif arguments.command == "createinstance":

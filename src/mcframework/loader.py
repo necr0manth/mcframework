@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import stat
 from collections.abc import Mapping
@@ -15,6 +14,7 @@ from .generations import Generation, generation
 from .model import LayerDefinition, ParentReference, frozen_map
 from .operations import DeclarePackage, PutFile, operation_from_json, producer_for_operations
 from .paths import normalize_relative_path
+from .metadata import JsonMetadataParser, MetadataParser
 
 METADATA_DIR = ".pack"
 MARKER_FILE = "layer.json"
@@ -23,10 +23,17 @@ MARKER_FILE = "layer.json"
 class WorkspaceLoader:
     """Load layer directories using the initial, intentionally small JSON frontend."""
 
-    def __init__(self, workspace: Path | str, *, refresh: bool = False):
+    def __init__(
+        self,
+        workspace: Path | str,
+        *,
+        refresh: bool = False,
+        parser: MetadataParser | None = None,
+    ):
         self.workspace = Path(workspace).resolve()
         self._cache: dict[Path, LayerDefinition] = {}
         self._refresh = refresh
+        self.parser = parser or JsonMetadataParser()
         self._generations: dict[Path, dict[Path, Generation]] = {}
         self._visited: set[Path] = set()
 
@@ -215,16 +222,13 @@ class WorkspaceLoader:
             raise MetadataError(f"layer directory does not exist: {path}")
         return path
 
-    @staticmethod
-    def _read_object(path: Path) -> Mapping[str, Any]:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise MetadataError(f"cannot read JSON metadata {path}: {exc}") from exc
-        if not isinstance(data, dict):
-            raise MetadataError(f"{path}: top-level JSON value must be an object")
-        return data
+    def _read_object(self, path: Path) -> Mapping[str, Any]:
+        """Read a metadata object through the configured format adapter.
 
+        Kept as an overridable seam for callers that customized the legacy
+        loader; new code should prefer ``parser=`` injection.
+        """
+        return self.parser.read_object(path)
 
 def validate_parameter_value(value: Any, label: str = "parameters") -> None:
     if value is None or isinstance(value, (str, int, float, bool)):

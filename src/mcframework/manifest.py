@@ -14,7 +14,11 @@ from .operations import operation_to_json
 
 
 def materialized_files(resolution: Resolution) -> tuple[Resolution, Mapping[str, bytes]]:
-    files = dict(resolution.state.files)
+    # Build/materialization consumes only the content projection.  Keeping this
+    # boundary explicit prevents web policy and routing metadata from leaking
+    # into the generated Minecraft payload.
+    content_state = resolution.state.content
+    files = dict(content_state.files)
     entries = [entry_for(path, content) for path, content in files.items()]
     for artifact in resolution.artifacts:
         path = artifact.declaration.destination

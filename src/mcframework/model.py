@@ -134,6 +134,47 @@ class PackState:
     prune: tuple[str, ...] = ()
     ignore: tuple[IgnoreSelector, ...] = ()
 
+    @property
+    def content(self) -> "ContentState":
+        """Files and exclusions consumed by the build/materializer subsystem."""
+        return ContentState(self.files, self.exclusions, self.prune)
+
+    @property
+    def package_catalog(self) -> "PackageState":
+        """Package/dependency data consumed by resolver and artifact planning."""
+        return PackageState(self.packages, self.dependencies, self.groups, self.sections)
+
+    @property
+    def web_policy(self) -> "WebPolicyState":
+        """Web/instance policy, intentionally excluded from materialized payloads."""
+        return WebPolicyState(self.ignore)
+
+
+@dataclass(frozen=True)
+class ContentState:
+    """The build-facing portion of a resolved pack state."""
+
+    files: Mapping[str, bytes] = field(default_factory=frozen_map)
+    exclusions: tuple[str, ...] = ()
+    prune: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PackageState:
+    """Package graph and UI grouping metadata used during resolution."""
+
+    packages: Mapping[str, PackageDeclaration] = field(default_factory=frozen_map)
+    dependencies: tuple[Dependency, ...] = ()
+    groups: Mapping[str, Group] = field(default_factory=frozen_map)
+    sections: Mapping[str, Section] = field(default_factory=frozen_map)
+
+
+@dataclass(frozen=True)
+class WebPolicyState:
+    """Policies used by web/instance-diff code, not by build output."""
+
+    ignore: tuple[IgnoreSelector, ...] = ()
+
 
 @dataclass(frozen=True)
 class ProducedOperationTrace:
