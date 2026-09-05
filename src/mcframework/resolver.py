@@ -89,10 +89,13 @@ class Resolver:
 def resolve_dependencies(
     state: PackState, automatic_dependencies: bool
 ) -> tuple[PackState, tuple[PackageDeclaration, ...]]:
-    packages = dict(state.packages)
-    groups = dict(state.groups)
+    # Dependency resolution is deliberately scoped to the package catalog;
+    # content bytes and web policy are opaque to this subsystem.
+    catalog = state.package_catalog
+    packages = dict(catalog.packages)
+    groups = dict(catalog.groups)
     known_nodes = set(packages) | set(groups)
-    for dependency in state.dependencies:
+    for dependency in catalog.dependencies:
         if dependency.source not in known_nodes:
             raise ResolutionError(f"dependency source is missing: {dependency.source!r}")
         if dependency.target not in known_nodes:
@@ -109,7 +112,7 @@ def resolve_dependencies(
     queue = list(sorted(active_nodes))
     while queue:
         source = queue.pop(0)
-        for dependency in state.dependencies:
+        for dependency in catalog.dependencies:
             if dependency.source != source:
                 continue
             target = dependency.target
