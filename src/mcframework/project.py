@@ -2656,11 +2656,12 @@ class ProjectService:
         if instance is not None:
             rules = merge_routing_rules(rules, self._routing_rules_for_instance(instance))
         engine = RoutingEngine(rules)
-        grouped: dict[Path, list[dict[str, Any]]] = {}
+        grouped: dict[Path, list[tuple[dict[str, Any], str | None]]] = {}
         for operation in additions:
             selected = engine.destination(operation, declaration_file=f"{METADATA_DIR}/local-edits.json")
             relative = selected[0] if selected else f"{METADATA_DIR}/local-edits.json"
-            grouped.setdefault(layer / relative, []).append(operation)
+            section = selected[1] if selected else None
+            grouped.setdefault(layer / relative, []).append((operation, section))
         before = {path: path.read_bytes() if path.exists() else None for path in grouped}
         try:
             for path, records in grouped.items():
@@ -2735,7 +2736,11 @@ class ProjectService:
                 rules.append(parsed)
         return merge_routing_rules(rules)
 
-    def _append_operations_to_path(self, path: Path, additions: list[dict[str, Any]]) -> None:
+    def _append_operations_to_path(
+        self,
+        path: Path,
+        additions: list[tuple[dict[str, Any], str | None]] | list[dict[str, Any]],
+    ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
             try:
@@ -2749,7 +2754,8 @@ class ProjectService:
         operations = document["operations"]
         if not isinstance(operations, list):
             raise MetadataError(f"{path}: operations must be an array")
-        for operation in additions:
+        annotated = [item if isinstance(item, tuple) else (item, None) for item in additions]
+        for operation, section_id in annotated:
             if operation.get("type") in {"activation", "package", "group"}:
                 operations[:] = [
                     item
@@ -2761,6 +2767,37 @@ class ProjectService:
                     )
                 ]
             operations.append(operation)
+            # A routing destination section is materialized as an ordinary
+            # section declaration alongside the routed operation.  This keeps
+            # the unified file syntax intact and avoids treating the
+            # routing_rule record itself as a section operation.
+            if section_id and operation.get("type") != "section":
+                member = operation.get("id")
+                if isinstance(member, str) and member:
+                    section = next(
+                        (
+                            item for item in operations
+                            if isinstance(item, dict)
+                            and item.get("type") == "section"
+                            and item.get("id") == section_id
+                        ),
+                        None,
+                    )
+                    if section is None:
+                        operations.append({
+                            "type": "section",
+                            "id": section_id,
+                            "title": section_id,
+                            "members": [member],
+                        })
+                    else:
+                        members = section.setdefault("members", [])
+                        if not isinstance(members, list):
+                            raise MetadataError(
+                                f"{path}: section {section_id!r} members must be an array"
+                            )
+                        if member not in members:
+                            members.append(member)
         atomic_write(path, (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode())
 
     @staticmethod
