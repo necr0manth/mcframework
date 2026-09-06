@@ -67,6 +67,40 @@ class RoutingRule:
             value = "/".join(base.split("/")[:-1] + [value])
         return normalize_relative_path(value)
 
+    def matches(self, operation: Mapping[str, Any]) -> bool:
+        """Return whether this rule applies to a serialized operation."""
+        for key, expected in self.when.items():
+            actual = operation.get(key)
+            if key == "operation_types":
+                actual = operation.get("type")
+            if isinstance(expected, (list, tuple, set)):
+                if actual not in expected:
+                    return False
+            elif isinstance(expected, Mapping):
+                if not isinstance(actual, Mapping) or any(actual.get(k) != v for k, v in expected.items()):
+                    return False
+            elif actual != expected:
+                return False
+        return True
+
+
+class RoutingEngine:
+    """Selects a destination metadata file for newly written records."""
+
+    def __init__(self, rules: Iterable[RoutingRule] = ()) -> None:
+        self.rules = tuple(rules)
+
+    def destination(self, operation: Mapping[str, Any], *, declaration_file: str | None = None) -> tuple[str, str | None] | None:
+        matches = sorted((rule for rule in self.rules if rule.matches(operation)), key=lambda r: -r.priority)
+        if not matches:
+            return None
+        top = matches[0].priority
+        winners = [rule for rule in matches if rule.priority == top]
+        destinations = {(rule.resolve_file(declaration_file), rule.section) for rule in winners}
+        if len(destinations) > 1:
+            raise ResolutionError("ambiguous routing rules for operation")
+        return next(iter(destinations))
+
 
 def routing_rule_from_json(raw: Mapping[str, Any], *, source: str, index: int = 0) -> RoutingRule:
     """Parse a routing rule record from the unified metadata document."""

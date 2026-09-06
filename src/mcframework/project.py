@@ -36,7 +36,7 @@ from .generations import Generation, generation
 from .loader import MARKER_FILE, METADATA_DIR, WorkspaceLoader
 from .local_state import InstanceRecord, LinkRecord, LocalState, validate_name
 from .model import Activation, IgnoreSelector, PackState, Resolution, SelectorKind, frozen_map
-from .operations import AddIgnoreSelector, operation_from_json, operation_to_json
+from .operations import AddIgnoreSelector, RoutingEngine, RoutingRule, operation_from_json, operation_to_json
 from .package_inspect import (
     ModrinthMatcher,
     ProviderMatcher,
@@ -2605,7 +2605,35 @@ class ProjectService:
         self._append_operations(layer, [operation])
 
     def _append_operations(self, layer: Path, additions: list[dict[str, Any]]) -> None:
-        path = layer / METADATA_DIR / "local-edits.json"
+        engine = RoutingEngine(self._routing_rules_for_layer(layer))
+        grouped: dict[Path, list[dict[str, Any]]] = {}
+        for operation in additions:
+            selected = engine.destination(operation, declaration_file=f"{METADATA_DIR}/local-edits.json")
+            relative = selected[0] if selected else f"{METADATA_DIR}/local-edits.json"
+            grouped.setdefault(layer / relative, []).append(operation)
+        for path, records in grouped.items():
+            self._append_operations_to_path(path, records)
+
+    def _routing_rules_for_layer(self, layer: Path) -> tuple[RoutingRule, ...]:
+        root = layer / METADATA_DIR
+        rules: list[RoutingRule] = []
+        if not root.exists():
+            return ()
+        for candidate in root.rglob("*.json"):
+            try:
+                document = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(document, dict) or not isinstance(document.get("operations"), list):
+                continue
+            source = candidate.relative_to(layer).as_posix()
+            for index, raw in enumerate(document["operations"]):
+                if isinstance(raw, dict) and raw.get("type") == "routing_rule":
+                    rules.append(operation_from_json(raw, source=source, index=index))
+        return tuple(rule for rule in rules if isinstance(rule, RoutingRule))
+
+    def _append_operations_to_path(self, path: Path, additions: list[dict[str, Any]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         if path.exists():
             try:
                 document = json.loads(path.read_text(encoding="utf-8"))
