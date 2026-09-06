@@ -66,7 +66,7 @@ class WorkspaceLoader:
                 for entry in entries:
                     path = Path(entry.path)
                     sources[path] = generation(path)
-                    if path == root / METADATA_DIR:
+                    if entry.is_dir(follow_symlinks=False) and path.name == METADATA_DIR:
                         target = path.resolve()
                         sources.setdefault(target, generation(target))
                         for metadata in path.glob("*.json"):
@@ -96,7 +96,7 @@ class WorkspaceLoader:
             raise MetadataError(f"layer marker does not exist: {marker}")
         marker_data = self._read_object(marker)
         schema = marker_data.get("schema", 1)
-        if schema != 1:
+        if schema not in (1, 2):
             raise MetadataError(f"{marker}: unsupported schema {schema!r}")
         identity = marker_data.get("id")
         if not isinstance(identity, str) or not identity:
@@ -120,10 +120,19 @@ class WorkspaceLoader:
         producers = []
         metadata_root = root / METADATA_DIR
         previous_producers = {item.source: item for item in cached.producers} if cached else {}
-        for metadata_file in sorted(metadata_root.glob("*.json"), key=lambda item: item.name):
-            if metadata_file.name == MARKER_FILE:
+        if schema == 1:
+            metadata_files = list(metadata_root.glob("*.json"))
+        else:
+            metadata_files = [
+                path
+                for pack_dir in root.rglob(METADATA_DIR)
+                if pack_dir.is_dir()
+                for path in pack_dir.glob("*.json")
+            ]
+        for metadata_file in sorted(metadata_files, key=lambda item: item.relative_to(root).as_posix()):
+            if metadata_file == marker or metadata_file.name == MARKER_FILE:
                 continue
-            source = f"{METADATA_DIR}/{metadata_file.name}"
+            source = metadata_file.relative_to(root).as_posix()
             previous_producer = previous_producers.get(source)
             metadata_paths = {metadata_file, metadata_file.resolve()}
             if previous_producer is not None and all(
@@ -170,7 +179,7 @@ class WorkspaceLoader:
                 for path in sources
                 if path != root
                 and path.is_relative_to(root)
-                and path.relative_to(root).parts[0] != METADATA_DIR
+                and METADATA_DIR not in path.relative_to(root).parts
             )
         else:
             payload_paths = sorted(root.rglob("*"))
@@ -182,7 +191,7 @@ class WorkspaceLoader:
                 is_symlink = stat.S_ISLNK(stamp[0])
                 is_file = stat.S_ISREG(stamp[0])
             else:
-                if file == metadata_root or metadata_root in file.parents:
+                if METADATA_DIR in file.relative_to(root).parts:
                     continue
                 is_symlink = file.is_symlink()
                 is_file = file.is_file()
