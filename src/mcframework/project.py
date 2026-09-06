@@ -34,6 +34,7 @@ from .explorer import (
 )
 from .generations import Generation, generation
 from .loader import MARKER_FILE, METADATA_DIR, WorkspaceLoader
+from .metadata import JsonMetadataParser
 from .local_state import InstanceRecord, LinkRecord, LocalState, validate_name
 from .model import Activation, IgnoreSelector, PackState, Resolution, SelectorKind, frozen_map
 from .operations import AddIgnoreSelector, RoutingEngine, RoutingRule, merge_routing_rules, operation_from_json, operation_to_json
@@ -2660,8 +2661,14 @@ class ProjectService:
             selected = engine.destination(operation, declaration_file=f"{METADATA_DIR}/local-edits.json")
             relative = selected[0] if selected else f"{METADATA_DIR}/local-edits.json"
             grouped.setdefault(layer / relative, []).append(operation)
-        for path, records in grouped.items():
-            self._append_operations_to_path(path, records)
+        before = {path: path.read_bytes() if path.exists() else None for path in grouped}
+        try:
+            for path, records in grouped.items():
+                self._append_operations_to_path(path, records)
+        except Exception:
+            for path, content in before.items():
+                self._restore_file(path, content)
+            raise
 
     def _routing_rules_for_layer(self, layer: Path) -> tuple[RoutingRule, ...]:
         """Return effective rules for a layer, including inherited parents.
@@ -2858,10 +2865,10 @@ class ProjectService:
 
     def _renamed_overlay_sources(self, old: Path, new: Path) -> dict[Path, bytes]:
         updates = {}
-        for path in sorted((old / METADATA_DIR).glob("*.json")):
+        for path in sorted((old / METADATA_DIR).rglob("*.json")):
             if path.name == MARKER_FILE:
                 continue
-            document = WorkspaceLoader._read_object(path)
+            document = JsonMetadataParser().read_object(path)
             operations = document.get("operations", [])
             if not isinstance(operations, list):
                 raise MetadataError(f"{path}: operations must be an array")
