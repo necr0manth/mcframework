@@ -867,6 +867,7 @@ class ProjectService:
             self._append_operation(
                 editable,
                 {"type": "ignore", "selector": selector.document()},
+                instance=instance,
             )
             refreshed = self.instance_context(instance)
         if cached is not None:
@@ -1140,7 +1141,7 @@ class ProjectService:
                 with ThreadPoolExecutor(max_workers=min(32, max(1, len(writes)))) as pool:
                     tuple(pool.map(write, writes))
                 if additions:
-                    self._append_operations(target, additions)
+                    self._append_operations(target, additions, instance=instance)
                 if pure_payload_fast_path:
                     expected_writes = {
                         self._bounded_target_path(target, item_path): actual_content
@@ -2135,6 +2136,7 @@ class ProjectService:
             self._append_operation(
                 target,
                 {"type": "activation", "id": package_id, "state": activation.value},
+                instance=instance,
             )
         try:
             self.instance_context(instance)
@@ -2162,7 +2164,7 @@ class ProjectService:
             operation["name"] = group.name
         if group.description is not None:
             operation["description"] = group.description
-        self._append_operation(target, operation)
+        self._append_operation(target, operation, instance=instance)
         try:
             self.instance_context(instance)
         except Exception:
@@ -2189,6 +2191,7 @@ class ProjectService:
                 {"type": "activation", "id": package_id, "state": activation.value}
                 for package_id in members
             ],
+            instance=instance,
         )
         try:
             self.instance_context(instance)
@@ -2260,7 +2263,7 @@ class ProjectService:
             operations_path = target / METADATA_DIR / "local-edits.json"
             operations_before = operations_path.read_bytes() if operations_path.exists() else None
             atomic_write(payload_path, content)
-            self._append_operation(target, {"type": "remove", "path": desired_path})
+            self._append_operation(target, {"type": "remove", "path": desired_path}, instance=instance)
             try:
                 refreshed = self.instance_context(instance)
                 remaining = {
@@ -2278,7 +2281,7 @@ class ProjectService:
             changed_path = target / METADATA_DIR / "local-edits.json"
             before = changed_path.read_bytes() if changed_path.exists() else None
             self._append_operation(
-                target, {"type": "activation", "id": package_id, "state": "disabled"}
+                target, {"type": "activation", "id": package_id, "state": "disabled"}, instance=instance
             )
         elif content is not None:
             changed_path = target.joinpath(*path.split("/"))
@@ -2287,7 +2290,7 @@ class ProjectService:
         else:
             changed_path = target / METADATA_DIR / "local-edits.json"
             before = changed_path.read_bytes() if changed_path.exists() else None
-            self._append_operation(target, {"type": "remove", "path": path})
+            self._append_operation(target, {"type": "remove", "path": path}, instance=instance)
         try:
             refreshed = self.instance_context(instance)
             if any(
@@ -2437,7 +2440,7 @@ class ProjectService:
                 rendered = json.dumps(declaration_document, indent=2, ensure_ascii=False) + "\n"
                 atomic_write(operations_path, rendered.encode())
             else:
-                self._append_operations(target, operations)
+                self._append_operations(target, operations, instance=instance)
             refreshed = self.instance_context(instance)
             if any(
                 entry["path"] == item["path"]
@@ -2601,11 +2604,14 @@ class ProjectService:
             if (root := self.branch_root(branch)) in participating
         }
 
-    def _append_operation(self, layer: Path, operation: dict[str, Any]) -> None:
-        self._append_operations(layer, [operation])
+    def _append_operation(self, layer: Path, operation: dict[str, Any], *, instance: str | None = None) -> None:
+        self._append_operations(layer, [operation], instance=instance)
 
-    def _append_operations(self, layer: Path, additions: list[dict[str, Any]]) -> None:
-        engine = RoutingEngine(self._routing_rules_for_layer(layer))
+    def _append_operations(self, layer: Path, additions: list[dict[str, Any]], *, instance: str | None = None) -> None:
+        rules = self._routing_rules_for_layer(layer)
+        if instance is not None:
+            rules = merge_routing_rules(rules, self._routing_rules_for_instance(instance))
+        engine = RoutingEngine(rules)
         grouped: dict[Path, list[dict[str, Any]]] = {}
         for operation in additions:
             selected = engine.destination(operation, declaration_file=f"{METADATA_DIR}/local-edits.json")
@@ -2663,6 +2669,21 @@ class ProjectService:
             return merge_routing_rules(inherited, own)
 
         return read_rules(layer)
+
+    def _routing_rules_for_instance(self, instance: str) -> tuple[RoutingRule, ...]:
+        """Parse untracked instance-local rules; these override layer rules."""
+        rules: list[RoutingRule] = []
+        source = str(self.state.routing_rules_path(instance))
+        for index, raw in enumerate(self.state.routing_rules(instance)):
+            try:
+                parsed = operation_from_json(
+                    {**raw, "type": "routing_rule"}, source=source, index=index
+                )
+            except (TypeError, ValueError, MetadataError, ResolutionError):
+                continue
+            if isinstance(parsed, RoutingRule):
+                rules.append(parsed)
+        return merge_routing_rules(rules)
 
     def _append_operations_to_path(self, path: Path, additions: list[dict[str, Any]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2737,7 +2758,7 @@ class ProjectService:
             operation["version"] = package.version
         operations_path = target / METADATA_DIR / "local-edits.json"
         before = operations_path.read_bytes() if operations_path.exists() else None
-        self._append_operation(target, operation)
+        self._append_operation(target, operation, instance=context.instance.name)
         try:
             refreshed = self.instance_context(context.instance.name)
             if any(

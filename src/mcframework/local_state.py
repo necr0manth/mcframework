@@ -67,6 +67,29 @@ class LocalState:
     def parameters_path(self, instance: str) -> Path:
         return self.root / "parameters" / f"{validate_name(instance, 'instance name')}.json"
 
+    def routing_rules_path(self, instance: str) -> Path:
+        """Untracked per-instance routing overrides.
+
+        The file deliberately lives in ``.mcpack``: rules here are local policy,
+        never repository content.  Its shape is ``{"routing_rules": [...]}``.
+        """
+        return self.root / "routing" / f"{validate_name(instance, 'instance name')}.json"
+
+    def routing_rules(self, instance: str) -> tuple[dict[str, Any], ...]:
+        path = self.routing_rules_path(instance)
+        if not path.exists():
+            return ()
+        document = self._read_document(path, "routing_rules")
+        raw = document["routing_rules"]
+        if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+            raise MetadataError(f"{path}: routing_rules must be an array of objects")
+        return tuple(raw)
+
+    def write_routing_rules(self, instance: str, rules: list[Mapping[str, Any]]) -> None:
+        if not all(isinstance(item, Mapping) for item in rules):
+            raise MetadataError("routing rules must be objects")
+        self._write_document(self.routing_rules_path(instance), {"routing_rules": list(rules)})
+
     def feature_root(self, instance: str) -> Path:
         return self.root / "features" / validate_name(instance, "instance name")
 
