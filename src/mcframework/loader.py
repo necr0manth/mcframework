@@ -69,7 +69,7 @@ class WorkspaceLoader:
                     if entry.is_dir(follow_symlinks=False) and path.name == METADATA_DIR:
                         target = path.resolve()
                         sources.setdefault(target, generation(target))
-                        for metadata in path.glob("*.json"):
+                        for metadata in path.rglob("*.json"):
                             sources[metadata] = generation(metadata)
                             if metadata.is_symlink():
                                 target = metadata.resolve()
