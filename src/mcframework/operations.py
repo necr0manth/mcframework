@@ -70,11 +70,19 @@ class RoutingRule:
     def matches(self, operation: Mapping[str, Any]) -> bool:
         """Return whether this rule applies to a serialized operation."""
         for key, expected in self.when.items():
-            actual = operation.get(key)
+            actual: Any = operation.get(key)
             if key == "operation_types":
                 actual = operation.get("type")
+            elif key.startswith("package."):
+                package = operation.get("package")
+                actual = package.get(key[8:]) if isinstance(package, Mapping) else operation.get(key[8:])
+            elif key == "tags":
+                actual = operation.get("tags", ()); actual = tuple(actual) if isinstance(actual, list) else actual
             if isinstance(expected, (list, tuple, set)):
-                if actual not in expected:
+                if key == "tags" and isinstance(actual, (list, tuple, set)):
+                    if not set(expected).issubset(set(actual)):
+                        return False
+                elif actual not in expected:
                     return False
             elif isinstance(expected, Mapping):
                 if not isinstance(actual, Mapping) or any(actual.get(k) != v for k, v in expected.items()):
