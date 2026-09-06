@@ -24,7 +24,7 @@ from .artifacts import (
     LocalArtifactProvider,
 )
 from .build import Builder
-from .errors import MetadataError
+from .errors import MetadataError, ResolutionError
 from .explorer import (
     ExplorerSnapshot,
     SourceGenerations,
@@ -36,7 +36,7 @@ from .generations import Generation, generation
 from .loader import MARKER_FILE, METADATA_DIR, WorkspaceLoader
 from .local_state import InstanceRecord, LinkRecord, LocalState, validate_name
 from .model import Activation, IgnoreSelector, PackState, Resolution, SelectorKind, frozen_map
-from .operations import AddIgnoreSelector, RoutingEngine, RoutingRule, operation_from_json, operation_to_json
+from .operations import AddIgnoreSelector, RoutingEngine, RoutingRule, merge_routing_rules, operation_from_json, operation_to_json
 from .package_inspect import (
     ModrinthMatcher,
     ProviderMatcher,
@@ -2615,22 +2615,54 @@ class ProjectService:
             self._append_operations_to_path(path, records)
 
     def _routing_rules_for_layer(self, layer: Path) -> tuple[RoutingRule, ...]:
-        root = layer / METADATA_DIR
-        rules: list[RoutingRule] = []
-        if not root.exists():
-            return ()
-        for candidate in root.rglob("*.json"):
+        """Return effective rules for a layer, including inherited parents.
+
+        Parent markers are repository-relative and are traversed before the child;
+        duplicate rule ids in a child replace the inherited definition.
+        """
+        seen: set[Path] = set()
+
+        def read_rules(current: Path) -> tuple[RoutingRule, ...]:
+            current = current.resolve()
+            if current in seen:
+                return ()
+            seen.add(current)
+            inherited: list[RoutingRule] = []
+            marker = current / METADATA_DIR / MARKER_FILE
             try:
-                document = json.loads(candidate.read_text(encoding="utf-8"))
+                marker_data = json.loads(marker.read_text(encoding="utf-8"))
             except (OSError, UnicodeError, json.JSONDecodeError):
-                continue
-            if not isinstance(document, dict) or not isinstance(document.get("operations"), list):
-                continue
-            source = candidate.relative_to(layer).as_posix()
-            for index, raw in enumerate(document["operations"]):
-                if isinstance(raw, dict) and raw.get("type") == "routing_rule":
-                    rules.append(operation_from_json(raw, source=source, index=index))
-        return tuple(rule for rule in rules if isinstance(rule, RoutingRule))
+                marker_data = {}
+            for parent in marker_data.get("parents", []) if isinstance(marker_data, dict) else []:
+                reference = parent if isinstance(parent, str) else parent.get("path") if isinstance(parent, dict) else None
+                if isinstance(reference, str):
+                    parent_path = (self.project / reference).resolve()
+                    inherited.extend(read_rules(parent_path))
+            own: list[RoutingRule] = []
+            root = current / METADATA_DIR
+            if not root.exists():
+                return merge_routing_rules(inherited)
+            for candidate in root.rglob("*.json"):
+                if candidate.name == MARKER_FILE:
+                    continue
+                try:
+                    document = json.loads(candidate.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(document, dict) or not isinstance(document.get("operations"), list):
+                    continue
+                source = candidate.relative_to(current).as_posix()
+                for index, raw in enumerate(document["operations"]):
+                    if isinstance(raw, dict) and raw.get("type") == "routing_rule":
+                        try:
+                            rule = operation_from_json(raw, source=source, index=index)
+                        except (TypeError, ValueError, MetadataError, ResolutionError):
+                            continue
+                        if isinstance(rule, RoutingRule):
+                            own.append(rule)
+            return merge_routing_rules(inherited, own)
+
+        return read_rules(layer)
 
     def _append_operations_to_path(self, path: Path, additions: list[dict[str, Any]]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
