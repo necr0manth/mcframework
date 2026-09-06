@@ -2144,6 +2144,49 @@ class ProjectService:
             self._restore_file(path, before)
             raise
 
+    def remove_package(
+        self,
+        instance: str,
+        package_id: str,
+        *,
+        mode: str = "disable",
+        target_layer: str | None = None,
+    ) -> None:
+        """Disable a package or remove its declaration when owned by the target layer."""
+        if mode not in {"disable", "remove"}:
+            raise MetadataError("package removal mode must be 'disable' or 'remove'")
+        context = self.instance_context(instance)
+        package = context.resolution.state.packages.get(package_id)
+        if package is None:
+            raise MetadataError(f"package is not declared: {package_id!r}")
+        target = self._editable_target(instance, context, target_layer)
+        source = Path(package.source_file) if package.source_file else None
+        owns = source is not None and source.resolve().is_relative_to(target.resolve())
+        if mode == "remove" and owns and package.source_index is not None:
+            before = source.read_bytes()
+            try:
+                document = json.loads(before)
+                operations = document.get("operations")
+                if not isinstance(operations, list):
+                    raise MetadataError(f"invalid operations document: {source}")
+                index = package.source_index
+                if index >= len(operations) or operations[index].get("id") != package_id:
+                    raise MetadataError(f"package declaration moved for {package_id!r}")
+                del operations[index]
+                atomic_write(source, (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode())
+            except Exception:
+                self._restore_file(source, before)
+                raise
+        else:
+            path = target / METADATA_DIR / "local-edits.json"
+            before = path.read_bytes() if path.exists() else None
+            self._append_operation(target, {"type": "activation", "id": package_id, "state": "disabled"}, instance=instance)
+            try:
+                self.instance_context(instance)
+            except Exception:
+                self._restore_file(path, before)
+                raise
+
     def set_group_activation(
         self, instance: str, group_id: str, state: str, target_layer: str | None = None
     ) -> None:
