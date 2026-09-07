@@ -73,7 +73,7 @@ def test_loader_rejects_bad_schema_and_unknown_document_keys(tmp_path: Path) -> 
     root = tmp_path / "bad"
     metadata = root / ".pack"
     metadata.mkdir(parents=True)
-    (metadata / "layer.json").write_text('{"schema": 2, "id": "bad"}')
+    (metadata / "layer.json").write_text('{"schema": 3, "id": "bad"}')
     with pytest.raises(MetadataError, match="schema"):
         WorkspaceLoader(tmp_path).load(root)
     (metadata / "layer.json").write_text('{"schema": 1, "id": "bad"}')

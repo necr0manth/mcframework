@@ -1,4 +1,4 @@
-"""Ordered recursive layer and package dependency resolution."""
+"""Layer composition coordinator and narrow package dependency resolution."""
 
 from __future__ import annotations
 
@@ -14,15 +14,18 @@ from .model import (
     LayerApplicationTrace,
     LayerDefinition,
     PackageDeclaration,
+    PackageState,
     PackState,
     ProducedOperationTrace,
     Resolution,
     frozen_map,
 )
-from .operations import Operation, PutFile, apply_local_operations
+from .operations import MetadataRecord, PutFile, apply_local_operations
 
 
-class Resolver:
+class LayerComposer:
+    """Coordinate mixed layer records without implementing their domain semantics."""
+
     def __init__(self, loader: WorkspaceLoader, *, automatic_dependencies: bool = True):
         self.loader = loader
         self.automatic_dependencies = automatic_dependencies
@@ -62,7 +65,7 @@ class Resolver:
         self._precedence += 1
         precedence = self._precedence
         produced: list[ProducedOperationTrace] = []
-        operations: list[Operation] = []
+        operations: list[MetadataRecord] = []
         for producer in layer.producers:
             concrete = producer.produce(parameters)
             producer.validate(concrete)
@@ -86,12 +89,22 @@ class Resolver:
         return state, trace
 
 
+class Resolver(LayerComposer):
+    """Backward-compatible name for the layer composition coordinator."""
+
+
 def resolve_dependencies(
     state: PackState, automatic_dependencies: bool
 ) -> tuple[PackState, tuple[PackageDeclaration, ...]]:
-    # Dependency resolution is deliberately scoped to the package catalog;
-    # content bytes and web policy are opaque to this subsystem.
-    catalog = state.package_catalog
+    """Compatibility adapter for callers holding the composed state."""
+    catalog, active = resolve_package_dependencies(state.package_catalog, automatic_dependencies)
+    return replace(state, packages=catalog.packages, groups=catalog.groups), active
+
+
+def resolve_package_dependencies(
+    catalog: PackageState, automatic_dependencies: bool
+) -> tuple[PackageState, tuple[PackageDeclaration, ...]]:
+    """Resolve activation closure using only the package graph."""
     packages = dict(catalog.packages)
     groups = dict(catalog.groups)
     known_nodes = set(packages) | set(groups)
@@ -169,7 +182,7 @@ def resolve_dependencies(
                 f"{package.destination!r}"
             )
         destinations[package.destination] = package.identity
-    return replace(state, packages=frozen_map(packages), groups=frozen_map(groups)), active
+    return replace(catalog, packages=frozen_map(packages), groups=frozen_map(groups)), active
 
 
 def redact(value: Any) -> Any:

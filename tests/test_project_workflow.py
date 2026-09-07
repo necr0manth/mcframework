@@ -79,7 +79,7 @@ def test_init_layer_creates_only_minimal_marker_and_refuses_existing_content(
     assert main(["init", "client"]) == 0
     marker = tmp_path / "client/.pack/layer.json"
     assert json.loads(marker.read_text(encoding="utf-8")) == {
-        "schema": 1,
+        "schema": 2,
         "id": "client",
         "parents": [],
     }

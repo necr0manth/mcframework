@@ -1,4 +1,5 @@
 import { normalizeDeltaItem } from './api.js';
+import { captureCreatesMetadata } from './routing-model.js';
 import { providerMatchFor } from './view-model.js';
 
 export function singleFileImportItem(entry) {
@@ -19,7 +20,8 @@ export function semanticCaptureAction(client, draft) {
   if (mode === 'import') {
     const candidate = item.provider_candidates.find((entry) => candidateKey(entry) === providerKey);
     const match = providerMatchFor(candidate, fuzzyConfirmed);
-    return () => client.importPackage(item.id, target, match, item.actual_sha256);
+    return () => client.importPackage(item.id, target, match, item.actual_sha256, draft.metadataWrite);
   }
-  return () => client.capture(item.id, target, item.actual_sha256);
+  const write = captureCreatesMetadata(draft) ? draft.metadataWrite : undefined;
+  return () => client.capture(item.id, target, item.actual_sha256, write);
 }

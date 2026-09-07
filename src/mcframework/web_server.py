@@ -150,6 +150,15 @@ class Handler(BaseHTTPRequestHandler):
                 with self.server.state.mutation_lock(self.server.instance):
                     self._json(self.server.delta())
                 return
+            if parsed.path == "/api/v1/routing":
+                query = parse_qs(parsed.query)
+                with self.server.state.mutation_lock(self.server.instance):
+                    result = self.server.service.routing_options(
+                        self.server.instance, query.get("target_layer", [None])[0]
+                    )
+                    result["revision"] = self.server.revision
+                    self._json(result)
+                return
             if parsed.path.startswith("/api/v1/delta/"):
                 delta_id = unquote(parsed.path.removeprefix("/api/v1/delta/"))
                 query = parse_qs(parsed.query)
@@ -224,6 +233,34 @@ class Handler(BaseHTTPRequestHandler):
             with self.server.state.mutation_lock(self.server.instance):
                 request_revision = self._require_revision()
                 body = self._read_json()
+                metadata_write = body.get("metadata_write", {})
+                if (
+                    not isinstance(metadata_write, dict)
+                    or set(metadata_write) - {"file", "section"}
+                ):
+                    raise MetadataError("metadata_write must contain only file and section")
+                destination = self._optional_string(metadata_write, "file")
+                section = self._optional_string(metadata_write, "section")
+                if method == "POST" and parsed.path == "/api/v1/routing/schema/preview":
+                    plan = self.server.service.preview_schema_upgrade(
+                        self.server.instance, self._optional_string(body, "target_layer")
+                    )
+                    plan["revision"] = self.server.revision
+                    self._json(plan)
+                    return
+                if method == "POST" and parsed.path == "/api/v1/routing/preview":
+                    operation = body.get("operation")
+                    if not isinstance(operation, dict):
+                        raise MetadataError("operation must be an object")
+                    plan = self.server.service.preview_routing(
+                        self.server.instance, operation,
+                        self._optional_string(body, "target_layer"),
+                        file=destination, section=section,
+                        origin=self._optional_string(body, "origin") or "user",
+                    )
+                    plan["revision"] = self.server.revision
+                    self._json(plan)
+                    return
                 if parsed.path == "/api/v1/files/capture":
                     auto_payload = body.get("auto_payload", False)
                     if not isinstance(auto_payload, bool):
@@ -268,7 +305,8 @@ class Handler(BaseHTTPRequestHandler):
                         raise MetadataError("plan_revision must be an integer")
                     if plan_revision != request_revision or plan_revision != self.server.revision:
                         raise RevisionConflict(plan_revision, self.server.revision)
-                should_shutdown = self._dispatch_mutation(method, parsed.path, body)
+                with self.server.service.metadata_destination(destination, section):
+                    should_shutdown = self._dispatch_mutation(method, parsed.path, body)
                 if parsed.path not in {
                     "/api/v1/files/capture",
                     "/api/v1/files/ignore",
@@ -363,6 +401,30 @@ class Handler(BaseHTTPRequestHandler):
                 self._optional_string(body, "target_layer"),
                 self._optional_provider_match(body),
                 expected_sha256=self._string(body, "expected_sha256"),
+            )
+        elif method == "DELETE" and route.startswith("packages/"):
+            self.server.service.remove_package(
+                self.server.instance, unquote(route.removeprefix("packages/")),
+                mode=self._string(body, "mode"),
+                target_layer=self._optional_string(body, "target_layer"),
+            )
+        elif method == "POST" and route == "routing/rules":
+            rule = body.get("rule")
+            if not isinstance(rule, dict):
+                raise MetadataError("rule must be an object")
+            self.server.service.save_routing_rule(
+                self.server.instance, rule, self._string(body, "scope"),
+                self._optional_string(body, "target_layer"),
+                file=self._optional_string(body, "destination"),
+            )
+        elif method == "DELETE" and route.startswith("routing/rules/"):
+            self.server.service.remove_routing_rule(
+                self.server.instance, unquote(route.removeprefix("routing/rules/")),
+                self._string(body, "scope"), self._optional_string(body, "target_layer"),
+            )
+        elif method == "POST" and route == "routing/schema/upgrade":
+            self.server.service.upgrade_layer_schema(
+                self.server.instance, self._optional_string(body, "target_layer")
             )
         elif method == "POST" and route == "sync":
             context = self.server.service.instance_context(self.server.instance)

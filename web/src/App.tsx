@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ApiClient, ApiError, createKeyedRequestLoader, createRevisionedDeltaLoader, mergeDeltaForRevision, runRevisionedMutation } from './api.js';
 import FileExplorer from './FileExplorer.js';
+import { RoutingRuleEditor, WriteDestination } from './RoutingControls.js';
+import type { MetadataWrite } from './RoutingControls.js';
+import { captureCreatesMetadata, captureRoutingOperation, packageOwnedBy } from './routing-model.js';
 import { candidateKey, semanticCaptureAction } from './semantic-import.js';
 import { allMembersActive, buildMetadataTree, canImportDelta, deltaPresentation, featureSidebarSummary, packageActivationTarget, paginateDelta } from './view-model.js';
 
@@ -11,6 +14,8 @@ const DELTA_PAGE_SIZE = 200;
 type PackageItem = {
   id: string;
   logical_id: string;
+  proposed_package_id?: string;
+  proposed_package_kind?: string;
   kind: string;
   version: string;
   activation: Activation;
@@ -40,6 +45,9 @@ type ProviderCandidate = {
   confidence: 'exact' | 'fuzzy' | string;
   reason: string;
   hashes: Record<string, unknown>;
+  kind?: string;
+  categories?: string[];
+  tags?: string[];
 };
 
 type DeltaItem = {
@@ -105,6 +113,7 @@ type CaptureDraft = {
   mode: 'capture' | 'import';
   providerKey: string;
   fuzzyConfirmed: boolean;
+  metadataWrite?: MetadataWrite;
 };
 
 const client = new ApiClient(window.fetch.bind(window));
@@ -149,6 +158,10 @@ export default function App() {
   const [view, setView] = useState<View>('pack');
   const [selected, setSelected] = useState<Selected | null>(null);
   const [targetLayer, setTargetLayer] = useState('');
+  const [routingDialog, setRoutingDialog] = useState(false);
+  const [packageEdit, setPackageEdit] = useState<{
+    item: PackageItem; target: string; mode: string; metadataWrite?: MetadataWrite;
+  } | null>(null);
   const [captureDraft, setCaptureDraft] = useState<CaptureDraft | null>(null);
   const [captureError, setCaptureError] = useState('');
   const [detailBusy, setDetailBusy] = useState('');
@@ -294,6 +307,19 @@ export default function App() {
       () => client.setActivation(item.id, state, target),
       `${item.id} is now ${state}.`,
     );
+  }
+
+  async function submitPackageEdit() {
+    if (!packageEdit) return;
+    const { item, mode, target, metadataWrite } = packageEdit;
+    const changed = await act(
+      `package:${item.id}`,
+      () => mode === 'enabled'
+        ? client.setActivation(item.id, 'enabled', target, metadataWrite)
+        : client.removePackage(item.id, mode, target, metadataWrite),
+      mode === 'remove' ? `${item.id} declaration removed.` : `${item.id} updated.`,
+    );
+    if (changed) { setPackageEdit(null); if (mode === 'remove') setSelected(null); }
   }
 
   function toggleGroup(item: Group) {
@@ -487,6 +513,7 @@ export default function App() {
         {view === 'pack' ? <>
           <div className="page-heading"><div><p className="eyebrow">Resolved composition</p><h1>Pack structure</h1><p>Metadata files, semantic sections and declarations in resolver order.</p></div><div className="summary"><strong>{activePackages}</strong><span>active</span><i /><strong>{data.declarations.length}</strong><span>declarations</span></div></div>
 
+          <div className="routing-toolbar"><TargetSelect layers={data.writable_layers} value={targetLayer} onChange={setTargetLayer} /><button className="secondary" disabled={!!busy} onClick={() => setRoutingDialog(true)}>Write routing rules</button></div>
           {data.groups.length > 0 && <section className="groups" aria-label="Package groups">{data.groups.map((group) => <article key={group.id}><span className="group-icon">G</span><div><small>Package group</small><strong>{group.name}</strong><p>{group.description || group.id}</p></div><Badge state={group.activation} /><Toggle checked={active(group.activation)} disabled={!!busy || !data.capabilities.activation} label={`Toggle ${group.name} group`} onChange={() => toggleGroup(group)} /></article>)}</section>}
 
           <div className="pack-grid">
@@ -506,6 +533,7 @@ export default function App() {
             </div>
 
             <aside className="details" aria-label="Selection details">
+              {selected?.type === 'package' && <button className="secondary" disabled={!!busy || !data.capabilities.activation} onClick={() => setPackageEdit({ item: selected.value, target: targetLayer, mode: 'disable' })}>Edit package / remove</button>}
               {selected?.type === 'package' ? <PackageDetails item={selected.value} /> : selected?.type === 'declaration' ? <DeclarationDetails item={selected.value} /> : <Empty title="Nothing selected">Choose a declaration to inspect its provenance.</Empty>}
             </aside>
           </div>
@@ -522,7 +550,34 @@ export default function App() {
         </> : <FileExplorer client={client} data={data} targetLayer={targetLayer} layers={data.writable_layers} onTargetLayer={setTargetLayer} onMutate={(label, action, success) => act(label, async () => await action() as Bootstrap, success)} onCompactMutation={applyCompactMutation} onRevisionConflict={(reason) => refreshAfterConflict(reason as ApiError)} onReviewImport={openCapture} onError={setError} />}
       </main>
 
-      {captureDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeCapture()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="capture-title"><header><div><p className="eyebrow">Semantic write</p><h2 id="capture-title">{deltaPresentation(captureDraft.item).title}</h2></div><button aria-label="Close" onClick={closeCapture}>×</button></header><div className="modal-body"><p>Only this semantic item will be written. Unrelated instance changes stay untouched.</p><TargetSelect layers={data.writable_layers} value={captureDraft.target} onChange={(target) => setCaptureDraft({ ...captureDraft, target })} />{detailBusy && <div className="inline-error" role="status">Inspecting this file and checking package metadata…</div>}{!detailBusy && canImportDelta(captureDraft.item) && data.capabilities.package_import && <fieldset><legend>Capture mode</legend><label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'import'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'import' })} /><span><strong>Import as package</strong><small>Use verified provider metadata or a local SHA-256 artifact.</small></span></label>{data.capabilities.capture && <label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'capture'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'capture' })} /><span><strong>Capture as file</strong><small>Preserve the change as a file operation.</small></span></label>}</fieldset>}{!detailBusy && captureDraft.mode === 'import' && <ImportChoices draft={captureDraft} selectedCandidate={selectedCandidate} onChange={setCaptureDraft} />}{captureError && <div className="inline-error" role="alert"><span>{captureError}</span>{!captureDraft.item.enriched && <button className="secondary" onClick={() => void openCapture(captureDraft.item, captureDraft.revision)}>Retry</button>}</div>}</div><footer><button className="secondary" onClick={closeCapture}>Cancel</button><button className="primary" disabled={!!detailBusy || !captureDraft.item.enriched} onClick={() => void submitCapture()}>{detailBusy ? 'Inspecting…' : captureDraft.mode === 'import' ? 'Import package' : 'Capture change'}</button></footer></section></div>}
+      {routingDialog && <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="routing-title">
+        <header><h2 id="routing-title">Write routing rules</h2><button aria-label="Close" onClick={() => setRoutingDialog(false)}>×</button></header>
+        <div className="modal-body"><TargetSelect layers={data.writable_layers} value={targetLayer} onChange={setTargetLayer} />
+          {error && <p className="inline-error" role="alert">{error}</p>}
+          <RoutingRuleEditor key={targetLayer} client={client} target={targetLayer} busy={!!busy} onSave={async (rule, scope, file) => {
+            const changed = await act('routing', () => client.saveRoutingRule(rule, scope, targetLayer, file), `${scope} routing rule saved.`);
+            if (changed) setRoutingDialog(false);
+            return changed;
+          }} onUpgrade={(revision) => act('schema-upgrade', () => client.upgradeLayerSchema(targetLayer, revision), 'Selected layer upgraded to schema 2.')}
+          onDelete={(id, scope) => act('routing-delete', () => client.deleteRoutingRule(id, scope, targetLayer), `${scope} rule ${id} removed.`)} />
+        </div>
+      </section></div>}
+
+      {packageEdit && <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="package-edit-title">
+        <header><h2 id="package-edit-title">Edit {packageEdit.item.id}</h2><button aria-label="Close" onClick={() => setPackageEdit(null)}>×</button></header>
+        <div className="modal-body"><TargetSelect layers={data.writable_layers} value={packageEdit.target} onChange={(target) => setPackageEdit({ ...packageEdit, target, mode: 'disable' })} />
+          {error && <p className="inline-error" role="alert">{error}</p>}
+          <label><span>Action</span><select value={packageEdit.mode} onChange={(event) => setPackageEdit({ ...packageEdit, mode: event.target.value })}>
+            <option value="enabled">Enable</option><option value="disable">Disable, keep declaration</option>
+            {packageOwnedBy(packageEdit.item, data.writable_layers, packageEdit.target) && <option value="remove">Remove declaration from selected layer</option>}
+          </select></label>
+          {!packageOwnedBy(packageEdit.item, data.writable_layers, packageEdit.target) && <p>This package is inherited. Disabling writes an override into the selected layer.</p>}
+          {packageEdit.mode === 'remove' ? <p>The declaration is removed from its existing metadata file; the artifact itself is not deleted. An inherited declaration may become visible again.</p> :
+            <WriteDestination client={client} target={packageEdit.target} operation={{ type: 'activation', id: packageEdit.item.id, state: packageEdit.mode === 'enabled' ? 'enabled' : 'disabled' }} value={packageEdit.metadataWrite} onChange={(metadataWrite) => setPackageEdit({ ...packageEdit, metadataWrite })} />}
+        </div><footer><button className="secondary" onClick={() => setPackageEdit(null)}>Cancel</button><button className="primary" disabled={!!busy} onClick={() => void submitPackageEdit()}>Apply package change</button></footer>
+      </section></div>}
+
+      {captureDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeCapture()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="capture-title"><header><div><p className="eyebrow">Semantic write</p><h2 id="capture-title">{deltaPresentation(captureDraft.item).title}</h2></div><button aria-label="Close" onClick={closeCapture}>×</button></header><div className="modal-body"><p>Only this semantic item will be written. Unrelated instance changes stay untouched.</p><TargetSelect layers={data.writable_layers} value={captureDraft.target} onChange={(target) => setCaptureDraft({ ...captureDraft, target })} />{detailBusy && <div className="inline-error" role="status">Inspecting this file and checking package metadata…</div>}{!detailBusy && canImportDelta(captureDraft.item) && data.capabilities.package_import && <fieldset><legend>Capture mode</legend><label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'import'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'import' })} /><span><strong>Import as package</strong><small>Use verified provider metadata or a local SHA-256 artifact.</small></span></label>{data.capabilities.capture && <label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'capture'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'capture', metadataWrite: undefined })} /><span><strong>Capture as file</strong><small>Preserve the change as a file operation.</small></span></label>}</fieldset>}{!detailBusy && captureDraft.mode === 'import' && <ImportChoices draft={captureDraft} selectedCandidate={selectedCandidate} onChange={setCaptureDraft} />}{captureCreatesMetadata(captureDraft) && <WriteDestination client={client} target={captureDraft.target} operation={captureRoutingOperation(captureDraft)} value={captureDraft.metadataWrite} origin="instance_capture" onChange={(metadataWrite) => setCaptureDraft({ ...captureDraft, metadataWrite })} />}{captureError && <div className="inline-error" role="alert"><span>{captureError}</span>{!captureDraft.item.enriched && <button className="secondary" onClick={() => void openCapture(captureDraft.item, captureDraft.revision)}>Retry</button>}</div>}</div><footer><button className="secondary" onClick={closeCapture}>Cancel</button><button className="primary" disabled={!!detailBusy || !captureDraft.item.enriched} onClick={() => void submitCapture()}>{detailBusy ? 'Inspecting…' : captureDraft.mode === 'import' ? 'Import package' : 'Capture change'}</button></footer></section></div>}
 
       {featureDialog && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setFeatureDialog(false)}><section className="modal compact" role="dialog" aria-modal="true" aria-labelledby="feature-title"><header><div><p className="eyebrow">Temporary layer</p><h2 id="feature-title">Add feature</h2></div><button aria-label="Close" onClick={() => setFeatureDialog(false)}>×</button></header><div className="modal-body"><p>The instance will be relinked to a local temporary layer containing this feature.</p><label><span>Feature</span><select value={featureChoice} onChange={(event) => setFeatureChoice(event.target.value)}>{remainingFeatures.map((feature) => <option value={feature} key={feature}>{feature}</option>)}</select></label></div><footer><button className="secondary" onClick={() => setFeatureDialog(false)}>Cancel</button><button className="primary" disabled={!featureChoice} onClick={() => void addFeature()}>Add feature</button></footer></section></div>}
     </div>

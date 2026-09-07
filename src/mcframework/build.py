@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from .artifacts import ArtifactResolver
@@ -18,7 +19,9 @@ class Builder:
         self.artifacts = artifacts
 
     def prepare(self, resolution: Resolution) -> tuple[Resolution, dict[str, bytes]]:
-        resolved = self.artifacts.resolve(resolution)
+        resolved = replace(
+            resolution, artifacts=self.artifacts.resolve_packages(resolution.active_packages)
+        )
         resolved, files = materialized_files(resolved)
         return resolved, dict(files)
 

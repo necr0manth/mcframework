@@ -299,3 +299,13 @@ select:focus, input:focus { border-color: #668b43; box-shadow: 0 0 0 2px rgba(16
   .delta-actions .primary { width: 100%; }
   .modal fieldset { grid-template-columns: 1fr; }
 }
+
+.routing-toolbar { display: flex; align-items: end; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+.routing-rule-editor, .routing-fields { display: grid; gap: 12px; }
+.routing-rule-editor label, .routing-fields label { display: grid; gap: 6px; }
+.routing-rule-editor input, .routing-rule-editor select, .routing-rule-editor textarea,
+.routing-fields input { width: 100%; min-width: 0; padding: 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface, #fff); color: inherit; }
+.routing-rule-editor .choice { display: flex; }
+.routing-rule-editor input[type=checkbox] { width: auto; }
+.routing-rule-editor pre, .routing-fields pre { max-height: 250px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.modal .routing-fields { grid-template-columns: 1fr; }

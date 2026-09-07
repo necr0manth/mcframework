@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from .paths import matches, normalize_relative_path
 
 if TYPE_CHECKING:
-    from .operations import Operation, Producer
+    from .operations import MetadataRecord, Producer
 
 
 def frozen_map(values: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
@@ -135,17 +135,17 @@ class PackState:
     ignore: tuple[IgnoreSelector, ...] = ()
 
     @property
-    def content(self) -> "ContentState":
+    def content(self) -> ContentState:
         """Files and exclusions consumed by the build/materializer subsystem."""
         return ContentState(self.files, self.exclusions, self.prune)
 
     @property
-    def package_catalog(self) -> "PackageState":
+    def package_catalog(self) -> PackageState:
         """Package/dependency data consumed by resolver and artifact planning."""
         return PackageState(self.packages, self.dependencies, self.groups, self.sections)
 
     @property
-    def web_policy(self) -> "WebPolicyState":
+    def web_policy(self) -> WebPolicyState:
         """Web/instance policy, intentionally excluded from materialized payloads."""
         return WebPolicyState(self.ignore)
 
@@ -180,7 +180,7 @@ class WebPolicyState:
 class ProducedOperationTrace:
     producer: str
     source: str
-    operations: tuple[Operation, ...]
+    operations: tuple[MetadataRecord, ...]
 
 
 @dataclass(frozen=True)

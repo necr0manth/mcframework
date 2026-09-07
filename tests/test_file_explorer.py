@@ -345,7 +345,31 @@ def test_plan_checks_all_target_metadata_and_later_layer_remains_supported(
     assert service.instance_diff(service.instance_context("dev"))["items"] == []
 
 
-def test_same_layer_package_declaration_is_rejected_before_artifact_write(
+def test_same_layer_check_decodes_local_paths_in_nested_schema_two_metadata(
+    layer_factory, tmp_path: Path
+) -> None:
+    root = layer_factory("client", operations=[])
+    marker = root / ".pack/layer.json"
+    marker.write_text('{"schema": 2, "id": "client", "parents": []}')
+    nested = root / "config/.pack/files.json"
+    nested.parent.mkdir(parents=True)
+    nested.write_text(
+        json.dumps(
+            {"operations": [{"type": "put", "path": "../a.txt", "content": "old"}]}
+        )
+    )
+    game = game_path(tmp_path)
+    (game / "config").mkdir(parents=True)
+    (game / "config/a.txt").write_text("new")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+
+    plan = service.explorer_plan("dev", "config/a.txt", "client")
+    assert plan["items"][0]["supported"] is False
+    assert "files.json" in plan["items"][0]["reason"]
+
+
+def test_same_layer_package_capture_updates_its_provenance_declaration(
     layer_factory, tmp_path: Path
 ) -> None:
     desired = tmp_path / "desired.jar"
@@ -374,9 +398,14 @@ def test_same_layer_package_declaration_is_rejected_before_artifact_write(
     item = service.instance_diff(service.instance_context("dev"))["items"][0]
     decisions = planned_decisions(service, item["path"], {str(item["id"]): "package"}, "client")
 
-    with pytest.raises(MetadataError, match="provenance-aware declaration"):
-        service.capture_explorer_path("dev", item["path"], "client", decisions)
-    assert not (tmp_path / "client/.pack/artifacts").exists()
+    service.capture_explorer_path("dev", item["path"], "client", decisions)
+
+    document = json.loads((tmp_path / "client/.pack/operations.json").read_text())
+    declaration = document["operations"][0]
+    assert declaration["id"] == "mod"
+    assert declaration["source"]["sha256"] == hashlib.sha256(b"actual").hexdigest()
+    assert declaration["source"]["location"].startswith("client/.pack/artifacts/")
+    assert service.instance_diff(service.instance_context("dev"))["items"] == []
 
 
 def test_shared_target_layer_lock_serializes_separate_service_instances(

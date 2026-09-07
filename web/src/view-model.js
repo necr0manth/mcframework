@@ -154,5 +154,8 @@ export function providerMatchFor(candidate, fuzzyConfirmed) {
     download_url: candidate.download_url,
     hashes: candidate.hashes,
     confidence: candidate.confidence,
+    ...(candidate.kind ? { kind: candidate.kind } : {}),
+    ...(Array.isArray(candidate.categories) ? { categories: candidate.categories } : {}),
+    ...(Array.isArray(candidate.tags) ? { tags: candidate.tags } : {}),
   };
 }

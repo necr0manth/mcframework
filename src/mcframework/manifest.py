@@ -9,18 +9,23 @@ from dataclasses import replace
 from pathlib import Path
 
 from .errors import MergeConflict
-from .model import ManifestEntry, Resolution
+from .model import ContentState, ManifestEntry, Resolution, ResolvedArtifact
 from .operations import operation_to_json
 
 
 def materialized_files(resolution: Resolution) -> tuple[Resolution, Mapping[str, bytes]]:
-    # Build/materialization consumes only the content projection.  Keeping this
-    # boundary explicit prevents web policy and routing metadata from leaking
-    # into the generated Minecraft payload.
-    content_state = resolution.state.content
+    """Compatibility adapter around the policy-independent materializer."""
+    entries, files = materialize_content(resolution.state.content, resolution.artifacts)
+    return replace(resolution, manifest=entries), files
+
+
+def materialize_content(
+    content_state: ContentState, artifacts: tuple[ResolvedArtifact, ...]
+) -> tuple[tuple[ManifestEntry, ...], Mapping[str, bytes]]:
+    """Produce payload files and their manifest without a composed resolution."""
     files = dict(content_state.files)
     entries = [entry_for(path, content) for path, content in files.items()]
-    for artifact in resolution.artifacts:
+    for artifact in artifacts:
         path = artifact.declaration.destination
         if path in files:
             raise MergeConflict(f"package destination conflicts with generated file: {path!r}")
@@ -30,7 +35,7 @@ def materialized_files(resolution: Resolution) -> tuple[Resolution, Mapping[str,
             ManifestEntry(path, artifact.sha256, artifact.size, artifact.declaration.identity)
         )
     entries.sort(key=lambda item: item.path)
-    return replace(resolution, manifest=tuple(entries)), dict(sorted(files.items()))
+    return tuple(entries), dict(sorted(files.items()))
 
 
 def entry_for(path: str, content: bytes) -> ManifestEntry:

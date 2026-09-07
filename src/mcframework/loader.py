@@ -11,10 +11,10 @@ from typing import Any
 
 from .errors import MetadataError, UnsafePathError
 from .generations import Generation, generation
+from .metadata import JsonMetadataParser, MetadataParser, decode_record_paths
 from .model import LayerDefinition, ParentReference, frozen_map
 from .operations import DeclarePackage, PutFile, operation_from_json, producer_for_operations
 from .paths import normalize_relative_path
-from .metadata import JsonMetadataParser, MetadataParser
 
 METADATA_DIR = ".pack"
 MARKER_FILE = "layer.json"
@@ -36,9 +36,11 @@ class WorkspaceLoader:
         self.parser = parser or JsonMetadataParser()
         self._generations: dict[Path, dict[Path, Generation]] = {}
         self._visited: set[Path] = set()
+        self._in_pass = False
 
     def begin(self) -> None:
         self._visited.clear()
+        self._in_pass = True
 
     def finish(self) -> None:
         """Retain only the graph used by the last successful resolution."""
@@ -46,6 +48,7 @@ class WorkspaceLoader:
         self._generations = {
             root: item for root, item in self._generations.items() if root in self._visited
         }
+        self._in_pass = False
 
     def fresh(self) -> bool:
         return all(
@@ -55,33 +58,74 @@ class WorkspaceLoader:
         )
 
     @staticmethod
-    def _sources(root: Path) -> dict[Path, Generation]:
+    def _scan(
+        root: Path,
+        schema: int,
+        *,
+        watch: bool = False,
+        metadata_extensions: tuple[str, ...] = (".json",),
+    ) -> tuple[list[Path], list[Path], dict[Path, Generation]]:
         # Record directory membership generations before enumerating. A concurrent
         # addition may enter the loaded payload, but cannot become an unwatched hit.
-        sources = {root: generation(root)}
+        sources = {root: generation(root)} if watch else {}
+        metadata_files: list[Path] = []
+        payload_paths: list[Path] = []
         pending = [root]
         while pending:
             directory = pending.pop()
             with os.scandir(directory) as entries:
                 for entry in entries:
                     path = Path(entry.path)
-                    sources[path] = generation(path)
-                    if entry.is_dir(follow_symlinks=False) and path.name == METADATA_DIR:
-                        target = path.resolve()
-                        sources.setdefault(target, generation(target))
-                        for metadata in path.rglob("*.json"):
-                            sources[metadata] = generation(metadata)
-                            if metadata.is_symlink():
+                    if watch:
+                        sources[path] = generation(path)
+                    is_metadata = path.name == METADATA_DIR and (schema == 2 or directory == root)
+                    if is_metadata and entry.is_dir():
+                        if watch:
+                            target = path.resolve()
+                            sources.setdefault(target, generation(target))
+                        for metadata in path.iterdir():
+                            if metadata.suffix not in metadata_extensions:
+                                continue
+                            if not metadata.is_file():
+                                continue
+                            if watch:
+                                sources[metadata] = generation(metadata)
                                 target = metadata.resolve()
-                                sources[target] = generation(target)
-                    elif entry.is_dir(follow_symlinks=False):
-                        pending.append(path)
-        return sources
+                                sources.setdefault(target, generation(target))
+                            if metadata.name != MARKER_FILE:
+                                metadata_files.append(metadata)
+                    else:
+                        payload_paths.append(path)
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(path)
+        metadata_files.sort(key=lambda item: item.relative_to(root).as_posix())
+        return metadata_files, sorted(payload_paths), sources
+
+    def metadata_files(self, layer: Path | str) -> tuple[Path, ...]:
+        """Discover operation documents using the layer's schema, excluding markers.
+
+        Returned paths retain their spelling within the layer, including supported
+        metadata symlinks; callers that write must separately enforce confinement.
+        """
+        root = self._resolve_layer_path(layer)
+        marker = root / METADATA_DIR / MARKER_FILE
+        schema = self._schema(marker, self._read_object(marker))
+        documents, _, _ = self._scan(
+            root, schema, metadata_extensions=self.parser.extensions
+        )
+        return tuple(documents)
+
+    @staticmethod
+    def _schema(marker: Path, document: Mapping[str, Any]) -> int:
+        schema = document.get("schema", 1)
+        if type(schema) is not int or schema not in (1, 2):
+            raise MetadataError(f"{marker}: unsupported schema {schema!r}")
+        return schema
 
     def load(self, layer: Path | str) -> LayerDefinition:
         root = self._resolve_layer_path(layer)
         cached = self._cache.get(root)
-        visited = root in self._visited
+        visited = self._in_pass and root in self._visited
         self._visited.add(root)
         previous = self._generations.get(root, {})
         if cached is not None and (
@@ -90,14 +134,25 @@ class WorkspaceLoader:
             or all(generation(path) == expected for path, expected in previous.items())
         ):
             return cached
-        sources = self._sources(root) if self._refresh else {}
         marker = root / METADATA_DIR / MARKER_FILE
         if not marker.is_file():
             raise MetadataError(f"layer marker does not exist: {marker}")
+        marker_sources = (
+            {path: generation(path) for path in (marker, marker.resolve())}
+            if self._refresh else {}
+        )
         marker_data = self._read_object(marker)
-        schema = marker_data.get("schema", 1)
-        if schema not in (1, 2):
-            raise MetadataError(f"{marker}: unsupported schema {schema!r}")
+        schema = self._schema(marker, marker_data)
+        metadata_files, payload_paths, sources = self._scan(
+            root,
+            schema,
+            watch=self._refresh,
+            metadata_extensions=self.parser.extensions,
+        )
+        sources.update(marker_sources)
+        marker_unchanged = all(
+            previous.get(path) == stamp for path, stamp in marker_sources.items()
+        )
         identity = marker_data.get("id")
         if not isinstance(identity, str) or not identity:
             raise MetadataError(f"{marker}: id must be a non-empty string")
@@ -118,24 +173,12 @@ class WorkspaceLoader:
             parents.append(ParentReference(raw["path"], frozen_map(parameters)))
 
         producers = []
-        metadata_root = root / METADATA_DIR
         previous_producers = {item.source: item for item in cached.producers} if cached else {}
-        if schema == 1:
-            metadata_files = list(metadata_root.glob("*.json"))
-        else:
-            metadata_files = [
-                path
-                for pack_dir in root.rglob(METADATA_DIR)
-                if pack_dir.is_dir()
-                for path in pack_dir.glob("*.json")
-            ]
-        for metadata_file in sorted(metadata_files, key=lambda item: item.relative_to(root).as_posix()):
-            if metadata_file == marker or metadata_file.name == MARKER_FILE:
-                continue
+        for metadata_file in metadata_files:
             source = metadata_file.relative_to(root).as_posix()
             previous_producer = previous_producers.get(source)
             metadata_paths = {metadata_file, metadata_file.resolve()}
-            if previous_producer is not None and all(
+            if previous_producer is not None and marker_unchanged and all(
                 path in previous and previous[path] == sources.get(path) for path in metadata_paths
             ):
                 producers.append(previous_producer)
@@ -152,7 +195,9 @@ class WorkspaceLoader:
                 if not isinstance(raw, dict):
                     raise MetadataError(f"{metadata_file}: operation {index} must be an object")
                 try:
-                    operation = operation_from_json(raw, source=source, index=index)
+                    operation = operation_from_json(
+                        decode_record_paths(raw, source, schema), source=source, index=index
+                    )
                     if (
                         isinstance(operation, PutFile)
                         and previous_producer is not None
@@ -173,16 +218,6 @@ class WorkspaceLoader:
             producers.append(producer_for_operations(metadata_file.stem, source, tuple(operations)))
 
         payload: dict[str, bytes] = {}
-        if self._refresh:
-            payload_paths = sorted(
-                path
-                for path in sources
-                if path != root
-                and path.is_relative_to(root)
-                and METADATA_DIR not in path.relative_to(root).parts
-            )
-        else:
-            payload_paths = sorted(root.rglob("*"))
         for file in payload_paths:
             if self._refresh:
                 stamp = sources[file]
@@ -191,8 +226,6 @@ class WorkspaceLoader:
                 is_symlink = stat.S_ISLNK(stamp[0])
                 is_file = stat.S_ISREG(stamp[0])
             else:
-                if METADATA_DIR in file.relative_to(root).parts:
-                    continue
                 is_symlink = file.is_symlink()
                 is_file = file.is_file()
             if is_symlink:

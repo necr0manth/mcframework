@@ -17,12 +17,16 @@ The framework is a universal source-controlled system for:
 
 The initial system manages files only. A remote server is accessed through SFTP; process lifecycle, console access, backups, Pterodactyl APIs, and restart management are outside the initial scope.
 
-The framework consists of four principal modules:
+The framework is a modular monolith composed of bounded subsystems with explicit data contracts:
 
-1. **Layer resolver** — composes layers into a logical desired state.
-2. **Artifact resolver** — resolves and downloads declared mods and other packages.
-3. **Instance synchronizer** — materializes a resolution locally or through SFTP.
-4. **Development web interface** — displays logical pack contents and differences between a resolution and an instance, then performs supported source edits.
+1. **Metadata frontend and layer loader** — decode source documents into typed records and direct payload contributions.
+2. **Layer composition coordinator** — applies ordered parents, dispatches records to their effect domains, and produces immutable resolved-state projections and a trace.
+3. **Package dependency resolver** — receives only the package graph and computes active declarations.
+4. **Artifact resolver** — receives exact active package declarations and resolves their bytes and hashes.
+5. **Content materializer and instance synchronizer** — receive concrete content/artifact manifests and synchronize local or SFTP targets.
+6. **Development web interface and metadata writer** — receive the projections, trace, and write policy needed for display and supported source edits.
+
+These are architectural boundaries, not separately deployed services. Compatibility facades may carry an aggregate object between older call sites, but domain implementations must consume the narrow immutable artifacts described below rather than reach into unrelated state.
 
 ---
 
@@ -74,24 +78,36 @@ LayerApplication {
 
 The same layer may appear more than once and may receive different parameters.
 
-## Pack state
+## Resolved state projections
 
-`PackState` is the logical desired state transformed by layers. It contains more than a filesystem:
+The logical state transformed by layers is split into independently consumable projections:
 
 ```text
-PackState {
-    environment metadata
+ContentState {
     virtual filesystem
+    persistent exclusions
+    prune selectors
+}
+
+PackageState {
     package declarations and activation states
     dependency relationships
     groups
     sections and display order
-    synchronization rules
-    instance-diff ignore rules
+}
+
+WebPolicyState {
+    instance-diff ignore selectors
+}
+
+RoutingRuleSet {
+    effective metadata-write routing rules
 }
 ```
 
-Minecraft version, loader, side, and similar properties may be represented in the environment portion.
+Minecraft version, loader, side, and similar properties may later form another explicit environment projection.
+
+`PackState` may remain as a compatibility aggregate of `ContentState`, `PackageState`, and `WebPolicyState`. It is not a license for every subsystem to receive every field: package resolution receives `PackageState`, materialization receives `ContentState` plus resolved artifacts, and instance comparison receives the content manifest plus `WebPolicyState`. Routing rules are resolved separately from desired pack content and are consumed only by the metadata writer and its web API.
 
 ## Layer delta
 
@@ -103,10 +119,9 @@ A **resolution** is the completely evaluated desired state for one top-level lay
 
 ```text
 Resolution {
-    logical PackState
+    resolved state projections
     concrete filesystem manifest
     exact selected artifacts and hashes
-    synchronization and ignore rules
     resolution trace
     resolved external parent commits
 }
@@ -132,32 +147,78 @@ An **instance delta** is the difference between the current resolution and the c
 
 A workspace may contain multiple layer directories, framework configuration, scripts, and unrelated project files.
 
-A layer directory uses a direct payload layout:
+A layer directory uses a direct payload layout. The current JSON frontend reserves directories named `.pack`:
 
 ```text
 client/
-├── <reserved metadata directory>/
-│   ├── layer marker and parent declarations
-│   ├── package declarations
-│   ├── groups and sections
-│   └── synchronization rules
+├── .pack/
+│   ├── layer.json
+│   ├── ignore.json
+│   └── routing.json
+├── mods/
+│   └── .pack/
+│       ├── mods.json
+│       ├── disabled.json
+│       └── dependencies.json
+├── resourcepacks/
+│   └── .pack/
+│       └── packs.json
 ├── config/
-├── kubejs/
-├── defaultconfigs/
-├── options.txt
-└── other payload files
+│   └── sub/
+│       └── .pack/
+│           └── remove.json
+└── ordinary payload files
 ```
 
 Requirements:
 
-- A fixed marker inside the reserved metadata directory identifies a directory as a layer.
-- Everything in the reserved metadata directory is excluded from the materialized instance.
-- Everything outside it is ordinary payload unless explicitly removed or ignored.
+- `.pack/layer.json` identifies the layer and declares its schema and parents.
+- Under schema 1, only the root `.pack/*.json` files are metadata; nested `.pack` directories retain their legacy payload meaning.
+- Under schema 2, every `**/.pack/*.json` document is metadata, and every `.pack` directory is excluded from payload materialization.
+- Outside the schema-selected metadata directories, files are ordinary payload unless explicitly removed.
 - Payload paths correspond directly to paths in the resulting Minecraft directory.
 - Metadata may be divided into arbitrarily many files.
 - The web interface groups declarations by metadata file, section, and declaration order.
 - Metadata-file execution order must not affect semantics.
-- The exact reserved directory name, marker filename, DSL extension, and file syntax are implementation-defined.
+- Metadata discovery is deterministic by layer-relative path; this order is presentation/provenance order only and does not change same-layer semantics.
+
+## Metadata documents and records
+
+The current JSON document envelope is deliberately uniform:
+
+```json
+{
+  "operations": [
+    { "type": "package", "id": "example", "destination": "example.jar" },
+    { "type": "ignore", "glob": "../logs/**" },
+    { "type": "routing_rule", "id": "mods", "when": {}, "write": {} }
+  ]
+}
+```
+
+`operations` is the source-format name for the ordered list of arbitrary typed metadata records. Every record has exactly one discriminator, `type`; the format does not add a second `kind` discriminator to distinguish internal subsystems. Operation-specific fields such as a package's artifact `kind` remain ordinary domain data.
+
+A file may mix package declarations, file operations, ignores, sections, routing rules, and future record types. The loader parses them into typed records and preserves their source file and index. Internal dispatch then sends each type only to the subsystem that understands its semantics. File co-location does not imply shared runtime behavior.
+
+The parsing boundary is format-independent: a metadata frontend decodes a document object, and typed record parsers, reducers, routing, tracing, and write planning operate on that object model. JSON is the initial frontend. A future compact DSL must be able to express the same mixed records without changing domain APIs. Discovery by extension and source-preserving writes may use frontend-specific adapters, but JSON parsing or rendering must not be embedded in domain reducers, artifact resolution, materialization, synchronization, or routing matching.
+
+## Path coordinates and schema migration
+
+No tracked metadata may contain an operating-system absolute path. In schema 2, path-bearing records support two repository-safe coordinate modes:
+
+- `path_mode: "local"` — the path is relative to the metadata file containing the record; this is the default;
+- `path_mode: "layer"` — the path is relative to the layer root.
+
+For example, a package destination `example.jar` in `mods/.pack/mods.json` resolves to `mods/.pack/example.jar`, while `../example.jar` resolves to `mods/example.jar`. The equivalent layer-root spelling is `"destination": "mods/example.jar", "path_mode": "layer"`. Resolution normalizes both forms into layer-root coordinates and rejects absolute paths, NUL bytes, and `..` traversal beyond the layer root. Provider URLs and local artifact source locations are not payload-path fields and are not rewritten by this mechanism.
+
+Schema 1 keeps its established layer-root path interpretation for compatibility. Upgrading a layer to schema 2 is an explicit transactional operation, never an implicit side effect of a web edit. The upgrade:
+
+1. refuses to continue when an existing nested `.pack` contains payload that schema 2 would reinterpret as metadata;
+2. rewrites existing schema-1 path-bearing records with explicit `path_mode: "layer"` where needed;
+3. changes the marker to schema 2 in the same write plan;
+4. re-resolves the layer and rolls the plan back unless logical state, active packages, and effective routing rules remain equivalent.
+
+Only the selected writable layer is upgraded. Parent layers are never migrated implicitly.
 
 A parent reference may point to:
 
@@ -302,15 +363,15 @@ A producer receives parameters only. It does not receive `PackState`; generated 
 
 ---
 
-# 7. Operation producers and operations
+# 7. Metadata records, operation producers, and operations
 
 ## Operation producer
 
-An `OperationProducer` converts parameters into inert typed operations:
+An `OperationProducer` converts parameters into inert typed metadata records:
 
 ```text
 OperationProducer {
-    produce(parameters) -> List<Operation>
+    produce(parameters) -> List<MetadataRecord>
     mayWrite: ResourceDomain
     mayRead: ResourceDomain or Unknown
 }
@@ -324,9 +385,9 @@ Common categories include:
 
 Producers are implemented as known classes. A producer constructor may accept a lambda, but the lambda operates inside restrictions enforced by the producer class. Users do not receive unrestricted access to the filesystem or mutable `PackState`.
 
-## Operation
+## Domain operation
 
-An operation is a typed transformation evaluated against the parent state.
+A domain operation is a typed transformation evaluated against the parent state.
 
 Examples:
 
@@ -345,6 +406,76 @@ AddIgnoreSelector
 ```
 
 The base `Operation` abstraction must remain minimal. Operation-specific data belongs to concrete operation types. The web interface uses type-specific handlers rather than expecting one universal metadata structure.
+
+Not every source-level entry in `operations` is a domain operation. In particular:
+
+- `type: "ignore"` changes only `WebPolicyState`;
+- `type: "routing_rule"` changes only the effective metadata-write policy;
+- file, package, dependency, group, section, and prune records change their respective domain projections.
+
+This distinction is internal. The source syntax remains one flat list selected by one `type` field.
+
+## Metadata write routing rules
+
+A routing rule selects the file and optional semantic section used when the web interface creates a new record:
+
+```json
+{
+  "type": "routing_rule",
+  "id": "mods.dependencies",
+  "priority": 200,
+  "when": {
+    "operation_types": ["package"],
+    "package": {
+      "kind": ["mod"],
+      "origin": ["automatic_dependency"]
+    }
+  },
+  "write": {
+    "file": {
+      "path": "../mods/.pack/dependencies.json",
+      "path_mode": "local"
+    },
+    "section": "Dependencies"
+  }
+}
+```
+
+The required stable `id` is the inheritance key. `priority` is an integer and defaults to zero. `when` may match:
+
+- record type through `type` or `operation_types`;
+- an operation `path`, `destination`, `glob`, `state`, or activation;
+- package id, artifact kind, provider, activation, tags, or categories;
+- write origin, including ordinary user input, instance capture, or an automatically added dependency.
+
+Path predicates compare normalized layer-root coordinates and support exact, prefix, subtree, and glob matching. Package tags, provider categories, and origin are ephemeral write context when appropriate; routing metadata does not have to be persisted into the resulting package declaration.
+
+`write.file.path_mode` is independent from the path mode of the record being written:
+
+- `local` resolves the destination relative to the file declaring the routing rule and is the default;
+- `layer` resolves the destination relative to the selected target layer root.
+
+Every destination must be a non-marker `.pack/*.json` metadata document admitted by the target layer schema. A destination cannot escape the selected layer.
+
+Rules are inherited by replaying the ordered parent applications. A later parent and then the current layer replace earlier rules with the same `id`; duplicate ids inside one layer are an error. Instance-local rules are applied last and replace tracked rules with the same id for writes to any selected writable layer. They are stored outside Git in instance local state, using the same `operations` envelope and complete `type: "routing_rule"` records. Implementations may continue to read an older dedicated local-state envelope for compatibility, but all new writes use the unified form.
+
+Among matching rules, the highest priority wins. Equal-priority rules may coexist only when they select the same file and section; otherwise the write is rejected as ambiguous. A destination chosen explicitly by the user is a one-write override and bypasses rule selection. Saving that choice as a layer or instance rule is a separate explicit action.
+
+Routing is applied only to new records. Editing an existing declaration preserves its provenance file unless the user explicitly performs a move operation. If `write.section` is selected, the writer updates or creates an ordinary `type: "section"` record and adds the routed declaration id to its members; the routing rule itself never becomes a section declaration.
+
+The routing planner is pure: it returns a write plan with the expected before-image and complete after-image of every affected metadata document. Applying the plan acquires one cross-process lock for the selected physical layer, revalidates all before-images and confined destinations, and commits the documents as one journaled edit. Every metadata mutation uses this same layer lock even when it was initiated through a different instance, so two web processes cannot silently overwrite each other's tracked-layer changes. A failed post-write resolution or validation restores the whole plan.
+
+In schema 2, defaults are:
+
+- user-enabled mods: `mods/.pack/mods.json`;
+- available or disabled mods: `mods/.pack/disabled.json`;
+- automatically added dependencies: `<package-folder>/.pack/dependencies.json`;
+- resource packs and datapacks: `resourcepacks/.pack/packs.json` and `datapacks/.pack/packs.json`;
+- ignores: `.pack/ignore.json`;
+- a remove for `config/sub/file.cfg`: `config/sub/.pack/remove.json`;
+- unclassified records: `.pack/local-edits.json`.
+
+Schema 1 continues to default to `.pack/local-edits.json`. All defaults can be overridden by routing rules or by a one-write manual choice.
 
 ## Effect domains
 
@@ -373,7 +504,7 @@ A producer may have a broad domain, but broad or unbounded domains prevent proof
 
 `mayRead` should also be bounded where practical. Unknown or universal reading may theoretically be supported, but it is expected to be exceptional and disables automatic editing of affected earlier-layer resources.
 
-Before applying generated operations:
+Before applying generated domain operations:
 
 1. The producer generates inert operations.
 2. Their concrete reads and writes are calculated.

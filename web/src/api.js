@@ -333,8 +333,9 @@ export class ApiClient {
     return this.remember(await this.request(`/api/v1/features/${encodeURIComponent(feature)}`, { method: 'DELETE' }));
   }
 
-  async setActivation(id, state, targetLayer) {
+  async setActivation(id, state, targetLayer, metadataWrite) {
     const body = { state };
+    if (metadataWrite) body.metadata_write = metadataWrite;
     if (targetLayer) body.target_layer = targetLayer;
     return this.remember(await this.request(`/api/v1/packages/${encodeURIComponent(id)}/activation`, { method: 'PATCH', body }));
   }
@@ -351,8 +352,9 @@ export class ApiClient {
     return this.remember(await this.request(`/api/v1/sections/${encodeURIComponent(id)}/activation`, { method: 'PATCH', body }));
   }
 
-  async capture(deltaId, targetLayer, expectedSha256) {
+  async capture(deltaId, targetLayer, expectedSha256, metadataWrite) {
     const body = {};
+    if (metadataWrite) body.metadata_write = metadataWrite;
     if (targetLayer) body.target_layer = targetLayer;
     if (expectedSha256) body.expected_sha256 = expectedSha256;
     return this.remember(await this.request(`/api/v1/delta/${encodeURIComponent(deltaId)}/capture`, { method: 'POST', body }));
@@ -415,8 +417,9 @@ export class ApiClient {
     }));
   }
 
-  async ignorePath(path, kind, targetLayer) {
+  async ignorePath(path, kind, targetLayer, metadataWrite) {
     const body = { path, kind };
+    if (metadataWrite) body.metadata_write = metadataWrite;
     if (targetLayer) body.target_layer = targetLayer;
     return this.remember(await this.request('/api/v1/files/ignore', {
       method: 'POST', body,
@@ -431,8 +434,9 @@ export class ApiClient {
     }));
   }
 
-  async importPackage(deltaId, targetLayer, providerMatch, expectedSha256) {
+  async importPackage(deltaId, targetLayer, providerMatch, expectedSha256, metadataWrite) {
     const body = { delta_id: deltaId };
+    if (metadataWrite) body.metadata_write = metadataWrite;
     if (targetLayer) body.target_layer = targetLayer;
     if (providerMatch) body.provider_match = providerMatch;
     if (expectedSha256) body.expected_sha256 = expectedSha256;
@@ -441,6 +445,58 @@ export class ApiClient {
 
   async sync() {
     return this.remember(await this.request('/api/v1/sync', { method: 'POST', body: {} }));
+  }
+
+  async previewRouting(operation, targetLayer, metadataWrite, origin) {
+    const body = { operation };
+    if (targetLayer) body.target_layer = targetLayer;
+    if (metadataWrite) body.metadata_write = metadataWrite;
+    if (origin) body.origin = origin;
+    return this.request('/api/v1/routing/preview', { method: 'POST', body });
+  }
+
+  async routingOptions(targetLayer) {
+    const query = new URLSearchParams();
+    if (targetLayer) query.set('target_layer', targetLayer);
+    return this.request(`/api/v1/routing?${query}`);
+  }
+
+  async saveRoutingRule(rule, scope, targetLayer, destination) {
+    const body = { rule, scope };
+    if (targetLayer) body.target_layer = targetLayer;
+    if (destination) body.destination = destination;
+    return this.remember(await this.request('/api/v1/routing/rules', { method: 'POST', body }));
+  }
+
+  async deleteRoutingRule(id, scope, targetLayer) {
+    const body = { scope };
+    if (targetLayer) body.target_layer = targetLayer;
+    return this.remember(await this.request(`/api/v1/routing/rules/${encodeURIComponent(id)}`, {
+      method: 'DELETE', body,
+    }));
+  }
+
+  async previewSchemaUpgrade(targetLayer) {
+    const body = {};
+    if (targetLayer) body.target_layer = targetLayer;
+    return this.request('/api/v1/routing/schema/preview', { method: 'POST', body });
+  }
+
+  async upgradeLayerSchema(targetLayer, revision) {
+    const body = {};
+    if (targetLayer) body.target_layer = targetLayer;
+    return this.remember(await this.request('/api/v1/routing/schema/upgrade', {
+      method: 'POST', body, revision,
+    }));
+  }
+
+  async removePackage(id, mode, targetLayer, metadataWrite) {
+    const body = { mode };
+    if (targetLayer) body.target_layer = targetLayer;
+    if (metadataWrite) body.metadata_write = metadataWrite;
+    return this.remember(await this.request(`/api/v1/packages/${encodeURIComponent(id)}`, {
+      method: 'DELETE', body,
+    }));
   }
 
   async shutdown() {

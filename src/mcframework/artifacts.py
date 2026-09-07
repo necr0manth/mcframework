@@ -107,11 +107,17 @@ class ArtifactResolver:
         self.cache = cache
 
     def resolve(self, resolution: Resolution) -> Resolution:
-        artifacts = tuple(
+        """Compatibility adapter for callers holding the composed resolution."""
+        return replace(resolution, artifacts=self.resolve_packages(resolution.active_packages))
+
+    def resolve_packages(
+        self, packages: tuple[PackageDeclaration, ...]
+    ) -> tuple[ResolvedArtifact, ...]:
+        """Resolve package artifacts without access to layer, content, or web state."""
+        return tuple(
             self.cache.obtain(package, self.registry.provider(package.source.provider))
-            for package in resolution.active_packages
+            for package in packages
         )
-        return replace(resolution, artifacts=artifacts)
 
 
 def explicit_update(

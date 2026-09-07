@@ -9,6 +9,8 @@ import {
 import { runAutoCaptureFlow } from './api.js';
 import type { CaptureChoice, CaptureDecisions } from './file-explorer-model.js';
 import { singleFileImportItem } from './semantic-import.js';
+import { WriteDestination } from './RoutingControls.js';
+import type { MetadataWrite } from './RoutingControls.js';
 
 type Entry = {
   path: string; name: string; type: string; actual: boolean; desired: boolean;
@@ -43,7 +45,9 @@ type ExplorerClient = {
   capturePath: (
     path: string, target: string, planRevision: number, decisions: CaptureDecisions,
   ) => Promise<unknown>;
-  ignorePath: (path: string, kind: string, target: string) => Promise<unknown>;
+  ignorePath: (path: string, kind: string, target: string, write?: MetadataWrite) => Promise<unknown>;
+  routingOptions: (target: string) => Promise<{ files: string[]; sections: string[]; effective_rules: unknown[] }>;
+  previewRouting: (operation: Record<string, unknown>, target: string, write?: MetadataWrite) => Promise<{ writes: Array<{ file: string; document: unknown }> }>;
   removeIgnore: (identity: Record<string, unknown>, target: string) => Promise<unknown>;
 };
 
@@ -69,6 +73,7 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   const [busy, setBusy] = useState('');
   const [plan, setPlan] = useState<ExplorerPlan | null>(null);
   const [choices, setChoices] = useState<Record<string, Choice>>({});
+  const [ignoreDraft, setIgnoreDraft] = useState<{ item: Entry; write?: MetadataWrite } | null>(null);
   const childrenRef = useRef(children);
   const expandedRef = useRef(expanded);
   const nextRef = useRef(next);
@@ -178,17 +183,18 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
     setExpanded(opened);
   }
 
-  async function ignore(item: Entry) {
+  async function ignore(item: Entry, write?: MetadataWrite) {
     const label = `ignore:${item.path}`;
     setBusy(label);
     try {
-      await onMutate(
+      const applied = await onMutate(
         label,
         () => client.ignorePath(
-          item.path, item.type === 'directory' ? 'subtree' : 'exact', targetLayer,
+          item.path, item.type === 'directory' ? 'subtree' : 'exact', targetLayer, write,
         ),
         `${item.path} is now ignored in ${targetLayer}.`,
       );
+      if (applied) setIgnoreDraft(null);
     } catch (reason) {
       onError(reason instanceof Error ? reason.message : 'Could not add ignore rule');
     } finally { setBusy((value) => value === label ? '' : value); }
@@ -295,11 +301,17 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
     <div className="explorer-layout"><section className="file-tree" aria-label="Instance files">
       {rows.length ? rows.map((item: Entry) => <div className={`file-row ${item.synthetic ? 'ghost' : ''} ${item.ignored ? 'ignored' : ''} ${item.changed ? 'changed' : ''}`} style={{ paddingLeft: `${14 + (item.depth || 0) * 22}px` }} key={item.path}>
         <button className="file-main" disabled={!!busy} onClick={() => void toggle(item)} title={item.reason || item.path}><span>{item.type === 'directory' ? (expanded.has(item.path) ? '▾' : '▸') : item.type === 'symlink' ? '↗' : '·'}</span><strong>{item.name}</strong>{item.synthetic && <em>deleted</em>}{item.ignored && <em>ignored</em>}{item.changed_count > 0 && <small>{item.status !== 'unchanged' ? item.status : `${item.changed_count} changed`}</small>}</button>
-        <div className="file-actions"><button disabled={!!busy || !item.actionable || item.ignored} onClick={() => void ignore(item)}>Ignore</button><button className="primary" disabled={!!busy || item.changed_count === 0 || !item.actionable} onClick={() => void reviewCapture(item)}>Send to layer</button></div>
+        <div className="file-actions"><button disabled={!!busy || !item.actionable || item.ignored} onClick={() => setIgnoreDraft({ item })}>Ignore</button><button className="primary" disabled={!!busy || item.changed_count === 0 || !item.actionable} onClick={() => void reviewCapture(item)}>Send to layer</button></div>
       </div>) : <div className="empty"><h2>No files in this mode</h2><p>Change the filter or enable ignored files.</p></div>}
       {next[''] !== null && next[''] !== undefined && <button className="load-more" disabled={!!busy} onClick={() => void load('', next[''] || 0)}>Load more</button>}
       {Object.entries(next).filter(([parent, cursor]) => parent && cursor !== null).map(([parent, cursor]) => <button className="load-more" disabled={!!busy} key={parent} onClick={() => void load(parent, cursor || 0)}>Load more in {parent}</button>)}
     </section><aside className="ignore-inspector"><p className="eyebrow">Selected layer</p><h2>Ignore rules</h2>{rules.length ? rules.map((rule) => <article key={rule.id}><code>{rule.selector.kind}: {rule.selector.path}</code><small>{rule.own ? 'Own rule' : `Inherited from ${rule.layer}`}</small>{rule.removable && <button disabled={!!busy} onClick={() => void removeRule(rule)}>Remove</button>}</article>) : <p>No ignore rules apply in this composition.</p>}</aside></div>
+    {ignoreDraft && <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="ignore-title">
+      <header><h2 id="ignore-title">Ignore {ignoreDraft.item.path}</h2><button aria-label="Close" onClick={() => setIgnoreDraft(null)}>×</button></header>
+      <div className="modal-body"><label><span>Writable target</span><select value={targetLayer} onChange={(event) => onTargetLayer(event.target.value)}>{layers.map((layer) => <option key={layer.id} value={layer.id}>{layer.id}</option>)}</select></label>
+        <WriteDestination client={client} target={targetLayer} operation={{ type: 'ignore', selector: { kind: ignoreDraft.item.type === 'directory' ? 'subtree' : 'exact', path: ignoreDraft.item.path } }} value={ignoreDraft.write} onChange={(write) => setIgnoreDraft({ ...ignoreDraft, write })} />
+      </div><footer><button className="secondary" onClick={() => setIgnoreDraft(null)}>Cancel</button><button className="primary" disabled={!!busy} onClick={() => void ignore(ignoreDraft.item, ignoreDraft.write)}>Add ignore</button></footer>
+    </section></div>}
     {plan && <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true"><header><div><p className="eyebrow">Atomic folder capture</p><h2>Choose package handling</h2></div><button onClick={() => setPlan(null)}>×</button></header><div className="modal-body"><p>Every changed descendant must have a valid decision before anything is written.</p>{plan.items.filter((item) => item.capture_modes.includes('package') && item.capture_modes.length > 1).map((item) => <fieldset key={item.id}><legend>{item.path}</legend>{item.capture_modes.includes('payload') && <label className="choice"><input type="radio" checked={choices[item.id]?.mode === 'payload'} onChange={() => setChoices({ ...choices, [item.id]: { mode: 'payload' } })} /><span><strong>Raw file</strong><small>Capture this JAR as ordinary payload.</small></span></label>}<label className="choice"><input type="radio" checked={choices[item.id]?.mode === 'package'} onChange={() => setChoices({ ...choices, [item.id]: { mode: 'package' } })} /><span><strong>Local package</strong><small>Store a verified local SHA-256 artifact.</small></span></label></fieldset>)}</div><footer><button onClick={() => setPlan(null)}>Cancel</button><button className="primary" disabled={!!busy} onClick={() => void submitPlan()}>Send all atomically</button></footer></section></div>}
   </>;
 }

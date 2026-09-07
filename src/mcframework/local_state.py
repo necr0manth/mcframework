@@ -9,15 +9,16 @@ import os
 import re
 import secrets
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .errors import MetadataError
+from .errors import MetadataError, ResolutionError
 from .loader import validate_parameter_value
 from .paths import atomic_write
+from .routing import merge_routing_rules, routing_rule_from_json
 
 LOCAL_DIR = ".mcpack"
 SCHEMA = 1
@@ -71,7 +72,9 @@ class LocalState:
         """Untracked per-instance routing overrides.
 
         The file deliberately lives in ``.mcpack``: rules here are local policy,
-        never repository content.  Its shape is ``{"routing_rules": [...]}``.
+        never repository content.  It uses the same typed ``operations`` envelope
+        as tracked layer metadata.  The legacy ``routing_rules`` envelope remains
+        readable so existing local state upgrades without a migration command.
         """
         return self.root / "routing" / f"{validate_name(instance, 'instance name')}.json"
 
@@ -79,16 +82,49 @@ class LocalState:
         path = self.routing_rules_path(instance)
         if not path.exists():
             return ()
-        document = self._read_document(path, "routing_rules")
-        raw = document["routing_rules"]
+        document = self._read_document(
+            path, optional={"operations", "routing_rules"}
+        )
+        has_operations = "operations" in document
+        has_legacy = "routing_rules" in document
+        if has_operations == has_legacy:
+            raise MetadataError(
+                f"{path}: expected exactly one of operations or routing_rules"
+            )
+        raw = document["operations" if has_operations else "routing_rules"]
         if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
-            raise MetadataError(f"{path}: routing_rules must be an array of objects")
-        return tuple(raw)
+            raise MetadataError(f"{path}: routing rules must be an array of objects")
+        normalized = [self._routing_record(item) for item in raw]
+        self._validate_routing_rules(normalized)
+        return tuple(normalized)
 
     def write_routing_rules(self, instance: str, rules: list[Mapping[str, Any]]) -> None:
         if not all(isinstance(item, Mapping) for item in rules):
             raise MetadataError("routing rules must be objects")
-        self._write_document(self.routing_rules_path(instance), {"routing_rules": list(rules)})
+        normalized = [self._routing_record(item) for item in rules]
+        self._validate_routing_rules(normalized)
+        self._write_document(self.routing_rules_path(instance), {"operations": normalized})
+
+    @staticmethod
+    def _routing_record(rule: Mapping[str, Any]) -> dict[str, Any]:
+        record = dict(rule)
+        record.setdefault("type", "routing_rule")
+        return record
+
+    @staticmethod
+    def _validate_routing_rules(rules: Sequence[Mapping[str, Any]]) -> None:
+        # Instance rules are evaluated in the selected target layer, never from
+        # the operating-system path of the local-state file.
+        try:
+            merge_routing_rules(
+                routing_rule_from_json(
+                    rule,
+                    source=".pack/instance-routing.json", index=index,
+                )
+                for index, rule in enumerate(rules)
+            )
+        except ResolutionError as exc:
+            raise MetadataError(f"invalid instance routing rules: {exc}") from exc
 
     def feature_root(self, instance: str) -> Path:
         return self.root / "features" / validate_name(instance, "instance name")

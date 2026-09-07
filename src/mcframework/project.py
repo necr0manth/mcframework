@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
 import stat
 import tempfile
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -34,20 +38,29 @@ from .explorer import (
 )
 from .generations import Generation, generation
 from .loader import MARKER_FILE, METADATA_DIR, WorkspaceLoader
-from .metadata import JsonMetadataParser
 from .local_state import InstanceRecord, LinkRecord, LocalState, validate_name
+from .metadata import JsonMetadataParser, MetadataParser, decode_record_paths, encode_record_paths
+from .metadata_write import MetadataWrite, MetadataWritePlan
 from .model import Activation, IgnoreSelector, PackState, Resolution, SelectorKind, frozen_map
-from .operations import AddIgnoreSelector, RoutingEngine, RoutingRule, merge_routing_rules, operation_from_json, operation_to_json
+from .operations import (
+    AddIgnoreSelector,
+    RoutingEngine,
+    RoutingRule,
+    merge_routing_rules,
+    operation_from_json,
+    operation_to_json,
+)
 from .package_inspect import (
     ModrinthMatcher,
+    ProviderMatch,
     ProviderMatcher,
     confirmed_provider_match,
     file_hashes,
     inspect_jar,
 )
-from .paths import atomic_write, matches, normalize_relative_path
+from .paths import atomic_write, confined_path, matches, normalize_relative_path
 from .preparation import ContentDigests, IncrementalPreparer, content_digest
-from .resolver import Resolver
+from .resolver import LayerComposer
 from .transport import LocalFilesystemInstance
 
 
@@ -70,20 +83,57 @@ class _ContextCache:
     generations: tuple[tuple[Path, Generation], ...] = ()
 
 
+_edit_journals: ContextVar[tuple[Any, ...]] = ContextVar("metadata_edit_journals", default=())
+_edit_destinations: ContextVar[tuple[tuple[Any, str | None, str | None], ...]] = ContextVar(
+    "metadata_edit_destinations", default=()
+)
+_edit_layer_locks: ContextVar[tuple[tuple[Any, Path], ...]] = ContextVar(
+    "metadata_edit_layer_locks", default=()
+)
+
+
+def _metadata_edit(method: Any) -> Any:
+    """Serialize and journal one metadata mutation against its physical target layer."""
+    signature = inspect.signature(method)
+
+    @wraps(method)
+    def transactional(self: ProjectService, *args: Any, **kwargs: Any) -> Any:
+        bound = signature.bind(self, *args, **kwargs)
+        instance = bound.arguments.get("instance")
+        if not isinstance(instance, str):
+            raise RuntimeError("metadata edits require an instance argument")
+        target = self._provisional_target(instance, bound.arguments.get("target_layer"))
+        with self._target_layer_edit_lock(target):
+            if any(journal.service is self for journal in _edit_journals.get()):
+                return method(self, *args, **kwargs)
+            with _BeforeImageJournal(self, self.project) as journal:
+                token = _edit_journals.set((*_edit_journals.get(), journal))
+                try:
+                    return method(self, *args, **kwargs)
+                finally:
+                    _edit_journals.reset(token)
+    return transactional
+
+
 class ProjectService:
     def __init__(
         self,
         project: Path | str | None = None,
         *,
         provider_matcher: ProviderMatcher | None = None,
+        metadata_parser: MetadataParser | None = None,
     ):
         self.project = Path(project or Path.cwd()).resolve()
         self.state = LocalState(self.project)
         self.provider_matcher = provider_matcher or ModrinthMatcher()
+        self.metadata: MetadataParser = metadata_parser or JsonMetadataParser()
         self._provider_matches: dict[str, list[dict[str, object]]] = {}
         self._explorer_snapshots: dict[str, ExplorerSnapshot] = {}
         self._context_lock = threading.RLock()
         self._contexts: dict[str, _ContextCache] = {}
+
+    def _loader(self, *, refresh: bool = False) -> WorkspaceLoader:
+        return WorkspaceLoader(self.project, refresh=refresh, parser=self.metadata)
 
     def init_layer(self, layer: str) -> Path:
         validate_name(layer, "layer name")
@@ -94,7 +144,7 @@ class ProjectService:
             if any(root.iterdir()):
                 raise MetadataError(f"layer directory is not empty: {layer!r}")
         marker = root / METADATA_DIR / MARKER_FILE
-        document = {"schema": 1, "id": layer, "parents": []}
+        document = {"schema": 2, "id": layer, "parents": []}
         atomic_write(
             marker,
             (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8"),
@@ -131,8 +181,8 @@ class ProjectService:
         *,
         automatic_dependencies: bool = True,
     ) -> Resolution:
-        return Resolver(
-            WorkspaceLoader(self.project), automatic_dependencies=automatic_dependencies
+        return LayerComposer(
+            self._loader(), automatic_dependencies=automatic_dependencies
         ).resolve(self.branch_root(branch), parameters)
 
     def create_instance(self, name: str, path: Path | str) -> InstanceRecord:
@@ -227,6 +277,7 @@ class ProjectService:
                 for source, destination in (
                     (self.state.parameters_path(old), self.state.parameters_path(new)),
                     (self.state.web_log_path(old), self.state.web_log_path(new)),
+                    (self.state.routing_rules_path(old), self.state.routing_rules_path(new)),
                 )
                 if source.exists()
             )
@@ -275,6 +326,7 @@ class ProjectService:
             self.state.write_instances(instances)
             self.state.write_links(links)
             self.state.parameters_path(name).unlink(missing_ok=True)
+            self.state.routing_rules_path(name).unlink(missing_ok=True)
             self._remove_local_tree(overlay)
             self.state.web_path(name).unlink(missing_ok=True)
             self.state.web_log_path(name).unlink(missing_ok=True)
@@ -335,7 +387,7 @@ class ProjectService:
             raise MetadataError(f"instance is not linked: {name!r}")
         self._contexts = {key: value for key, value in self._contexts.items() if key in instances}
         cached = self._contexts.setdefault(
-            name, _ContextCache(WorkspaceLoader(self.project, refresh=True))
+            name, _ContextCache(self._loader(refresh=True))
         )
         current = cached.context
         prepared = cached.preparer.current
@@ -363,7 +415,7 @@ class ProjectService:
         features = self._overlay_features(name, link)
         cached.loader.begin()
         try:
-            resolution = Resolver(cached.loader).resolve(layer, parameters)
+            resolution = LayerComposer(cached.loader).resolve(layer, parameters)
         finally:
             cached.loader.finish()
         files: dict[str, bytes] = {}
@@ -623,10 +675,12 @@ class ProjectService:
                         path = Path(entry.path)
                         paths.add(path)
                         if path == root / METADATA_DIR:
-                            # Only top-level JSON metadata is consumed by WorkspaceLoader.
-                            # Artifact storage and other metadata internals are not payload.
+                            # Root metadata documents are consumed by the configured
+                            # frontend; artifact storage and other internals are not payload.
                             paths.add(path.resolve())
-                            for metadata in path.glob("*.json"):
+                            for metadata in path.iterdir():
+                                if metadata.suffix not in self.metadata.extensions:
+                                    continue
                                 paths.add(metadata)
                                 if metadata.is_symlink():
                                     paths.add(metadata.resolve())
@@ -812,10 +866,7 @@ class ProjectService:
                 for index, operation in enumerate(producer.operations):
                     if not isinstance(operation, AddIgnoreSelector):
                         continue
-                    own = (
-                        trace_root == target
-                        and producer.source == f"{METADATA_DIR}/local-edits.json"
-                    )
+                    own = trace_root == target
                     identity = {
                         "target": self._layer_reference(target),
                         "source": producer.source,
@@ -838,6 +889,7 @@ class ProjectService:
                     )
         return rules
 
+    @_metadata_edit
     def add_ignore(
         self,
         instance: str,
@@ -863,7 +915,9 @@ class ProjectService:
             target / METADATA_DIR / "local-edits.json",
             self.state.links_path,
         ]
-        with self.state.target_layer_lock(target), _BeforeImageJournal(self, target, journal_paths):
+        with self._target_layer_edit_lock(target), _BeforeImageJournal(
+            self, target, journal_paths
+        ):
             editable = self._editable_target(instance, context, target_layer)
             self._append_operation(
                 editable,
@@ -895,22 +949,24 @@ class ProjectService:
         expected_target = self._layer_reference(target)
         if identity.get("target") != expected_target:
             raise MetadataError("ignore rule does not belong to the selected target layer")
-        if identity.get("source") != f"{METADATA_DIR}/local-edits.json":
-            raise MetadataError("inherited ignore rules cannot be removed")
+        source = identity.get("source")
+        if not isinstance(source, str) or not any(
+            rule["identity"] == identity and rule["removable"]
+            for rule in self.ignore_rules(instance, target_layer)
+        ):
+            raise MetadataError("inherited ignore rule cannot be removed, or the rule has moved")
         index = identity.get("index")
         if not isinstance(index, int) or index < 0:
             raise MetadataError("ignore rule identity has an invalid operation index")
-        with self.state.target_layer_lock(target):
-            path = target / METADATA_DIR / "local-edits.json"
-            with _BeforeImageJournal(self, target, [target / METADATA_DIR / "local-edits.json"]):
+        with self._target_layer_edit_lock(target):
+            path = confined_path(target, source)
+            with _BeforeImageJournal(self, target, [path]):
                 try:
-                    document = json.loads(path.read_text(encoding="utf-8"))
+                    document = dict(self.metadata.read_object(path))
                     operations = document["operations"]
                     raw = operations[index]
                 except (
-                    OSError,
-                    UnicodeError,
-                    json.JSONDecodeError,
+                    MetadataError,
                     KeyError,
                     IndexError,
                     TypeError,
@@ -918,9 +974,12 @@ class ProjectService:
                     raise MetadataError("ignore rule moved or no longer exists") from exc
                 if not isinstance(raw, dict):
                     raise MetadataError("ignore rule moved or no longer exists")
+                marker = JsonMetadataParser().read_object(target / METADATA_DIR / MARKER_FILE)
                 parsed = operation_from_json(
-                    raw,
-                    source=f"{METADATA_DIR}/local-edits.json",
+                    decode_record_paths(
+                        raw, source, int(marker.get("schema", 1)),
+                    ),
+                    source=source,
                     index=index,
                 )
                 if not isinstance(
@@ -930,7 +989,7 @@ class ProjectService:
                 del operations[index]
                 atomic_write(
                     path,
-                    (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode(),
+                    self.metadata.encode_object(document, destination=path),
                 )
                 refreshed = self.instance_context(instance)
         if cached is not None:
@@ -940,6 +999,7 @@ class ProjectService:
                 source_generations=self._context_source_generations(refreshed),
             )
 
+    @_metadata_edit
     def capture_explorer_path(
         self,
         instance: str,
@@ -996,7 +1056,7 @@ class ProjectService:
         final_context: InstanceContext | None = None
         pure_payload_committed = False
 
-        with self.state.target_layer_lock(provisional_target):
+        with self._target_layer_edit_lock(provisional_target):
             context = self.instance_context(instance)
             target = self._target_path(instance, context, target_layer)
             if target.resolve() != provisional_target.resolve():
@@ -1036,10 +1096,20 @@ class ProjectService:
                 provider_is_local = provider_match is None or provider_match == "local"
                 if isinstance(provider_match, dict):
                     provider_is_local = provider_match.get("provider") == "local"
-                if not provider_is_local:
+                if not provider_is_local and mode != "package":
                     raise MetadataError(
-                        "folder package capture cannot use remote provider enrichment; "
-                        "import the package individually"
+                        "remote provider enrichment requires package capture mode"
+                    )
+                if isinstance(provider_match, dict) and not provider_is_local and (
+                    provider_match.get("confidence") != "exact"
+                    or not all(
+                        isinstance(provider_match.get(field), str) and provider_match[field]
+                        for field in ("project_id", "version_id", "download_url")
+                    )
+                    or not isinstance(provider_match.get("hashes"), dict)
+                ):
+                    raise MetadataError(
+                        "review the package individually before choosing an exact provider match"
                     )
                 item_path = normalize_relative_path(str(item["path"]))
                 prepared.append((item, raw, mode, item_path))
@@ -1091,6 +1161,7 @@ class ProjectService:
             payload_writes: dict[Path, bytes] = {}
             artifact_writes: dict[Path, bytes] = {}
             additions: list[dict[str, Any]] = []
+            operation_contexts: dict[str, dict[str, Any]] = {}
             reserved_ids = set(context.resolution.state.packages)
             reconciliations: dict[str, bytes | None] = {}
             for item, mode, content in captured:
@@ -1115,6 +1186,30 @@ class ProjectService:
                     additions.append(operation)
                 else:
                     payload_writes[self._bounded_target_path(target, item_path)] = content
+                if content is not None and (package_id is not None or mode == "package"):
+                    match = self._selected_provider_match(
+                        decision_map[str(item["id"])].get("provider_match"), content
+                    )
+                    if match is not None:
+                        operation = additions[-1]
+                        # The exact instance bytes are already available. Seed the
+                        # normal artifact cache so validating this import stays offline.
+                        digest = hashlib.sha256(content).hexdigest()
+                        artifact_writes.pop(artifact, None)
+                        cache_path = self.state.root / "cache" / "sha256" / digest[:2] / digest
+                        artifact_writes[cache_path] = content
+                        operation["source"] = {
+                            "provider": "direct_url", "location": match.download_url,
+                            "sha256": digest,
+                        }
+                        operation["update_policy"] = "latest_compatible"
+                        if match.kind is not None:
+                            operation["kind"] = match.kind
+                        if match.version is not None:
+                            operation["version"] = match.version
+                        operation_contexts[str(operation["id"])] = self._provider_routing_context(
+                            match
+                        )
 
             operations_path = target / METADATA_DIR / "local-edits.json"
             pure_payload_fast_path = (
@@ -1142,7 +1237,10 @@ class ProjectService:
                 with ThreadPoolExecutor(max_workers=min(32, max(1, len(writes)))) as pool:
                     tuple(pool.map(write, writes))
                 if additions:
-                    self._append_operations(target, additions, instance=instance)
+                    self._append_operations(
+                        target, additions, instance=instance,
+                        operation_contexts=operation_contexts, origin="instance_capture",
+                    )
                 if pure_payload_fast_path:
                     expected_writes = {
                         self._bounded_target_path(target, item_path): actual_content
@@ -1210,7 +1308,7 @@ class ProjectService:
         prefix = normalized + "/"
         provisional_target = self._provisional_target(instance, target_layer)
 
-        with self.state.target_layer_lock(provisional_target):
+        with self._target_layer_edit_lock(provisional_target):
             context = self.instance_context(instance)
             target = self._target_path(instance, context, target_layer)
             if target.resolve() != provisional_target.resolve():
@@ -1459,6 +1557,20 @@ class ProjectService:
             return overlay
         return self.branch_root(target_layer)
 
+    @contextmanager
+    def _target_layer_edit_lock(self, layer: Path) -> Iterator[None]:
+        """Acquire the cross-process layer lock once for a nested edit workflow."""
+        target = layer.resolve()
+        if any(owner is self and locked == target for owner, locked in _edit_layer_locks.get()):
+            yield
+            return
+        with self.state.target_layer_lock(target):
+            token = _edit_layer_locks.set((*_edit_layer_locks.get(), (self, target)))
+            try:
+                yield
+            finally:
+                _edit_layer_locks.reset(token)
+
     @staticmethod
     def _scan_scope(root: Path, normalized: str) -> dict[str, str]:
         return {
@@ -1605,20 +1717,12 @@ class ProjectService:
     ) -> tuple[Path, dict[str, Any]]:
         digest = hashlib.sha256(content).hexdigest()
         artifact = target / METADATA_DIR / "artifacts" / f"{digest}.jar"
-        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(destination).stem).strip("-")
-        package_id = stem or f"imported-{digest[:12]}"
-        if package_id in reserved_ids:
-            package_id = f"{package_id}-{digest[:8]}"
-        suffix = 2
-        candidate = package_id
-        while candidate in reserved_ids:
-            candidate = f"{package_id}-{suffix}"
-            suffix += 1
-        package_id = candidate
+        package_id = self._allocate_package_id(destination, digest, reserved_ids)
         reserved_ids.add(package_id)
         return artifact, {
             "type": "package",
             "id": package_id,
+            "kind": self._infer_package_kind(destination),
             "activation": "enabled",
             "destination": destination,
             "source": {
@@ -1631,16 +1735,16 @@ class ProjectService:
 
     def _same_layer_capture_reason(self, target: Path, item: dict[str, Any]) -> str | None:
         """Reject raw writes that conflict with a structured producer in the target."""
-        metadata_root = target / METADATA_DIR
+        marker_path = target / METADATA_DIR / MARKER_FILE
+        if not marker_path.is_file():
+            return None
+        marker = JsonMetadataParser().read_object(marker_path)
+        schema = int(marker.get("schema", 1))
+        metadata_paths = self._loader().metadata_files(target)
         package_id = item.get("package_id")
         if package_id is not None:
-            for metadata_path in sorted(metadata_root.glob("*.json")):
-                try:
-                    document = json.loads(metadata_path.read_text(encoding="utf-8"))
-                except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                    raise MetadataError(
-                        f"cannot inspect same-layer provenance {metadata_path}: {exc}"
-                    ) from exc
+            for metadata_path in metadata_paths:
+                document = self.metadata.read_object(metadata_path)
                 operations = document.get("operations") if isinstance(document, dict) else None
                 if not isinstance(operations, list):
                     continue
@@ -1650,31 +1754,25 @@ class ProjectService:
                     and raw.get("id") == package_id
                     for raw in operations
                 ):
-                    if metadata_path.name == "local-edits.json":
-                        return None
-                    return (
-                        f"package {package_id!r} is declared in {metadata_path.name}; "
-                        "capturing it here needs a provenance-aware declaration edit"
-                    )
+                    # Existing package capture updates the declaration at its
+                    # provenance source, regardless of shard name or depth.
+                    return None
             return None
         affected = {normalize_relative_path(str(item["path"]))}
         if item.get("to_path"):
             affected.add(normalize_relative_path(str(item["to_path"])))
-        for metadata_path in sorted(metadata_root.glob("*.json")):
-            try:
-                document = json.loads(metadata_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                raise MetadataError(
-                    f"cannot inspect same-layer provenance {metadata_path}: {exc}"
-                ) from exc
+        for metadata_path in metadata_paths:
+            source = metadata_path.relative_to(target).as_posix()
+            document = self.metadata.read_object(metadata_path)
             operations = document.get("operations") if isinstance(document, dict) else None
             if not isinstance(operations, list):
                 continue
             for raw in operations:
                 if not isinstance(raw, dict):
                     continue
-                operation_type = raw.get("type")
-                operation_path = raw.get("path")
+                canonical = decode_record_paths(raw, source, schema)
+                operation_type = canonical.get("type")
+                operation_path = canonical.get("path")
                 if (
                     operation_type in {"put", "remove", "patch_properties"}
                     and isinstance(operation_path, str)
@@ -1685,7 +1783,7 @@ class ProjectService:
                         "a provenance-aware edit; raw payload capture would create an "
                         "incompatible same-layer write"
                     )
-                pattern = raw.get("glob")
+                pattern = canonical.get("glob")
                 if (
                     operation_type == "remove_paths"
                     and isinstance(pattern, str)
@@ -1734,6 +1832,49 @@ class ProjectService:
             ),
             None,
         )
+
+    @classmethod
+    def _proposed_package_id(
+        cls, context: InstanceContext, path: str, digest: str
+    ) -> str:
+        existing = cls._package_for_path(context, path)
+        if existing is not None:
+            return str(existing.identity)
+        return cls._allocate_package_id(path, digest, set(context.resolution.state.packages))
+
+    @staticmethod
+    def _allocate_package_id(path: str, digest: str, reserved_ids: set[str]) -> str:
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(path).stem).strip("-")
+        identity = stem or f"imported-{digest[:12]}"
+        if identity in reserved_ids:
+            identity = f"{identity}-{digest[:8]}"
+        candidate = identity
+        suffix = 2
+        while candidate in reserved_ids:
+            candidate = f"{identity}-{suffix}"
+            suffix += 1
+        return candidate
+
+    @staticmethod
+    def _infer_package_kind(path: str) -> str:
+        if path.startswith("resourcepacks/"):
+            return "resourcepack"
+        if path.startswith("datapacks/"):
+            return "datapack"
+        return "mod"
+
+    @staticmethod
+    def _package_import_operations(
+        context: InstanceContext, operation: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Return the metadata conversion used by both import preview and commit."""
+        destination = operation.get("destination")
+        if (
+            isinstance(destination, str)
+            and destination in context.resolution.state.content.files
+        ):
+            return [{"type": "remove", "path": destination}, operation]
+        return [operation]
 
     @staticmethod
     def _delta_item(
@@ -1848,6 +1989,12 @@ class ProjectService:
             item["enriched"] = True
             return item
         item["kind"] = "package"
+        item["proposed_package_id"] = self._proposed_package_id(
+            context, path, str(item["actual_sha256"])
+        )
+        item["proposed_package_kind"] = (
+            str(package.kind) if package is not None else self._infer_package_kind(path)
+        )
         item["capture_modes"] = ["package"] if package is not None else ["package", "payload"]
         item["provider_candidates"] = self._provider_candidates(
             content,
@@ -2110,6 +2257,7 @@ class ProjectService:
             "dependency_paths": _dependency_paths(state, target),
         }
 
+    @_metadata_edit
     def set_activation(
         self, instance: str, package_id: str, state: str, target_layer: str | None = None
     ) -> None:
@@ -2128,8 +2276,9 @@ class ProjectService:
         if package.source_file is not None and Path(package.source_file).resolve().is_relative_to(
             target
         ):
-            path = Path(package.source_file)
+            path = confined_path(target, Path(package.source_file).relative_to(target).as_posix())
             before = path.read_bytes()
+            self._record_edit_paths(path)
             self._edit_declaration_activation(path, package_id, package.source_index, activation)
         else:
             path = target / METADATA_DIR / "local-edits.json"
@@ -2145,6 +2294,7 @@ class ProjectService:
             self._restore_file(path, before)
             raise
 
+    @_metadata_edit
     def remove_package(
         self,
         instance: str,
@@ -2163,31 +2313,47 @@ class ProjectService:
         target = self._editable_target(instance, context, target_layer)
         source = Path(package.source_file) if package.source_file else None
         owns = source is not None and source.resolve().is_relative_to(target.resolve())
+        before: bytes | None
         if mode == "remove" and owns and package.source_index is not None:
+            assert source is not None
+            source = confined_path(target, source.relative_to(target).as_posix())
             before = source.read_bytes()
             try:
-                document = json.loads(before)
+                document = dict(self.metadata.decode_object(before, source))
                 operations = document.get("operations")
                 if not isinstance(operations, list):
                     raise MetadataError(f"invalid operations document: {source}")
                 index = package.source_index
-                if index >= len(operations) or operations[index].get("id") != package_id:
+                if (
+                    index < 0 or index >= len(operations)
+                    or not isinstance(operations[index], dict)
+                    or operations[index].get("type") != "package"
+                    or operations[index].get("id") != package_id
+                ):
                     raise MetadataError(f"package declaration moved for {package_id!r}")
                 del operations[index]
-                atomic_write(source, (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode())
+                atomic_write(
+                    source,
+                    self.metadata.encode_object(document, destination=source),
+                )
+                self.instance_context(instance)
             except Exception:
                 self._restore_file(source, before)
                 raise
         else:
             path = target / METADATA_DIR / "local-edits.json"
             before = path.read_bytes() if path.exists() else None
-            self._append_operation(target, {"type": "activation", "id": package_id, "state": "disabled"}, instance=instance)
+            self._append_operation(
+                target, {"type": "activation", "id": package_id, "state": "disabled"},
+                instance=instance,
+            )
             try:
                 self.instance_context(instance)
             except Exception:
                 self._restore_file(path, before)
                 raise
 
+    @_metadata_edit
     def set_group_activation(
         self, instance: str, group_id: str, state: str, target_layer: str | None = None
     ) -> None:
@@ -2215,6 +2381,7 @@ class ProjectService:
             self._restore_file(path, before)
             raise
 
+    @_metadata_edit
     def set_section_activation(
         self, instance: str, section_id: str, state: str, target_layer: str | None = None
     ) -> None:
@@ -2243,6 +2410,7 @@ class ProjectService:
             self._restore_file(path, before)
             raise
 
+    @_metadata_edit
     def capture_delta(
         self,
         instance: str,
@@ -2306,8 +2474,12 @@ class ProjectService:
             payload_before = payload_path.read_bytes() if payload_path.exists() else None
             operations_path = target / METADATA_DIR / "local-edits.json"
             operations_before = operations_path.read_bytes() if operations_path.exists() else None
+            self._record_edit_paths(payload_path)
             atomic_write(payload_path, content)
-            self._append_operation(target, {"type": "remove", "path": desired_path}, instance=instance)
+            self._append_operation(
+                target, {"type": "remove", "path": desired_path}, instance=instance,
+                origin="instance_capture",
+            )
             try:
                 refreshed = self.instance_context(instance)
                 remaining = {
@@ -2325,7 +2497,8 @@ class ProjectService:
             changed_path = target / METADATA_DIR / "local-edits.json"
             before = changed_path.read_bytes() if changed_path.exists() else None
             self._append_operation(
-                target, {"type": "activation", "id": package_id, "state": "disabled"}, instance=instance
+                target, {"type": "activation", "id": package_id, "state": "disabled"},
+                instance=instance, origin="instance_capture",
             )
         elif content is not None:
             changed_path = target.joinpath(*path.split("/"))
@@ -2334,7 +2507,10 @@ class ProjectService:
         else:
             changed_path = target / METADATA_DIR / "local-edits.json"
             before = changed_path.read_bytes() if changed_path.exists() else None
-            self._append_operation(target, {"type": "remove", "path": path}, instance=instance)
+            self._append_operation(
+                target, {"type": "remove", "path": path}, instance=instance,
+                origin="instance_capture",
+            )
         try:
             refreshed = self.instance_context(instance)
             if any(
@@ -2347,6 +2523,7 @@ class ProjectService:
                 self._restore_file(changed_path, before)
             raise
 
+    @_metadata_edit
     def import_package(
         self,
         instance: str,
@@ -2369,18 +2546,7 @@ class ProjectService:
         if content is None or metadata is None:
             raise MetadataError("package import requires a valid changed or extra JAR")
         digest = hashlib.sha256(content).hexdigest()
-        match = None
-        if (
-            provider_match is None
-            or provider_match == "local"
-            or (isinstance(provider_match, dict) and provider_match.get("provider") == "local")
-        ):
-            match = None
-        elif provider_match == "modrinth":
-            candidate = self.provider_matcher.match(content)
-            match = candidate if candidate is not None and candidate.confidence == "exact" else None
-        else:
-            match = confirmed_provider_match(provider_match, content)
+        match = self._selected_provider_match(provider_match, content)
         artifact: Path | None = None
         artifact_existed = False
         cached: Path | None = None
@@ -2399,14 +2565,15 @@ class ProjectService:
                 "sha256": digest,
             }
             cached = self.state.root / "cache" / "sha256" / digest[:2] / digest
-        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(item["path"]).stem).strip("-")
         existing_package = self._package_for_path(context, str(item["path"]))
-        package_id = (
-            existing_package.identity if existing_package else stem or f"imported-{digest[:12]}"
+        package_id = self._proposed_package_id(context, str(item["path"]), digest)
+        package_kind = (
+            match.kind
+            if match is not None and match.kind is not None
+            else existing_package.kind
+            if existing_package is not None
+            else self._infer_package_kind(str(item["path"]))
         )
-        existing_ids = set(context.resolution.state.packages)
-        if existing_package is None and package_id in existing_ids:
-            package_id = f"{package_id}-{digest[:8]}"
         version = (
             (match.version if match is not None else None)
             or metadata.version
@@ -2416,12 +2583,13 @@ class ProjectService:
         owns_declaration = (
             existing_package is not None
             and existing_package.source_file is not None
-            and Path(existing_package.source_file).resolve().parent
-            == (target / METADATA_DIR).resolve()
+            and Path(existing_package.source_file).resolve().is_relative_to(target.resolve())
         )
         if owns_declaration:
             assert existing_package is not None and existing_package.source_file is not None
-            operations_path = Path(existing_package.source_file)
+            operations_path = confined_path(
+                target, Path(existing_package.source_file).relative_to(target).as_posix()
+            )
         operations_before = operations_path.read_bytes() if operations_path.exists() else None
         declaration_document = None
         if owns_declaration:
@@ -2431,7 +2599,9 @@ class ProjectService:
             if operations_before is None:
                 raise MetadataError(f"cannot locate package declaration {package_id!r}")
             try:
-                declaration_document = json.loads(operations_before)
+                declaration_document = dict(
+                    self.metadata.decode_object(operations_before, operations_path)
+                )
                 declaration = declaration_document["operations"][existing_package.source_index]
             except (UnicodeError, ValueError, KeyError, IndexError, TypeError) as exc:
                 raise MetadataError(f"cannot locate package declaration {package_id!r}") from exc
@@ -2445,34 +2615,33 @@ class ProjectService:
             declaration["update_policy"] = "latest_compatible" if match is not None else "fixed"
             if version:
                 declaration["version"] = version
-        operations: list[dict[str, Any]] = []
         payload_path = target.joinpath(*str(item["path"]).split("/"))
         payload_before: bytes | None = None
-        if item["path"] in context.resolution.state.files:
-            operations.append({"type": "remove", "path": item["path"]})
-            if payload_path.is_file():
-                payload_before = payload_path.read_bytes()
-        operations.append(
-            {
-                "type": "package",
-                "id": package_id,
-                **(
-                    {
-                        "logical_id": existing_package.logical_identity,
-                        "kind": existing_package.kind,
-                        "automatic_requires": list(existing_package.automatic_requires),
-                        **({"alias": existing_package.alias} if existing_package.alias else {}),
-                    }
-                    if existing_package is not None
-                    else {}
-                ),
-                "activation": "enabled",
-                "destination": item["path"],
-                "source": source,
-                "update_policy": "latest_compatible" if match is not None else "fixed",
-                **({"version": version} if version else {}),
-            },
-        )
+        if (
+            item["path"] in context.resolution.state.content.files
+            and payload_path.is_file()
+        ):
+            payload_before = payload_path.read_bytes()
+        package_operation = {
+            "type": "package",
+            "id": package_id,
+            "kind": package_kind,
+            **(
+                {
+                    "logical_id": existing_package.logical_identity,
+                    "automatic_requires": list(existing_package.automatic_requires),
+                    **({"alias": existing_package.alias} if existing_package.alias else {}),
+                }
+                if existing_package is not None
+                else {}
+            ),
+            "activation": "enabled",
+            "destination": item["path"],
+            "source": source,
+            "update_policy": "latest_compatible" if match is not None else "fixed",
+            **({"version": version} if version else {}),
+        }
+        operations = self._package_import_operations(context, package_operation)
         try:
             if artifact is not None:
                 atomic_write(artifact, content)
@@ -2481,10 +2650,19 @@ class ProjectService:
             if payload_before is not None:
                 payload_path.unlink()
             if declaration_document is not None:
-                rendered = json.dumps(declaration_document, indent=2, ensure_ascii=False) + "\n"
-                atomic_write(operations_path, rendered.encode())
+                atomic_write(
+                    operations_path,
+                    self.metadata.encode_object(
+                        declaration_document, destination=operations_path
+                    ),
+                )
             else:
-                self._append_operations(target, operations, instance=instance)
+                self._append_operations(
+                    target, operations, instance=instance,
+                    operation_contexts={package_id: self._provider_routing_context(match)}
+                    if match is not None else None,
+                    origin="instance_capture",
+                )
             refreshed = self.instance_context(instance)
             if any(
                 entry["path"] == item["path"]
@@ -2498,6 +2676,26 @@ class ProjectService:
             if artifact is not None and not artifact_existed and artifact.exists():
                 artifact.unlink()
             raise
+
+    def _selected_provider_match(self, value: object, content: bytes) -> ProviderMatch | None:
+        if value is None or value == "local" or (
+            isinstance(value, dict) and value.get("provider") == "local"
+        ):
+            return None
+        if value == "modrinth":
+            candidate = self.provider_matcher.match(content)
+            return candidate if candidate is not None and candidate.confidence == "exact" else None
+        return confirmed_provider_match(value, content)
+
+    @staticmethod
+    def _provider_routing_context(match: ProviderMatch) -> dict[str, Any]:
+        package: dict[str, Any] = {
+            "provider": match.provider, "categories": list(match.categories),
+            "tags": list(match.tags),
+        }
+        if match.kind is not None:
+            package["kind"] = match.kind
+        return {"package": package}
 
     def safe_build_output(self, branch: str, output: Path | str | None) -> Path:
         default = (self.project / "build" / branch).resolve()
@@ -2518,13 +2716,17 @@ class ProjectService:
     def _write_overlay(self, instance: str, branch: str, features: list[str]) -> LinkRecord:
         overlay = self.state.feature_root(instance)
         overlay_metadata = overlay / METADATA_DIR
+        self._record_edit_paths(overlay_metadata / MARKER_FILE, self.state.links_path)
         overlay_metadata.mkdir(parents=True, exist_ok=True)
         parents = [
             str(self.branch_root(branch)),
             *(str(self.branch_root(item)) for item in features),
         ]
         marker = {
-            "schema": 1,
+            "schema": (
+                self._overlay_marker(overlay).get("schema", 1)
+                if (overlay_metadata / MARKER_FILE).is_file() else self._new_overlay_schema(branch)
+            ),
             "id": f"local-{instance}",
             "parents": parents,
             "features": features,
@@ -2542,6 +2744,10 @@ class ProjectService:
             links[instance] = LinkRecord(instance, branch, self._layer_reference(overlay))
             self.state.write_links(links)
         return links[instance]
+
+    def _new_overlay_schema(self, branch: str) -> int:
+        marker = self.branch_root(branch) / METADATA_DIR / MARKER_FILE
+        return int(JsonMetadataParser().read_object(marker).get("schema", 1))
 
     def _change_features(
         self, instance: str, context: InstanceContext, features: list[str]
@@ -2591,7 +2797,7 @@ class ProjectService:
     def _validate_overlay(self, instance: str, link: LinkRecord, overlay: Path) -> None:
         marker = self._overlay_marker(overlay)
         allowed = {"schema", "id", "parents", "features"}
-        if set(marker) != allowed or marker.get("schema") != 1:
+        if set(marker) != allowed or marker.get("schema") not in (1, 2):
             raise MetadataError(f"invalid virtual layer marker for {instance!r}")
         features = marker["features"]
         expected = [str(self.branch_root(link.branch))]
@@ -2648,157 +2854,562 @@ class ProjectService:
             if (root := self.branch_root(branch)) in participating
         }
 
-    def _append_operation(self, layer: Path, operation: dict[str, Any], *, instance: str | None = None) -> None:
-        self._append_operations(layer, [operation], instance=instance)
+    def _append_operation(
+        self, layer: Path, operation: dict[str, Any], *, instance: str | None = None,
+        origin: str = "user",
+    ) -> None:
+        self._append_operations(layer, [operation], instance=instance, origin=origin)
 
-    def _append_operations(self, layer: Path, additions: list[dict[str, Any]], *, instance: str | None = None) -> None:
-        rules = self._routing_rules_for_layer(layer)
+    def _append_operations(
+        self, layer: Path, additions: list[dict[str, Any]], *, instance: str | None = None,
+        operation_contexts: dict[str, dict[str, Any]] | None = None, origin: str = "user",
+    ) -> None:
+        plan = self.plan_metadata_writes(
+            layer, additions, instance=instance,
+            operation_contexts=operation_contexts, origin=origin,
+        )
+        self._apply_metadata_plan(plan, layer)
+
+    @contextmanager
+    def metadata_destination(
+        self, file: str | None = None, section: str | None = None
+    ) -> Iterator[None]:
+        """One request's explicit layer-root destination; never moves existing records."""
+        if file is not None:
+            normalize_relative_path(file)
+        if section is not None and (not isinstance(section, str) or not section):
+            raise MetadataError("section must be a non-empty string")
+        token = _edit_destinations.set((*_edit_destinations.get(), (self, file, section)))
+        try:
+            yield
+        finally:
+            _edit_destinations.reset(token)
+
+    def routing_options(self, instance: str, target_layer: str | None = None) -> dict[str, Any]:
+        context = self.instance_context(instance, prepare=False)
+        target = self._target_path(instance, context, target_layer)
+        exists = (target / METADATA_DIR / MARKER_FILE).is_file()
+        source = target if exists else self._effective_root(instance, context.link)
+        layer_rules = self._routing_rules_for_layer(source)
+        instance_rules = self._routing_rules_for_instance(instance)
+        schema = (
+            int(
+                JsonMetadataParser()
+                .read_object(target / METADATA_DIR / MARKER_FILE)
+                .get("schema", 1)
+            )
+            if exists
+            else self._new_overlay_schema(context.link.branch)
+        )
+        files = (
+            [
+                path.relative_to(target).as_posix()
+                for path in self._loader().metadata_files(target)
+            ]
+            if exists
+            else []
+        )
+        own_rule_ids = (
+            [
+                operation.identity
+                for producer in self._loader().load(target).producers
+                for operation in producer.operations
+                if isinstance(operation, RoutingRule)
+            ]
+            if exists
+            else []
+        )
+        return {
+            "target_layer": self._layer_reference(target),
+            "schema": schema,
+            "files": files,
+            "sections": list(context.resolution.state.sections),
+            "layer_rules": [operation_to_json(rule) for rule in layer_rules],
+            "instance_rules": [operation_to_json(rule) for rule in instance_rules],
+            "own_rule_ids": own_rule_ids,
+            "effective_rules": [
+                operation_to_json(rule) for rule in merge_routing_rules(layer_rules, instance_rules)
+            ],
+        }
+
+    def preview_routing(
+        self,
+        instance: str,
+        operation: dict[str, Any],
+        target_layer: str | None = None,
+        *,
+        file: str | None = None,
+        section: str | None = None,
+        origin: str = "user",
+    ) -> dict[str, Any]:
+        context = self.instance_context(instance, prepare=False)
+        target = self._target_path(instance, context, target_layer)
+        additions = (
+            self._package_import_operations(context, operation)
+            if origin == "instance_capture" and operation.get("type") == "package"
+            else [operation]
+        )
+        plan = self.plan_metadata_writes(
+            target, additions, instance=instance, destination=file, section=section,
+            origin=origin,
+        )
+        return {
+            "target_layer": self._layer_reference(target),
+            "writes": [
+                {
+                    "file": item.path.relative_to(target).as_posix(),
+                    "document": dict(self.metadata.decode_object(item.after, item.path)),
+                }
+                for item in plan.writes
+            ],
+        }
+
+    def _plan_schema_upgrade(self, target: Path) -> MetadataWritePlan:
+        """Preserve schema-one meaning explicitly before enabling local-path defaults."""
+        target = target.resolve()
+        marker = confined_path(target, f"{METADATA_DIR}/{MARKER_FILE}")
+        marker_parser = JsonMetadataParser()
+        document = dict(marker_parser.read_object(marker))
+        schema = document.get("schema", 1)
+        if schema == 2:
+            return MetadataWritePlan((), target)
+        if schema != 1:
+            raise MetadataError(f"unsupported layer schema: {schema!r}")
+        for directory in target.rglob(METADATA_DIR):
+            relative = directory.relative_to(target)
+            if directory == target / METADATA_DIR or METADATA_DIR in relative.parts[:-1]:
+                continue
+            if directory.is_symlink() or any(
+                path.is_file() or path.is_symlink() for path in directory.rglob("*")
+            ):
+                raise MetadataError(
+                    f"cannot upgrade a layer with existing nested metadata content: {relative}; "
+                    "review these files before upgrading"
+                )
+        writes: list[MetadataWrite] = []
+        for path in self._loader().metadata_files(target):
+            source = path.relative_to(target).as_posix()
+            path = self._metadata_destination(target, source, 1)
+            original = path.read_bytes()
+            metadata = dict(self.metadata.read_object(path))
+            metadata["operations"] = [
+                encode_record_paths(raw, source, 2, mode="layer")
+                for raw in metadata.get("operations", [])
+            ]
+            writes.append(
+                MetadataWrite(
+                    path,
+                    original,
+                    self.metadata.encode_object(metadata, destination=path),
+                )
+            )
+        document["schema"] = 2
+        writes.append(
+            MetadataWrite(marker, marker.read_bytes(), marker_parser.encode_object(document))
+        )
+        return MetadataWritePlan(tuple(writes), target)
+
+    def preview_schema_upgrade(
+        self, instance: str, target_layer: str | None = None
+    ) -> dict[str, Any]:
+        context = self.instance_context(instance, prepare=False)
+        target = self._target_path(instance, context, target_layer)
+        if (target / METADATA_DIR / MARKER_FILE).is_file():
+            plan = self._plan_schema_upgrade(target)
+            files = [write.path.relative_to(target).as_posix() for write in plan.writes]
+            current = not plan.writes
+        else:
+            # Previewing a prospective local overlay must not create it.
+            current = self._new_overlay_schema(context.link.branch) == 2
+            files = [] if current else [f"{METADATA_DIR}/{MARKER_FILE}"]
+        return {
+            "target_layer": self._layer_reference(target),
+            "from_schema": 2 if current else 1,
+            "to_schema": 2,
+            "files": files,
+            "already_current": current,
+        }
+
+    @_metadata_edit
+    def upgrade_layer_schema(
+        self, instance: str, target_layer: str | None = None
+    ) -> dict[str, Any]:
+        context = self.instance_context(instance, prepare=False)
+        target = self._target_path(instance, context, target_layer)
+        with self._target_layer_edit_lock(target):
+            target = self._editable_target(instance, context, target_layer)
+            baseline = self.instance_context(instance, prepare=False).resolution
+            rules = self._routing_rules_for_layer(target)
+            plan = self._plan_schema_upgrade(target)
+            self._apply_metadata_plan(plan, target)
+            refreshed = self.instance_context(instance, prepare=False).resolution
+            if (
+                refreshed.state != baseline.state
+                or refreshed.active_packages != baseline.active_packages
+                or self._routing_rules_for_layer(target) != rules
+            ):
+                raise MetadataError(
+                    "schema upgrade changed layer semantics; changes were rolled back"
+                )
+        return self.routing_options(instance, target_layer)
+
+    @_metadata_edit
+    def save_routing_rule(
+        self,
+        instance: str,
+        raw: dict[str, Any],
+        scope: str,
+        target_layer: str | None = None,
+        *,
+        file: str | None = None,
+    ) -> dict[str, Any]:
+        if scope not in {"layer", "instance"}:
+            raise MetadataError("routing rule scope must be layer or instance")
+        context = self.instance_context(instance, prepare=False)
+        target = self._target_path(instance, context, target_layer)
+        source = file or ".pack/routing.json"
+        rule = operation_from_json(
+            raw, source=source if scope == "layer" else ".pack/instance-routing.json", index=0
+        )
+        if not isinstance(rule, RoutingRule):
+            raise MetadataError("expected a routing_rule record")
+        if scope == "instance":
+            rules = [
+                item
+                for item in self.state.routing_rules(instance)
+                if item.get("id") != rule.identity
+            ]
+            self._record_edit_paths(self.state.routing_rules_path(instance))
+            self.state.write_routing_rules(instance, [*rules, raw])
+        else:
+            with self._target_layer_edit_lock(target):
+                target = self._editable_target(instance, context, target_layer)
+                plan = self.plan_metadata_writes(
+                    target, [raw], instance=instance, destination=source
+                )
+                self._apply_metadata_plan(plan, target)
+                self.instance_context(instance, prepare=False)
+        return self.routing_options(instance, target_layer)
+
+    @_metadata_edit
+    def remove_routing_rule(
+        self, instance: str, identity: str, scope: str, target_layer: str | None = None
+    ) -> dict[str, Any]:
+        if scope not in {"layer", "instance"}:
+            raise MetadataError("routing rule scope must be layer or instance")
+        context = self.instance_context(instance, prepare=False)
+        target = self._target_path(instance, context, target_layer)
+        if scope == "instance":
+            rules = self.state.routing_rules(instance)
+            remaining = [raw for raw in rules if raw.get("id") != identity]
+            if len(remaining) == len(rules):
+                raise MetadataError("instance routing rule does not exist")
+            self._record_edit_paths(self.state.routing_rules_path(instance))
+            self.state.write_routing_rules(instance, [*remaining])
+        else:
+            with self._target_layer_edit_lock(target):
+                if not (target / METADATA_DIR / MARKER_FILE).is_file():
+                    raise MetadataError("inherited routing rules cannot be removed")
+                definition = self._loader().load(target)
+                matches = [
+                    (producer.source, index)
+                    for producer in definition.producers
+                    for index, operation in enumerate(producer.operations)
+                    if isinstance(operation, RoutingRule) and operation.identity == identity
+                ]
+                if len(matches) != 1:
+                    raise MetadataError("routing rule is inherited, missing, or ambiguous")
+                source, index = matches[0]
+                path = confined_path(target, source)
+                before = path.read_bytes()
+                document = dict(self.metadata.read_object(path))
+                raw = document["operations"][index]
+                if raw.get("type") != "routing_rule" or raw.get("id") != identity:
+                    raise MetadataError("routing rule moved before removal")
+                del document["operations"][index]
+                plan = MetadataWritePlan(
+                    (
+                        MetadataWrite(
+                            path,
+                            before,
+                            self.metadata.encode_object(document, destination=path),
+                        ),
+                    ),
+                    target,
+                )
+                self._apply_metadata_plan(plan, target)
+                self.instance_context(instance, prepare=False)
+        return self.routing_options(instance, target_layer)
+
+    def _record_edit_paths(self, *paths: Path) -> None:
+        for journal in _edit_journals.get():
+            if journal.service is self:
+                for path in paths:
+                    journal.record(path)
+
+    def _apply_metadata_plan(self, plan: MetadataWritePlan, layer: Path) -> None:
+        plan.validate_paths()
+        paths = [write.path for write in plan.writes]
+        self._record_edit_paths(*paths)
+        with _BeforeImageJournal(self, layer, paths):
+            plan.apply()
+
+    def _metadata_destination(self, layer: Path, relative: str, schema: int) -> Path:
+        path = confined_path(layer, relative)
+        if (
+            path.suffix not in self.metadata.extensions
+            or path.parent.name != METADATA_DIR
+            or path.name == MARKER_FILE
+            or METADATA_DIR in path.parent.relative_to(layer).parts[:-1]
+        ):
+            supported = ", ".join(self.metadata.extensions)
+            raise MetadataError(
+                "destination must be a non-control .pack metadata file "
+                f"with a supported extension ({supported})"
+            )
+        if schema == 1 and path.parent != layer / METADATA_DIR:
+            raise MetadataError("nested metadata destinations require layer schema 2")
+        return path
+
+    @staticmethod
+    def _default_metadata_destination(
+        operation: dict[str, Any], schema: int, *, origin: str = "user"
+    ) -> str:
+        if schema == 1:
+            return f"{METADATA_DIR}/local-edits.json"
+        kind = operation.get("type")
+        if kind == "ignore":
+            return f"{METADATA_DIR}/ignore.json"
+        if kind in {"remove", "remove_paths"}:
+            subject = operation.get("path", operation.get("glob", ""))
+            parent = Path(str(subject)).parent.as_posix()
+            return f"{parent}/{METADATA_DIR}/remove.json" if parent != "." else ".pack/remove.json"
+        if kind == "activation":
+            return "mods/.pack/disabled.json"
+        if kind == "package":
+            folder = {"mod": "mods", "resourcepack": "resourcepacks", "datapack": "datapacks"}.get(
+                str(operation.get("kind", "mod")), "mods"
+            )
+            filename = "mods" if folder == "mods" else "packs"
+            if origin == "automatic_dependency":
+                filename = "dependencies"
+            elif operation.get("activation", "available") in {"available", "disabled"}:
+                filename = "disabled"
+            return f"{folder}/.pack/{filename}.json"
+        return f"{METADATA_DIR}/local-edits.json"
+
+    def plan_metadata_writes(
+        self,
+        layer: Path,
+        additions: list[dict[str, Any]],
+        *,
+        instance: str | None = None,
+        destination: str | None = None,
+        section: str | None = None,
+        operation_contexts: dict[str, dict[str, Any]] | None = None,
+        origin: str = "user",
+    ) -> MetadataWritePlan:
+        """Preview exact changes without writing; existing records retain their source."""
+        layer = layer.resolve()
+        for owner, chosen_file, chosen_section in reversed(_edit_destinations.get()):
+            if owner is self:
+                destination = destination if destination is not None else chosen_file
+                section = section if section is not None else chosen_section
+                break
+        if section is not None and not any(
+            operation.get("type") in {"package", "activation", "group"}
+            and isinstance(operation.get("id"), str)
+            for operation in additions
+        ):
+            raise MetadataError(
+                "manual section requires package, activation, or group records with ids"
+            )
+        cache = self._contexts.get(instance) if instance is not None else None
+        loader = cache.loader if cache is not None else self._loader()
+        marker = layer / METADATA_DIR / MARKER_FILE
+        virtual = not marker.is_file()
+        if virtual:
+            if instance is None or layer != self.state.feature_root(instance).resolve():
+                raise MetadataError(f"layer marker does not exist: {marker}")
+            instance_context = self.instance_context(instance, prepare=False)
+            resolved = instance_context.resolution
+            rule_source = self._effective_root(instance, instance_context.link)
+            metadata_files: tuple[Path, ...] = ()
+            schema = self._new_overlay_schema(instance_context.link.branch)
+        else:
+            definition = loader.load(layer)
+            schema = int(JsonMetadataParser().read_object(marker).get("schema", 1))
+            metadata_files = loader.metadata_files(layer)
+            rule_source = layer
+            resolved = LayerComposer(loader).resolve(definition)
+        documents: dict[Path, dict[str, Any]] = {}
+        originals: dict[Path, bytes | None] = {}
+        for source in metadata_files:
+            path = self._metadata_destination(layer, source.relative_to(layer).as_posix(), schema)
+            originals[path] = path.read_bytes()
+            documents[path] = dict(self.metadata.read_object(path))
+        local: dict[tuple[str, str], tuple[Path, dict[str, Any]]] = {}
+        for path, document in documents.items():
+            for record in document.get("operations", []):
+                if isinstance(record, dict) and isinstance(record.get("id"), str):
+                    key = (str(record.get("type")), record["id"])
+                    if key in local:
+                        raise MetadataError(f"duplicate local declaration: {key}")
+                    local[key] = (path, record)
+        rules = self._routing_rules_for_layer(rule_source, loader=loader)
         if instance is not None:
             rules = merge_routing_rules(rules, self._routing_rules_for_instance(instance))
-        engine = RoutingEngine(rules)
-        grouped: dict[Path, list[tuple[dict[str, Any], str | None]]] = {}
+        engine = RoutingEngine(
+            tuple(replace(rule, section=section) for rule in rules)
+            if section is not None
+            else rules
+        )
+        # Resolve only logical metadata; no artifact downloads or materialization.
+        changed: set[Path] = set()
         for operation in additions:
-            selected = engine.destination(operation, declaration_file=f"{METADATA_DIR}/local-edits.json")
-            relative = selected[0] if selected else f"{METADATA_DIR}/local-edits.json"
-            section = selected[1] if selected else None
-            grouped.setdefault(layer / relative, []).append((operation, section))
-        before = {path: path.read_bytes() if path.exists() else None for path in grouped}
-        try:
-            for path, records in grouped.items():
-                self._append_operations_to_path(path, records)
-        except Exception:
-            for path, content in before.items():
-                self._restore_file(path, content)
-            raise
+            operation = deepcopy(operation)
+            identity = operation.get("id")
+            key = (str(operation.get("type")), str(identity))
+            existing = local.get(key)
+            if operation.get("type") == "activation":
+                existing = local.get(("package", str(identity))) or existing
+            if existing is not None:
+                path, record = existing
+                if operation.get("type") == "activation" and record.get("type") == "package":
+                    record["activation"] = operation["state"]
+                else:
+                    source_reference = path.relative_to(layer).as_posix()
+                    mode = record.get("path_mode", "local")
+                    canonical = decode_record_paths(record, source_reference, schema)
+                    canonical.update(operation)
+                    encoded = encode_record_paths(canonical, source_reference, schema, mode=mode)
+                    if "path_mode" in record:
+                        encoded["path_mode"] = mode
+                    record.clear()
+                    record.update(encoded)
+                changed.add(path)
+                continue
+            package = (
+                resolved.state.packages.get(str(identity))
+                if operation.get("type") in {"package", "activation"}
+                else None
+            )
+            package_context: dict[str, Any] = {}
+            if package is not None:
+                package_context = {
+                    "id": package.identity,
+                    "kind": package.kind,
+                    "provider": package.source.provider,
+                    "activation": package.activation.value,
+                    "destination": package.destination,
+                }
+            routing_context: dict[str, Any] = {"origin": origin, "package": package_context}
+            if operation.get("type") in {"package", "activation"}:
+                supplied = (operation_contexts or {}).get(str(identity), {})
+                package_context.update(supplied.get("package", {}))
+                routing_context["origin"] = supplied.get("origin", origin)
+                requested_activation = operation.get("activation", operation.get("state"))
+                if requested_activation is not None:
+                    package_context["activation"] = requested_activation
+            # A manual destination is a complete one-shot choice; conflicting
+            # automatic candidates must not prevent the user's explicit choice.
+            selected = (
+                None
+                if destination is not None
+                else engine.destination(operation, context=routing_context)
+            )
+            relative = destination or (
+                selected[0]
+                if selected
+                else self._default_metadata_destination(
+                    operation, schema, origin=routing_context["origin"]
+                )
+            )
+            section_id = section if section is not None else selected[1] if selected else None
+            path = self._metadata_destination(layer, relative, schema)
+            if path not in documents:
+                originals[path] = path.read_bytes() if path.exists() else None
+                documents[path] = (
+                    dict(self.metadata.read_object(path))
+                    if path.exists()
+                    else {"operations": []}
+                )
+            encoded = encode_record_paths(operation, path.relative_to(layer).as_posix(), schema)
+            documents[path].setdefault("operations", []).append(encoded)
+            changed.add(path)
+            if isinstance(identity, str):
+                local[key] = (path, encoded)
+            if (
+                section_id is None
+                or not isinstance(identity, str)
+                or operation.get("type") == "section"
+            ):
+                continue
+            section_record = local.get(("section", section_id))
+            if section_record is None:
+                inherited = resolved.state.sections.get(section_id)
+                record = {
+                    "type": "section",
+                    "id": section_id,
+                    "title": inherited.title if inherited else section_id,
+                    "members": list(inherited.members) if inherited else [],
+                    "order": inherited.order if inherited else 0,
+                }
+                documents[path]["operations"].append(record)
+                local[("section", section_id)] = (path, record)
+                section_path = path
+            else:
+                section_path, record = section_record
+            members = record.setdefault("members", [])
+            if identity not in members:
+                members.append(identity)
+                changed.add(section_path)
+        return MetadataWritePlan(
+            tuple(
+                MetadataWrite(
+                    path,
+                    originals[path],
+                    self.metadata.encode_object(documents[path], destination=path),
+                )
+                for path in sorted(changed)
+            ),
+            layer,
+        )
 
-    def _routing_rules_for_layer(self, layer: Path) -> tuple[RoutingRule, ...]:
-        """Return effective rules for a layer, including inherited parents.
+    def _routing_rules_for_layer(
+        self, layer: Path, *, loader: WorkspaceLoader | None = None
+    ) -> tuple[RoutingRule, ...]:
+        """Replay the loader's parent graph, retaining ordered ancestor applications."""
+        loader = loader or self._loader()
 
-        Parent markers are repository-relative and are traversed before the child;
-        duplicate rule ids in a child replace the inherited definition.
-        """
-        seen: set[Path] = set()
+        def read_rules(definition: Any, stack: tuple[str, ...]) -> tuple[RoutingRule, ...]:
+            if definition.root in stack:
+                raise ResolutionError(f"layer cycle while resolving routing: {definition.root}")
+            result: tuple[RoutingRule, ...] = ()
+            for reference in definition.parents:
+                parent = loader.resolve_parent(definition, reference)
+                result = merge_routing_rules(result, read_rules(parent, (*stack, definition.root)))
+            own = tuple(
+                operation
+                for producer in definition.producers
+                for operation in producer.operations
+                if isinstance(operation, RoutingRule)
+            )
+            return merge_routing_rules(result, own)
 
-        def read_rules(current: Path) -> tuple[RoutingRule, ...]:
-            current = current.resolve()
-            if current in seen:
-                return ()
-            seen.add(current)
-            inherited: list[RoutingRule] = []
-            marker = current / METADATA_DIR / MARKER_FILE
-            try:
-                marker_data = json.loads(marker.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError):
-                marker_data = {}
-            for parent in marker_data.get("parents", []) if isinstance(marker_data, dict) else []:
-                reference = parent if isinstance(parent, str) else parent.get("path") if isinstance(parent, dict) else None
-                if isinstance(reference, str):
-                    parent_path = (self.project / reference).resolve()
-                    inherited.extend(read_rules(parent_path))
-            own: list[RoutingRule] = []
-            root = current / METADATA_DIR
-            if not root.exists():
-                return merge_routing_rules(inherited)
-            for candidate in root.rglob("*.json"):
-                if candidate.name == MARKER_FILE:
-                    continue
-                try:
-                    document = json.loads(candidate.read_text(encoding="utf-8"))
-                except (OSError, UnicodeError, json.JSONDecodeError):
-                    continue
-                if not isinstance(document, dict) or not isinstance(document.get("operations"), list):
-                    continue
-                source = candidate.relative_to(current).as_posix()
-                for index, raw in enumerate(document["operations"]):
-                    if isinstance(raw, dict) and raw.get("type") == "routing_rule":
-                        try:
-                            rule = operation_from_json(raw, source=source, index=index)
-                        except (TypeError, ValueError, MetadataError, ResolutionError):
-                            continue
-                        if isinstance(rule, RoutingRule):
-                            own.append(rule)
-            return merge_routing_rules(inherited, own)
-
-        return read_rules(layer)
+        return read_rules(loader.load(layer), ())
 
     def _routing_rules_for_instance(self, instance: str) -> tuple[RoutingRule, ...]:
         """Parse untracked instance-local rules; these override layer rules."""
         rules: list[RoutingRule] = []
-        source = str(self.state.routing_rules_path(instance))
+        source = ".pack/instance-routing.json"
         for index, raw in enumerate(self.state.routing_rules(instance)):
-            try:
-                parsed = operation_from_json(
-                    {**raw, "type": "routing_rule"}, source=source, index=index
-                )
-            except (TypeError, ValueError, MetadataError, ResolutionError):
-                continue
+            parsed = operation_from_json(
+                {**raw, "type": "routing_rule"}, source=source, index=index
+            )
             if isinstance(parsed, RoutingRule):
                 rules.append(parsed)
         return merge_routing_rules(rules)
-
-    def _append_operations_to_path(
-        self,
-        path: Path,
-        additions: list[tuple[dict[str, Any], str | None]] | list[dict[str, Any]],
-    ) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            try:
-                document = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-                raise MetadataError(f"cannot edit {path}: {exc}") from exc
-            if not isinstance(document, dict) or set(document) != {"operations"}:
-                raise MetadataError(f"{path}: unsupported local edit document")
-        else:
-            document = {"operations": []}
-        operations = document["operations"]
-        if not isinstance(operations, list):
-            raise MetadataError(f"{path}: operations must be an array")
-        annotated = [item if isinstance(item, tuple) else (item, None) for item in additions]
-        for operation, section_id in annotated:
-            if operation.get("type") in {"activation", "package", "group"}:
-                operations[:] = [
-                    item
-                    for item in operations
-                    if not (
-                        isinstance(item, dict)
-                        and item.get("type") == operation.get("type")
-                        and item.get("id") == operation.get("id")
-                    )
-                ]
-            operations.append(operation)
-            # A routing destination section is materialized as an ordinary
-            # section declaration alongside the routed operation.  This keeps
-            # the unified file syntax intact and avoids treating the
-            # routing_rule record itself as a section operation.
-            if section_id and operation.get("type") != "section":
-                member = operation.get("id")
-                if isinstance(member, str) and member:
-                    section = next(
-                        (
-                            item for item in operations
-                            if isinstance(item, dict)
-                            and item.get("type") == "section"
-                            and item.get("id") == section_id
-                        ),
-                        None,
-                    )
-                    if section is None:
-                        operations.append({
-                            "type": "section",
-                            "id": section_id,
-                            "title": section_id,
-                            "members": [member],
-                        })
-                    else:
-                        members = section.setdefault("members", [])
-                        if not isinstance(members, list):
-                            raise MetadataError(
-                                f"{path}: section {section_id!r} members must be an array"
-                            )
-                        if member not in members:
-                            members.append(member)
-        atomic_write(path, (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode())
 
     @staticmethod
     def _parse_edit_activation(value: str) -> Activation:
@@ -2822,6 +3433,7 @@ class ProjectService:
         digest = hashlib.sha256(content).hexdigest()
         artifact = target / METADATA_DIR / "artifacts" / f"{digest}.jar"
         artifact_existed = artifact.exists()
+        self._record_edit_paths(artifact)
         atomic_write(artifact, content)
         relative = artifact.relative_to(self.project).as_posix()
         operation = {
@@ -2845,7 +3457,9 @@ class ProjectService:
             operation["version"] = package.version
         operations_path = target / METADATA_DIR / "local-edits.json"
         before = operations_path.read_bytes() if operations_path.exists() else None
-        self._append_operation(target, operation, instance=context.instance.name)
+        self._append_operation(
+            target, operation, instance=context.instance.name, origin="instance_capture"
+        )
         try:
             refreshed = self.instance_context(context.instance.name)
             if any(
@@ -2859,19 +3473,20 @@ class ProjectService:
                 artifact.unlink(missing_ok=True)
             raise
 
-    @staticmethod
     def _edit_declaration_activation(
-        path: Path, package_id: str, source_index: int | None, activation: Activation
+        self,
+        path: Path,
+        package_id: str,
+        source_index: int | None,
+        activation: Activation,
     ) -> None:
         if source_index is None:
             raise MetadataError(f"package {package_id!r} has no editable source index")
         try:
-            document = json.loads(path.read_text(encoding="utf-8"))
+            document = dict(self.metadata.read_object(path))
             operation = document["operations"][source_index]
         except (
-            OSError,
-            UnicodeError,
-            json.JSONDecodeError,
+            MetadataError,
             KeyError,
             IndexError,
             TypeError,
@@ -2880,7 +3495,7 @@ class ProjectService:
         if operation.get("type") != "package" or operation.get("id") != package_id:
             raise MetadataError(f"package declaration moved for {package_id!r}")
         operation["activation"] = activation.value
-        atomic_write(path, (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode())
+        atomic_write(path, self.metadata.encode_object(document, destination=path))
 
     @staticmethod
     def _restore_file(path: Path, content: bytes | None) -> None:
@@ -2902,10 +3517,8 @@ class ProjectService:
 
     def _renamed_overlay_sources(self, old: Path, new: Path) -> dict[Path, bytes]:
         updates = {}
-        for path in sorted((old / METADATA_DIR).rglob("*.json")):
-            if path.name == MARKER_FILE:
-                continue
-            document = JsonMetadataParser().read_object(path)
+        for path in self._loader().metadata_files(old):
+            document = dict(self.metadata.read_object(path))
             operations = document.get("operations", [])
             if not isinstance(operations, list):
                 raise MetadataError(f"{path}: operations must be an array")
@@ -2933,7 +3546,7 @@ class ProjectService:
                 )
                 changed = True
             if changed:
-                updates[path] = (json.dumps(document, indent=2, ensure_ascii=False) + "\n").encode()
+                updates[path] = self.metadata.encode_object(document, destination=path)
         return updates
 
     def _require_web_stopped(self, instance: str) -> None:

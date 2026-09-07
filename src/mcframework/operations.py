@@ -11,142 +11,24 @@ from .errors import MergeConflict, ResolutionError
 from .model import (
     Activation,
     ArtifactSource,
+    ContentState,
     Dependency,
     Group,
     IgnoreSelector,
     PackageDeclaration,
+    PackageState,
     PackState,
     Section,
     SelectorKind,
     UpdatePolicy,
+    WebPolicyState,
     frozen_map,
 )
 from .paths import matches, normalize_relative_path
-
-
-@dataclass(frozen=True)
-class RoutingRule:
-    """A declarative destination rule for newly produced metadata operations.
-
-    Rules are intentionally kept separate from executable operations.  They are
-    nevertheless serialized in the same ``operations`` array using
-    ``type: routing_rule``.
-    """
-
-    identity: str
-    priority: int = 0
-    when: Mapping[str, Any] = field(default_factory=frozen_map)
-    file: str = ".pack/local-edits.json"
-    section: str | None = None
-    path_mode: str = "layer"
-    source_file: str | None = None
-
-    def writes(self) -> tuple[Resource, ...]:
-        return ()
-
-    def reads(self) -> tuple[Resource, ...]:
-        return ()
-
-    def writes(self) -> tuple[ResourceDomain, ...]:
-        return ()
-
-    def reads(self) -> tuple[ResourceDomain, ...]:
-        return ()
-
-    def resolve_file(self, declaration_file: str | None = None) -> str:
-        """Resolve destination to a layer-root relative, repository-safe path."""
-        mode = self.path_mode.lower()
-        if mode not in {"layer", "local"}:
-            raise ResolutionError(f"invalid routing path_mode {self.path_mode!r}")
-        value = self.file.replace("\\", "/")
-        if mode == "local":
-            base = declaration_file or self.source_file
-            if not base:
-                raise ResolutionError("local routing path requires declaration file")
-            base = base.replace("\\", "/")
-            value = "/".join(base.split("/")[:-1] + [value])
-        return normalize_relative_path(value)
-
-    def matches(self, operation: Mapping[str, Any]) -> bool:
-        """Return whether this rule applies to a serialized operation."""
-        for key, expected in self.when.items():
-            actual: Any = operation.get(key)
-            if key == "operation_types":
-                actual = operation.get("type")
-            elif key.startswith("package."):
-                package = operation.get("package")
-                actual = package.get(key[8:]) if isinstance(package, Mapping) else operation.get(key[8:])
-            elif key == "tags":
-                actual = operation.get("tags", ()); actual = tuple(actual) if isinstance(actual, list) else actual
-            if isinstance(expected, (list, tuple, set)):
-                if key == "tags" and isinstance(actual, (list, tuple, set)):
-                    if not set(expected).issubset(set(actual)):
-                        return False
-                elif actual not in expected:
-                    return False
-            elif isinstance(expected, Mapping):
-                if not isinstance(actual, Mapping) or any(actual.get(k) != v for k, v in expected.items()):
-                    return False
-            elif actual != expected:
-                return False
-        return True
-
-
-class RoutingEngine:
-    """Selects a destination metadata file for newly written records."""
-
-    def __init__(self, rules: Iterable[RoutingRule] = ()) -> None:
-        self.rules = tuple(rules)
-
-    def destination(self, operation: Mapping[str, Any], *, declaration_file: str | None = None) -> tuple[str, str | None] | None:
-        matches = sorted((rule for rule in self.rules if rule.matches(operation)), key=lambda r: -r.priority)
-        if not matches:
-            return None
-        top = matches[0].priority
-        winners = [rule for rule in matches if rule.priority == top]
-        destinations = {(rule.resolve_file(declaration_file), rule.section) for rule in winners}
-        if len(destinations) > 1:
-            raise ResolutionError("ambiguous routing rules for operation")
-        return next(iter(destinations))
-
-
-def routing_rule_from_json(raw: Mapping[str, Any], *, source: str, index: int = 0) -> RoutingRule:
-    """Parse a routing rule record from the unified metadata document."""
-    identity = required_string(raw, "id", source)
-    priority = raw.get("priority", 0)
-    if isinstance(priority, bool) or not isinstance(priority, int):
-        raise ResolutionError(f"{source}: routing_rule priority must be an integer")
-    when = raw.get("when", {})
-    if not isinstance(when, dict):
-        raise ResolutionError(f"{source}: routing_rule when must be an object")
-    write = raw.get("write", {})
-    if not isinstance(write, dict):
-        raise ResolutionError(f"{source}: routing_rule write must be an object")
-    file_spec = write.get("file", write.get("path", ".pack/local-edits.json"))
-    if isinstance(file_spec, dict):
-        path = file_spec.get("path", ".pack/local-edits.json")
-        path_mode = file_spec.get("path_mode", "layer")
-    else:
-        path, path_mode = file_spec, write.get("path_mode", "layer")
-    if not isinstance(path, str) or not path:
-        raise ResolutionError(f"{source}: routing_rule destination file must be a string")
-    if not isinstance(path_mode, str) or path_mode not in {"layer", "local"}:
-        raise ResolutionError(f"{source}: routing_rule path_mode must be layer or local")
-    section = write.get("section")
-    if section is not None and (not isinstance(section, str) or not section):
-        raise ResolutionError(f"{source}: routing_rule section must be a string")
-    rule = RoutingRule(identity, priority, frozen_map(when), path, section, path_mode, source)
-    rule.resolve_file(source)
-    return rule
-
-
-def merge_routing_rules(*layers: Iterable[RoutingRule]) -> tuple[RoutingRule, ...]:
-    """Merge inherited rules; child identity replaces parent, priority orders output."""
-    merged: dict[str, RoutingRule] = {}
-    for rules in layers:
-        for rule in rules:
-            merged[rule.identity] = rule
-    return tuple(sorted(merged.values(), key=lambda item: (-item.priority, item.identity)))
+from .routing import RoutingEngine as RoutingEngine
+from .routing import RoutingRule as RoutingRule
+from .routing import merge_routing_rules as merge_routing_rules
+from .routing import routing_rule_from_json as routing_rule_from_json
 
 
 @dataclass(frozen=True)
@@ -316,22 +198,31 @@ class AddIgnoreSelector:
         return ()
 
 
+type DomainOperation = (
+    PutFile | RemoveFile | RemovePaths | PatchProperties | DeclarePackage |
+    SetPackageActivation | AddDependency | DeclareGroup | DeclareSection | AddPruneSelector
+)
+type MetadataRecord = Operation | RoutingRule
+
+
 @dataclass(frozen=True)
 class Producer:
     name: str
     source: str
-    operations: tuple[Operation, ...]
+    operations: tuple[MetadataRecord, ...]
     may_write: tuple[ResourceDomain, ...]
     may_read: tuple[ResourceDomain, ...] | None = None
 
-    def produce(self, parameters: Mapping[str, Any]) -> tuple[Operation, ...]:
+    def produce(self, parameters: Mapping[str, Any]) -> tuple[MetadataRecord, ...]:
         # JSON metadata is static in the initial frontend. The parameter argument is
         # retained so bounded parametric producers can be added without changing the core.
         del parameters
         return self.operations
 
-    def validate(self, operations: Iterable[Operation]) -> None:
+    def validate(self, operations: Iterable[MetadataRecord]) -> None:
         for operation in operations:
+            if isinstance(operation, RoutingRule):
+                continue
             for resource in operation.writes():
                 if not any(domain.contains(resource) for domain in self.may_write):
                     raise ResolutionError(
@@ -347,7 +238,7 @@ class Producer:
 
 def operation_from_json(
     raw: Mapping[str, Any], *, source: str, index: int, layer_precedence: int = 0
-) -> Operation:
+) -> MetadataRecord:
     kind = required_string(raw, "type", source)
     if kind == "routing_rule":
         return routing_rule_from_json(raw, source=source, index=index)
@@ -500,7 +391,9 @@ def parse_activation(value: Any, source: str) -> Activation:
     return result
 
 
-def producer_for_operations(name: str, source: str, operations: tuple[Operation, ...]) -> Producer:
+def producer_for_operations(
+    name: str, source: str, operations: tuple[MetadataRecord, ...]
+) -> Producer:
     return Producer(
         name=name,
         source=source,
@@ -508,41 +401,73 @@ def producer_for_operations(name: str, source: str, operations: tuple[Operation,
         may_write=tuple(
             ResourceDomain(resource.kind, resource.identity)
             for operation in operations
+            if not isinstance(operation, RoutingRule)
             for resource in operation.writes()
         ),
         may_read=tuple(
             ResourceDomain(resource.kind, resource.identity)
             for operation in operations
+            if not isinstance(operation, RoutingRule)
             for resource in operation.reads()
         ),
     )
 
 
 def apply_local_operations(
-    parent: PackState, operations: tuple[Operation, ...], precedence: int
+    parent: PackState, operations: tuple[MetadataRecord, ...], precedence: int
 ) -> PackState:
-    """Merge operations as an unordered local delta, then apply it to parent."""
-    domain_operations = tuple(op for op in operations if not isinstance(op, RoutingRule))
-    validate_same_layer(domain_operations)
-    files = dict(parent.files)
-    exclusions = list(parent.exclusions)
-    packages = dict(parent.packages)
-    dependencies = list(parent.dependencies)
-    groups = dict(parent.groups)
-    sections = dict(parent.sections)
-    prune = list(parent.prune)
-    ignore = list(parent.ignore)
+    """Compose independently reduced domain data and web policy for legacy callers."""
+    domain_operations = tuple(
+        op for op in operations if isinstance(op, (
+            PutFile, RemoveFile, RemovePaths, PatchProperties, DeclarePackage,
+            SetPackageActivation, AddDependency, DeclareGroup, DeclareSection, AddPruneSelector,
+        ))
+    )
+    content, catalog = apply_domain_operations(
+        parent.content, parent.package_catalog, domain_operations, precedence
+    )
+    policy = apply_web_policy(
+        parent.web_policy,
+        tuple(op for op in operations if isinstance(op, AddIgnoreSelector)),
+    )
+    return PackState(
+        content.files, content.exclusions, catalog.packages, catalog.dependencies,
+        catalog.groups, catalog.sections, content.prune, policy.ignore,
+    )
+
+
+def apply_web_policy(
+    parent: WebPolicyState, operations: tuple[AddIgnoreSelector, ...]
+) -> WebPolicyState:
+    """Resolve editor visibility policy, without reading or changing pack content."""
+    selectors = tuple(dict.fromkeys((*parent.ignore, *(op.selector for op in operations))))
+    return WebPolicyState(selectors)
+
+
+def apply_domain_operations(
+    content: ContentState, catalog: PackageState,
+    operations: tuple[DomainOperation, ...], precedence: int,
+) -> tuple[ContentState, PackageState]:
+    """Merge a domain-only local delta against immutable content and package inputs."""
+    validate_same_layer(operations)
+    files = dict(content.files)
+    exclusions = list(content.exclusions)
+    packages = dict(catalog.packages)
+    dependencies = list(catalog.dependencies)
+    groups = dict(catalog.groups)
+    sections = dict(catalog.sections)
+    prune = list(content.prune)
 
     # Every structured patch reads the unmodified parent state.
     patched: dict[str, bytes] = {}
     grouped_patches: dict[str, list[PatchProperties]] = {}
-    for operation in domain_operations:
+    for operation in operations:
         if isinstance(operation, PatchProperties):
             grouped_patches.setdefault(operation.path, []).append(operation)
     for path, patches in grouped_patches.items():
-        if path not in parent.files:
+        if path not in content.files:
             raise ResolutionError(f"cannot patch missing inherited properties file {path!r}")
-        properties = parse_properties(parent.files[path], path)
+        properties = parse_properties(content.files[path], path)
         for patch in patches:
             for key in patch.remove_keys:
                 properties.pop(key, None)
@@ -553,15 +478,13 @@ def apply_local_operations(
         operation for operation in operations if isinstance(operation, SetPackageActivation)
     )
     for operation in activation_operations:
-        if operation.identity not in parent.packages:
+        if operation.identity not in catalog.packages:
             raise ResolutionError(
                 f"same-layer activation cannot target package absent from immutable "
                 f"parent state: {operation.identity!r}; set activation on the declaration"
             )
 
     for operation in operations:
-        if isinstance(operation, RoutingRule):
-            continue
         if isinstance(operation, RemovePaths):
             exclusions.append(operation.pattern)
             for path in tuple(files):
@@ -590,23 +513,17 @@ def apply_local_operations(
             sections[operation.section.identity] = operation.section
         elif isinstance(operation, AddPruneSelector) and operation.pattern not in prune:
             prune.append(operation.pattern)
-        elif isinstance(operation, AddIgnoreSelector) and operation.selector not in ignore:
-            ignore.append(operation.selector)
     # Activation operations read only the immutable parent state. Applying their
     # already-validated delta last makes the local merge independent of source order.
     for operation in activation_operations:
         packages[operation.identity] = replace(
             packages[operation.identity], activation=operation.activation
         )
-    return PackState(
-        frozen_map(files),
-        tuple(exclusions),
-        frozen_map(packages),
-        tuple(dependencies),
-        frozen_map(groups),
-        frozen_map(sections),
-        tuple(prune),
-        tuple(ignore),
+    return (
+        ContentState(frozen_map(files), tuple(exclusions), tuple(prune)),
+        PackageState(
+            frozen_map(packages), tuple(dependencies), frozen_map(groups), frozen_map(sections)
+        ),
     )
 
 
@@ -678,7 +595,7 @@ def render_properties(properties: Mapping[str, str]) -> bytes:
 
 
 def operation_to_json(
-    operation: Operation, *, file_digest: Callable[[bytes], str] | None = None
+    operation: MetadataRecord, *, file_digest: Callable[[bytes], str] | None = None
 ) -> dict[str, Any]:
     """Stable diagnostic representation used by manifests and CLI output."""
     if isinstance(operation, RoutingRule):

@@ -53,7 +53,8 @@ class IncrementalPreparer:
                     raise ArtifactError("artifact changed during preparation")
                 generations[Path(artifact.cache_path)] = stamp
         elif (
-            len(content_state.files) == len(previous_content.files)
+            previous_content is not None
+            and len(content_state.files) == len(previous_content.files)
             and all(
                 previous_content.files.get(path) is content
                 for path, content in content_state.files.items()

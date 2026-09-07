@@ -20,7 +20,7 @@ from .errors import FrameworkError, MetadataError
 from .loader import WorkspaceLoader, validate_parameter_value
 from .manifest import manifest_document
 from .project import ProjectService
-from .resolver import Resolver
+from .resolver import LayerComposer
 from .sync import Synchronizer
 from .transport import LocalFilesystemInstance, SftpInstance
 from .update import UpdateService
@@ -287,7 +287,7 @@ def _legacy_invocation(arguments: list[str]) -> int | None:
     elif command == "update":
         legacy.add_argument("package_ids", nargs="+")
     parsed = legacy.parse_args(tail)
-    resolution = Resolver(
+    resolution = LayerComposer(
         WorkspaceLoader(workspace), automatic_dependencies=not parsed.no_auto_dependencies
     ).resolve(layer, parse_parameters(parsed.parameters))
     cache_path = parsed.cache or workspace / ".mcpack" / "cache"

@@ -6,6 +6,7 @@ import hashlib
 import json
 import tomllib
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -46,6 +47,9 @@ class ProviderMatch:
     hashes: dict[str, str]
     confidence: str = "exact"
     reason: str = "provider returned the exact file hash"
+    kind: str | None = None
+    categories: tuple[str, ...] = ()
+    tags: tuple[str, ...] = ()
 
     def document(self) -> dict[str, object]:
         return {
@@ -57,6 +61,9 @@ class ProviderMatch:
             "hashes": dict(self.hashes),
             "confidence": self.confidence,
             "reason": self.reason,
+            "kind": self.kind,
+            "categories": list(self.categories),
+            "tags": list(self.tags),
         }
 
 
@@ -149,9 +156,39 @@ class ModrinthMatcher:
     """Official anonymous exact-hash lookup. Network failures are a normal no-match."""
 
     endpoint = "https://api.modrinth.com/v2/version_file/{digest}?algorithm=sha512"
+    project_endpoint = "https://api.modrinth.com/v2/project/{project_id}"
+    project_cache_limit = 128
 
     def __init__(self, timeout: float = 10.0):
         self.timeout = timeout
+        self._project_metadata: dict[str, tuple[str, tuple[str, ...]]] = {}
+
+    def _project(self, project_id: str) -> tuple[str, tuple[str, ...]] | None:
+        if project_id in self._project_metadata:
+            return self._project_metadata[project_id]
+        request = urllib.request.Request(
+            self.project_endpoint.format(project_id=urllib.parse.quote(project_id, safe="")),
+            headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = json.loads(response.read())
+            if not isinstance(raw, dict) or raw.get("id") != project_id:
+                return None
+            kind = raw.get("project_type")
+            if not isinstance(kind, str) or kind not in (
+                "mod", "resourcepack", "datapack", "modpack", "shader"
+            ):
+                return None
+            categories = _string_list(raw.get("categories"), "categories")
+            additional = _string_list(raw.get("additional_categories"), "additional_categories")
+        except (OSError, urllib.error.URLError, UnicodeError, json.JSONDecodeError, MetadataError):
+            return None  # Optional project metadata must not discard an exact file match.
+        result = kind, tuple(dict.fromkeys((*categories, *additional)))
+        if len(self._project_metadata) >= self.project_cache_limit:
+            self._project_metadata.pop(next(iter(self._project_metadata)))
+        self._project_metadata[project_id] = result
+        return result
 
     def match(self, content: bytes) -> ProviderMatch | None:
         hashes = file_hashes(content)
@@ -184,6 +221,7 @@ class ModrinthMatcher:
         version_id = raw.get("id")
         if not isinstance(project_id, str) or not isinstance(version_id, str):
             return None
+        project = self._project(project_id)
         return ProviderMatch(
             "modrinth",
             project_id,
@@ -191,6 +229,9 @@ class ModrinthMatcher:
             _optional_text(raw.get("version_number")),
             str(selected["url"]),
             hashes,
+            kind=project[0] if project else None,
+            categories=project[1] if project else (),
+            tags=project[1] if project else (),
         )
 
 
@@ -241,6 +282,11 @@ def confirmed_provider_match(value: object, content: bytes) -> ProviderMatch | N
     actual = file_hashes(content)
     if not any(hashes.get(name) == actual[name] for name in ("sha512", "sha1", "sha256")):
         raise MetadataError("confirmed provider file hashes do not match the instance JAR")
+    kind = value.get("kind")
+    if kind is not None and (not isinstance(kind, str) or not kind):
+        raise MetadataError("provider_match kind must be a non-empty string or null")
+    categories = _string_list(value.get("categories", []), "categories")
+    tags = _string_list(value.get("tags", []), "tags")
     return ProviderMatch(
         str(value["provider"]),
         str(value["project_id"]),
@@ -250,7 +296,16 @@ def confirmed_provider_match(value: object, content: bytes) -> ProviderMatch | N
         actual,
         str(confidence),
         "explicit user confirmation" if confidence == "fuzzy" else "confirmed exact match",
+        kind,
+        categories,
+        tags,
     )
+
+
+def _string_list(value: object, field: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        raise MetadataError(f"provider_match {field} must be an array of non-empty strings")
+    return tuple(dict.fromkeys(value))
 
 
 def _read_json(archive: zipfile.ZipFile, path: str) -> dict[str, Any]:
