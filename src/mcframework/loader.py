@@ -71,6 +71,32 @@ class WorkspaceLoader:
         metadata_files: list[Path] = []
         payload_paths: list[Path] = []
         pending = [root]
+
+        def scan_metadata(directory: Path) -> None:
+            if watch:
+                sources.setdefault(directory, generation(directory))
+                resolved = directory.resolve()
+                sources.setdefault(resolved, generation(resolved))
+            with os.scandir(directory) as metadata_entries:
+                for metadata_entry in metadata_entries:
+                    metadata = Path(metadata_entry.path)
+                    if metadata_entry.is_dir(follow_symlinks=False):
+                        if watch:
+                            sources[metadata] = generation(metadata)
+                            target = metadata.resolve()
+                            sources.setdefault(target, generation(target))
+                        scan_metadata(metadata)
+                    elif (
+                        metadata.suffix in metadata_extensions
+                        and metadata.is_file()
+                        and metadata.name != MARKER_FILE
+                    ):
+                        if watch:
+                            sources[metadata] = generation(metadata)
+                            target = metadata.resolve()
+                            sources.setdefault(target, generation(target))
+                        metadata_files.append(metadata)
+
         while pending:
             directory = pending.pop()
             with os.scandir(directory) as entries:
@@ -83,17 +109,20 @@ class WorkspaceLoader:
                         if watch:
                             target = path.resolve()
                             sources.setdefault(target, generation(target))
-                        for metadata in path.iterdir():
-                            if metadata.suffix not in metadata_extensions:
-                                continue
-                            if not metadata.is_file():
-                                continue
-                            if watch:
-                                sources[metadata] = generation(metadata)
-                                target = metadata.resolve()
-                                sources.setdefault(target, generation(target))
-                            if metadata.name != MARKER_FILE:
-                                metadata_files.append(metadata)
+                        if schema == 2:
+                            scan_metadata(path)
+                        else:
+                            for metadata in path.iterdir():
+                                if metadata.suffix not in metadata_extensions:
+                                    continue
+                                if not metadata.is_file():
+                                    continue
+                                if watch:
+                                    sources[metadata] = generation(metadata)
+                                    target = metadata.resolve()
+                                    sources.setdefault(target, generation(target))
+                                if metadata.name != MARKER_FILE:
+                                    metadata_files.append(metadata)
                     else:
                         payload_paths.append(path)
                         if entry.is_dir(follow_symlinks=False):

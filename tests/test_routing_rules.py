@@ -25,13 +25,13 @@ def test_local_path_requires_source_file():
 
 def test_child_rule_replaces_parent_and_priority_orders():
     parent = routing_rule_from_json(
-        {"type": "routing_rule", "id": "a", "priority": 1}, source="p.json"
+        {"type": "routing_rule", "id": "a", "priority": 1}, source=".pack/p.json"
     )
     child = routing_rule_from_json(
-        {"type": "routing_rule", "id": "a", "priority": 5}, source="c.json"
+        {"type": "routing_rule", "id": "a", "priority": 5}, source=".pack/c.json"
     )
     other = routing_rule_from_json(
-        {"type": "routing_rule", "id": "b", "priority": 3}, source="c.json"
+        {"type": "routing_rule", "id": "b", "priority": 3}, source=".pack/c.json"
     )
     merged = merge_routing_rules((parent,), (child, other))
     assert [r.identity for r in merged] == ["a", "b"]

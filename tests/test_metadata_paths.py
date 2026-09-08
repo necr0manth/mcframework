@@ -10,7 +10,12 @@ from mcframework.artifacts import ArtifactCache, ArtifactRegistry, ArtifactResol
 from mcframework.build import Builder
 from mcframework.errors import MetadataError, UnsafePathError
 from mcframework.loader import WorkspaceLoader
-from mcframework.metadata import JsonMetadataParser, decode_record_paths, encode_record_paths
+from mcframework.metadata import (
+    JsonMetadataParser,
+    decode_record_paths,
+    encode_record_paths,
+    normalize_metadata_destination,
+)
 from mcframework.project import ProjectService
 from mcframework.resolver import Resolver
 
@@ -50,6 +55,42 @@ def test_local_paths_default_to_declaring_file_and_preserve_globs():
     assert encode_record_paths(
         {"type": "remove", "path": "config/a.txt"}, "config/.pack/remove.json", 2
     ) == {"type": "remove", "path": "../a.txt"}
+
+
+def test_local_paths_use_nearest_pack_directory_for_deep_metadata():
+    source = "mods/.pack/groups/optional/mods.json"
+    assert decode_record_paths(
+        {"type": "package", "destination": "example.jar"}, source, 2
+    ) == {"type": "package", "destination": "mods/.pack/example.jar"}
+    assert encode_record_paths(
+        {"type": "package", "destination": "mods/.pack/example.jar"}, source, 2
+    ) == {"type": "package", "destination": "example.jar"}
+    assert decode_record_paths(
+        {"type": "package", "destination": "../example.jar"}, source, 2
+    ) == {"type": "package", "destination": "mods/example.jar"}
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("mods/mods", "mods/.pack/mods.json"),
+        ("mods/mods.json", "mods/.pack/mods.json"),
+        ("mods/.pack/mods", "mods/.pack/mods.json"),
+        ("mods/.pack/mods.json", "mods/.pack/mods.json"),
+        ("ignore", ".pack/ignore.json"),
+        ("config/.pack/nested/remove.meta", "config/.pack/nested/remove.meta"),
+    ],
+)
+def test_metadata_destination_shorthand_preserves_explicit_paths(value: str, expected: str):
+    assert normalize_metadata_destination(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value", ["../mods/mods", "/mods/mods", "C:/mods/mods", r"C:\mods\mods", "mods/.pack"]
+)
+def test_metadata_destination_shorthand_rejects_unsafe_or_directory_paths(value: str):
+    with pytest.raises(UnsafePathError):
+        normalize_metadata_destination(value)
 
 
 @pytest.mark.parametrize("path", ["../../../escape", "/etc/passwd", "C:/mods/a.jar",

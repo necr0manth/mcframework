@@ -50,12 +50,12 @@ def test_schema_controls_nested_metadata_and_payload(tmp_path: Path, schema: int
     nested = root / "mods/.pack/mods.json"
     write_document(nested, {"operations": [{"type": "ignore", "glob": "logs/**"}]})
     control = root / "mods/.pack/cache/internal.json"
-    write_document(control, {"not": "an operation document"})
+    write_document(control, {"operations": [{"type": "ignore", "glob": "cache/**"}]})
     loader = WorkspaceLoader(tmp_path, refresh=refresh)
     layer = loader.load(root)
     expected = [".pack/root.json"]
     if schema == 2:
-        expected.append("mods/.pack/mods.json")
+        expected.extend(["mods/.pack/cache/internal.json", "mods/.pack/mods.json"])
         assert not layer.payload
     else:
         assert layer.payload == {
@@ -64,6 +64,51 @@ def test_schema_controls_nested_metadata_and_payload(tmp_path: Path, schema: int
         }
     assert [item.source for item in layer.producers] == expected
     assert [item.relative_to(root).as_posix() for item in loader.metadata_files(root)] == expected
+
+
+def test_deep_metadata_uses_pack_root_for_local_operation_paths(tmp_path: Path):
+    root = tmp_path / "layer"
+    write_document(root / ".pack/layer.json", {"schema": 2, "id": "layer"})
+    source = root / "mods/.pack/groups/optional/mods.json"
+    write_document(
+        source,
+        {
+            "operations": [
+                {
+                    "type": "package",
+                    "id": "example",
+                    "destination": "example.jar",
+                    "source": {
+                        "provider": "local",
+                        "location": "artifact.jar",
+                        "sha256": "0" * 64,
+                    },
+                }
+            ]
+        },
+    )
+
+    loader = WorkspaceLoader(tmp_path)
+    definition = loader.load(root)
+
+    assert loader.metadata_files(root) == (source,)
+    assert definition.producers[0].operations[0].package.destination == "mods/.pack/example.jar"
+
+
+def test_deep_metadata_refresh_matches_cold_load(tmp_path: Path):
+    root = tmp_path / "layer"
+    write_document(root / ".pack/layer.json", {"schema": 2, "id": "layer"})
+    source = root / "mods/.pack/groups/optional/rules.json"
+    write_document(source, {"operations": []})
+    loader = WorkspaceLoader(tmp_path, refresh=True)
+    loader.load(root)
+
+    write_document(source, {"operations": [{"type": "ignore", "glob": "logs/**"}]})
+
+    assert not loader.fresh()
+    loader.begin()
+    assert loader.load(root) == WorkspaceLoader(tmp_path).load(root)
+    assert loader.fresh()
 
 
 @pytest.mark.parametrize("mutation", ["add_document", "add_directory", "edit", "delete"])

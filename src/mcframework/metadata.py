@@ -10,6 +10,8 @@ from typing import Any, Protocol
 from .errors import MetadataError, UnsafePathError
 from .paths import normalize_relative_path
 
+METADATA_DIRECTORY = ".pack"
+
 
 class MetadataParser(Protocol):
     """Codec boundary for metadata documents.
@@ -71,13 +73,26 @@ def _record_paths(raw: Mapping[str, Any]) -> tuple[tuple[str, ...], ...]:
     return ()
 
 
+def metadata_local_root(source: str) -> str:
+    """Return the nearest ``.pack`` directory that owns a metadata source."""
+    source = normalize_relative_path(source)
+    parts = PurePosixPath(source).parts
+    try:
+        index = len(parts) - 1 - tuple(reversed(parts)).index(METADATA_DIRECTORY)
+    except ValueError as exc:
+        raise MetadataError(
+            f"metadata source is not inside {METADATA_DIRECTORY}: {source!r}"
+        ) from exc
+    return PurePosixPath(*parts[: index + 1]).as_posix()
+
+
 def _local_path(value: Any, source: str) -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise UnsafePathError("path must be a non-empty string without NUL bytes")
     value = value.replace("\\", "/")
     if value.startswith("/") or (len(value) >= 2 and value[1] == ":"):
         raise UnsafePathError(f"absolute path is not allowed: {value!r}")
-    parts = list(PurePosixPath(source).parent.parts)
+    parts = list(PurePosixPath(metadata_local_root(source)).parts)
     for part in value.split("/"):
         if part == "..":
             if not parts:
@@ -116,7 +131,7 @@ def _convert_record_paths(
         else:
             value = _local_path(value, source)
         if encode and mode == "local":
-            value = posixpath.relpath(value, str(PurePosixPath(source).parent))
+            value = posixpath.relpath(value, metadata_local_root(source))
         owner[key] = value
     result.pop("path_mode", None)
     if encode and fields and mode == "layer":
@@ -134,3 +149,16 @@ def encode_record_paths(
 ) -> dict[str, Any]:
     """Encode a canonical record for a shard; schema 1 retains legacy layer paths."""
     return _convert_record_paths(canonical, source, schema, mode, encode=True)
+
+
+def normalize_metadata_destination(value: str) -> str:
+    """Expand a concise metadata filename without weakening path validation."""
+    normalized = normalize_relative_path(value)
+    parts = list(PurePosixPath(normalized).parts)
+    if parts[-1] == METADATA_DIRECTORY:
+        raise UnsafePathError("metadata destination must identify a file")
+    if not PurePosixPath(parts[-1]).suffix:
+        parts[-1] += ".json"
+    if METADATA_DIRECTORY not in parts:
+        parts.insert(len(parts) - 1, METADATA_DIRECTORY)
+    return normalize_relative_path("/".join(parts))

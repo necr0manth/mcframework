@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import PureWindowsPath
 from typing import Any
 
-from .errors import ResolutionError
+from .errors import MetadataError, ResolutionError, UnsafePathError
+from .metadata import metadata_local_root, normalize_metadata_destination
 from .model import frozen_map
 from .paths import matches, normalize_relative_path
 
@@ -79,7 +80,10 @@ class RoutingRule:
             base = self.source_file or declaration_file
             if not base:
                 raise ResolutionError("local routing path requires declaration file")
-            parts = normalize_relative_path(base).split("/")[:-1]
+            try:
+                parts = metadata_local_root(base).split("/")
+            except (MetadataError, UnsafePathError) as exc:
+                raise ResolutionError(str(exc)) from exc
         for part in _relative_components(self.file):
             if part == "..":
                 if not parts:
@@ -87,7 +91,7 @@ class RoutingRule:
                 parts.pop()
             elif part not in {"", "."}:
                 parts.append(part)
-        return normalize_relative_path("/".join(parts))
+        return normalize_metadata_destination(normalize_relative_path("/".join(parts)))
 
     def matches(
         self, operation: Mapping[str, Any], *, context: Mapping[str, Any] | None = None

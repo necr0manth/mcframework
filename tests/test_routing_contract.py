@@ -26,6 +26,14 @@ def test_local_default_uses_actual_rule_file_not_writer_fallback():
     ) == ("mods/.pack/magic.json", None)
 
 
+def test_deep_local_rule_uses_nearest_pack_and_destination_shorthand():
+    entry = rule(source="mods/.pack/groups/optional/rules.json", write={"file": "magic"})
+    assert entry.resolve_file() == "mods/.pack/magic.json"
+    assert rule(
+        write={"file": {"path": "mods/mods", "path_mode": "layer"}}
+    ).resolve_file() == "mods/.pack/mods.json"
+
+
 def test_local_parent_segments_stay_inside_layer():
     assert rule(write={"file": "../../resourcepacks/.pack/packs.json"}).resolve_file() == (
         "resourcepacks/.pack/packs.json"
