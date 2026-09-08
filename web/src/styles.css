@@ -189,12 +189,12 @@ select:focus, input:focus { border-color: #668b43; box-shadow: 0 0 0 2px rgba(16
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .modal-backdrop { position: fixed; inset: 0; z-index: 20; display: grid; place-items: center; padding: 20px; background: rgba(3, 6, 4, .8); backdrop-filter: blur(4px); }
-.modal { width: min(580px, 100%); overflow: hidden; border: 1px solid #3c4941; border-radius: 12px; background: #131915; box-shadow: 0 24px 90px rgba(0,0,0,.55); }
+.modal { width: min(580px, 100%); max-height: calc(100dvh - 40px); display: flex; flex-direction: column; overflow: hidden; border: 1px solid #3c4941; border-radius: 12px; background: #131915; box-shadow: 0 24px 90px rgba(0,0,0,.55); }
 .modal.compact { width: min(440px, 100%); }
 .modal > header { display: flex; justify-content: space-between; align-items: flex-start; padding: 19px 20px 14px; border-bottom: 1px solid var(--line); }
 .modal h2 { margin: 0; font-size: 19px; letter-spacing: -.03em; }
 .modal header button { border: 0; background: transparent; color: #7f8a83; font-size: 22px; }
-.modal-body { display: grid; gap: 15px; padding: 18px 20px; }
+.modal-body { min-height: 0; display: grid; gap: 15px; overflow-y: auto; padding: 18px 20px; }
 .modal-body > p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.55; }
 .modal-body em { color: #68736c; font-style: normal; font-weight: 400; text-transform: none; }
 .modal fieldset { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0; border: 0; padding: 0; }
@@ -303,8 +303,9 @@ select:focus, input:focus { border-color: #668b43; box-shadow: 0 0 0 2px rgba(16
 .routing-toolbar { display: flex; align-items: end; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
 .routing-rule-editor, .routing-fields { display: grid; gap: 12px; }
 .routing-rule-editor label, .routing-fields label { display: grid; gap: 6px; }
+.routing-rule-editor label > small, .routing-fields label > small { color: var(--muted); font-size: 8px; line-height: 1.45; }
 .routing-rule-editor input, .routing-rule-editor select, .routing-rule-editor textarea,
-.routing-fields input { width: 100%; min-width: 0; padding: 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface, #fff); color: inherit; }
+.routing-fields input { width: 100%; min-width: 0; padding: 9px; border: 1px solid var(--line); border-radius: 6px; background: #161d18; color: var(--text); }
 .routing-rule-editor .choice { display: flex; }
 .routing-rule-editor input[type=checkbox] { width: auto; }
 .routing-rule-editor pre, .routing-fields pre { max-height: 250px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
