@@ -762,6 +762,29 @@ def test_warm_delta_detail_preserves_delta_id_collision_rejection(
         service.delta_detail("dev", delta_id)
 
 
+def test_warm_delta_detail_rejects_delta_id_collision_added_after_snapshot(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer_factory("client", operations=[])
+    game = game_path(tmp_path)
+    game.mkdir(parents=True)
+    (game / "selected.txt").write_text("selected")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+    snapshot = service.explorer_snapshot("dev")
+    delta_id = str(snapshot.entries["selected.txt"]["delta_id"])
+    original_delta_id = service._delta_id
+
+    (game / "collision.txt").write_text("collision")
+
+    def collide(path: str) -> str:
+        return delta_id if path == "collision.txt" else original_delta_id(path)
+
+    monkeypatch.setattr(service, "_delta_id", collide)
+    with pytest.raises(MetadataError, match="does not exist"):
+        service.delta_detail("dev", delta_id)
+
+
 def test_stale_folder_sha_rejects_before_any_write(layer_factory, tmp_path: Path) -> None:
     layer_factory("client", operations=[])
     game = game_path(tmp_path)

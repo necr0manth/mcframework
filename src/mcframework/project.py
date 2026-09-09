@@ -2297,6 +2297,7 @@ class ProjectService:
             or snapshot.scan.root != context.instance.path.resolve()
             or snapshot.context_fingerprint != self._context_fingerprint(context)
             or not self._snapshot_auto_payload_epochs_match(snapshot)
+            or not scan_generation_matches(snapshot.scan, set(context.files))
         ):
             return None
         matches_id = [
