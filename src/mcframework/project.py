@@ -59,6 +59,7 @@ from .operations import (
     operation_to_json,
 )
 from .package_inspect import (
+    CurseForgeFingerprintRunner,
     ProviderMatch,
     ProviderMatcher,
     confirmed_provider_match,
@@ -150,7 +151,15 @@ class ProjectService:
     ):
         self.project = Path(project or Path.cwd()).resolve()
         self.state = LocalState(self.project)
-        self.provider_matcher = provider_matcher or default_provider_matcher()
+        if provider_matcher is None:
+            fingerprint_runner = CurseForgeFingerprintRunner()
+            self._fingerprint_runner: CurseForgeFingerprintRunner | None = fingerprint_runner
+            self.provider_matcher = default_provider_matcher(
+                fingerprinter=fingerprint_runner
+            )
+        else:
+            self._fingerprint_runner = None
+            self.provider_matcher = provider_matcher
         self.metadata: MetadataParser = metadata_parser or JsonMetadataParser()
         self._provider_matches: dict[str, _ProviderLookup] = {}
         self._provider_prefetches: set[_PackagePrefetch] = set()
@@ -164,6 +173,19 @@ class ProjectService:
         self._explorer_snapshots: dict[str, ExplorerSnapshot] = {}
         self._context_lock = threading.RLock()
         self._contexts: dict[str, _ContextCache] = {}
+        self._close_lock = threading.Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        with self._close_lock:
+            with self._provider_lock:
+                if self._closed:
+                    return
+                self._closed = True
+            self._provider_prefetch_executor.shutdown(wait=True, cancel_futures=True)
+            self._provider_executor.shutdown(wait=True, cancel_futures=True)
+            if self._fingerprint_runner is not None:
+                self._fingerprint_runner.close()
 
     def _loader(self, *, refresh: bool = False) -> WorkspaceLoader:
         return WorkspaceLoader(self.project, refresh=refresh, parser=self.metadata)
@@ -1947,14 +1969,16 @@ class ProjectService:
         self, instance: str, hints: tuple[_PackagePrefetch, ...]
     ) -> None:
         with self._provider_lock:
+            if self._closed:
+                return
             pending = tuple(hint for hint in hints if hint not in self._provider_prefetches)
             if not pending:
                 return
             self._provider_prefetches.update(pending)
-        future = self._provider_prefetch_executor.submit(
-            self._prefetch_package_paths, instance, pending
-        )
-        future.add_done_callback(partial(self._finish_package_prefetch, pending))
+            future = self._provider_prefetch_executor.submit(
+                self._prefetch_package_paths, instance, pending
+            )
+            future.add_done_callback(partial(self._finish_package_prefetch, pending))
 
     def _finish_package_prefetch(
         self,
@@ -2040,6 +2064,8 @@ class ProjectService:
             return "ready", [local]
         digest = str(local["hashes"]["sha512"])  # type: ignore[index]
         with self._provider_lock:
+            if self._closed:
+                raise RuntimeError("ProjectService is closed")
             lookup = self._provider_matches.get(digest)
             if lookup is None:
                 lookup = _ProviderLookup()

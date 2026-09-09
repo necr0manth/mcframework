@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import os
+import threading
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from collections.abc import Iterable
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Iterable
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -282,6 +284,42 @@ def curseforge_fingerprint(content: bytes) -> int:
     return value & 0xFFFFFFFF
 
 
+class CurseForgeFingerprintRunner:
+    """Run bounded CurseForge fingerprints outside the service process."""
+
+    def __init__(self) -> None:
+        self._executor: ProcessPoolExecutor | None = None
+        self._lock = threading.Lock()
+        self._slots = threading.BoundedSemaphore(2)
+        self._closed = False
+
+    def __call__(self, content: bytes) -> int:
+        self._slots.acquire()
+        try:
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("CurseForge fingerprint runner is closed")
+                if self._executor is None:
+                    self._executor = ProcessPoolExecutor(
+                        max_workers=1,
+                        mp_context=multiprocessing.get_context("spawn"),
+                    )
+                future = self._executor.submit(curseforge_fingerprint, content)
+            return future.result()
+        finally:
+            self._slots.release()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            executor = self._executor
+            self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+
 def _usable_download_url(value: object) -> str | None:
     if not isinstance(value, str):
         return None
@@ -296,9 +334,16 @@ class CurseForgeFingerprintMatcher:
     provider = "curseforge"
     download_endpoint = "https://api.curseforge.com/v1/mods/{mod_id}/files/{file_id}/download-url"
 
-    def __init__(self, api_key: str, timeout: float = 10.0):
+    def __init__(
+        self,
+        api_key: str,
+        timeout: float = 10.0,
+        *,
+        fingerprinter: Callable[[bytes], int] = curseforge_fingerprint,
+    ):
         self.api_key = api_key
         self.timeout = timeout
+        self.fingerprinter = fingerprinter
 
     def lookup(self, fingerprint: int) -> dict[str, Any] | None:
         data = json.dumps({"fingerprints": [fingerprint]}).encode()
@@ -331,7 +376,7 @@ class CurseForgeFingerprintMatcher:
     def match(self, content: bytes) -> ProviderMatch | None:
         if not self.api_key.strip():
             return None
-        fingerprint = curseforge_fingerprint(content)
+        fingerprint = self.fingerprinter(content)
         raw = self.lookup(fingerprint)
         data = raw.get("data") if isinstance(raw, dict) else None
         matches = data.get("exactMatches") if isinstance(data, dict) else None
@@ -448,11 +493,13 @@ class CompositeProviderMatcher:
         return None
 
 
-def default_provider_matcher() -> ProviderMatcher:
+def default_provider_matcher(
+    *, fingerprinter: Callable[[bytes], int] = curseforge_fingerprint
+) -> ProviderMatcher:
     matchers: list[ProviderMatcher] = [ModrinthMatcher()]
     api_key = os.environ.get("CURSEFORGE_API_KEY", "").strip()
     if api_key:
-        matchers.append(CurseForgeFingerprintMatcher(api_key))
+        matchers.append(CurseForgeFingerprintMatcher(api_key, fingerprinter=fingerprinter))
     return CompositeProviderMatcher(matchers)
 
 

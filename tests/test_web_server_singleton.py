@@ -257,6 +257,34 @@ def test_project_web_lock_is_nonblocking_and_reports_open_failure(
         state.probe_web_server_lock()
 
 
+def test_timed_path_lock_does_not_unlock_after_failed_acquire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = LocalState(tmp_path)
+    unlocks = 0
+
+    def contended(handle: object) -> None:
+        del handle
+        raise BlockingIOError(13, "held")
+
+    def unlock(handle: object) -> None:
+        del handle
+        nonlocal unlocks
+        unlocks += 1
+
+    monkeypatch.setattr(local_state_module, "_lock_file", contended)
+    monkeypatch.setattr(local_state_module, "_unlock_file", unlock)
+    path = state.root / "timed.lock"
+    path.parent.mkdir(parents=True)
+    with (
+        pytest.raises(MetadataError, match="timed out waiting"),
+        state._path_lock(path, timeout=0),
+    ):
+        pass
+    assert unlocks == 0
+    path.unlink()
+
+
 def test_start_rejects_project_lock_contention_before_reservation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -553,3 +581,30 @@ def test_constructor_failure_after_bind_closes_socket(
     with pytest.raises(MetadataError, match="injected constructor failure"):
         web_server.McpackServer(tmp_path, "first", reservation["nonce"])
     assert events == ["bind", "close"]
+
+
+def test_server_close_closes_only_its_owned_service_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = LocalState(tmp_path)
+    reservation = state.reserve_web("first")
+    closes = 0
+
+    class FakeService:
+        def __init__(self, project: Path):
+            del project
+
+        def close(self) -> None:
+            nonlocal closes
+            closes += 1
+
+    class Replacement:
+        def close(self) -> None:
+            raise AssertionError("server must not close an injected replacement service")
+
+    monkeypatch.setattr(web_server, "ProjectService", FakeService)
+    server = web_server.McpackServer(tmp_path, "first", reservation["nonce"])
+    server.service = Replacement()  # type: ignore[assignment]
+    server.server_close()
+    server.server_close()
+    assert closes == 1

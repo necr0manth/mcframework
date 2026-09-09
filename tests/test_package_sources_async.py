@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import sys
 import threading
 import time
 import urllib.error
@@ -12,11 +14,14 @@ from pathlib import Path
 
 import pytest
 
+import mcframework.package_inspect as package_inspect_module
 import mcframework.project as project_module
 from mcframework.errors import MetadataError
+from mcframework.local_state import LocalState
 from mcframework.package_inspect import (
     CompositeProviderMatcher,
     CurseForgeFingerprintMatcher,
+    CurseForgeFingerprintRunner,
     ModrinthMatcher,
     ProviderMatch,
     curseforge_fingerprint,
@@ -24,6 +29,7 @@ from mcframework.package_inspect import (
     file_hashes,
 )
 from mcframework.project import ProjectService
+from mcframework.web_server import McpackServer
 
 
 class NoMatch:
@@ -116,6 +122,120 @@ def test_curseforge_fingerprint_filters_whitespace_and_is_unsigned() -> None:
     assert curseforge_fingerprint(b"abc") == 0x60A4FCC1
 
 
+def test_curseforge_fingerprint_runner_is_exact_isolated_and_keeps_http_in_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = b"package bytes"
+    parent_pid = os.getpid()
+    http_pids: list[int] = []
+
+    def urlopen(request: urllib.request.Request, timeout: float):
+        del request, timeout
+        http_pids.append(os.getpid())
+        return io.BytesIO(
+            json.dumps(cf_response(content, download_url="https://cdn/x.jar")).encode()
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    runner = CurseForgeFingerprintRunner()
+    processes: tuple[object, ...] = ()
+    try:
+        assert runner(content) == curseforge_fingerprint(content)
+        match = CurseForgeFingerprintMatcher(
+            "secret", fingerprinter=runner
+        ).match(content)
+        assert match is not None and match.provider == "curseforge"
+        executor = runner._executor
+        assert executor is not None
+        assert executor._processes  # type: ignore[attr-defined]
+        processes = tuple(executor._processes.values())  # type: ignore[attr-defined]
+        assert parent_pid not in executor._processes  # type: ignore[attr-defined]
+        assert http_pids == [parent_pid]
+    finally:
+        runner.close()
+        runner.close()
+    assert all(not process.is_alive() for process in processes)  # type: ignore[attr-defined]
+
+
+def test_curseforge_fingerprint_runner_bounds_outstanding_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    submitted: list[tuple[object, bytes, object]] = []
+    lock = threading.Lock()
+    shutdowns = 0
+
+    class FakePool:
+        def __init__(self, *, max_workers: int, mp_context: object):
+            assert max_workers == 1
+            assert mp_context.get_start_method() == "spawn"  # type: ignore[attr-defined]
+
+        def submit(self, function, content: bytes):
+            from concurrent.futures import Future
+
+            future: Future[int] = Future()
+            with lock:
+                submitted.append((function, content, future))
+            return future
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            nonlocal shutdowns
+            assert wait and cancel_futures
+            shutdowns += 1
+
+    monkeypatch.setattr(package_inspect_module, "ProcessPoolExecutor", FakePool)
+    runner = CurseForgeFingerprintRunner()
+    contents = [bytes([index]) * 100 for index in range(4)]
+    with package_inspect_module.ThreadPoolExecutor(max_workers=4) as pool:
+        results = [pool.submit(runner, content) for content in contents]
+        deadline = time.monotonic() + 2
+        while len(submitted) < 2 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert len(submitted) == 2
+        time.sleep(0.05)
+        assert len(submitted) == 2
+        completed = 0
+        while completed < len(contents):
+            deadline = time.monotonic() + 2
+            while len(submitted) <= completed and time.monotonic() < deadline:
+                time.sleep(0.001)
+            function, content, future = submitted[completed]
+            assert function is curseforge_fingerprint
+            future.set_result(curseforge_fingerprint(content))
+            completed += 1
+        assert [future.result() for future in results] == [
+            curseforge_fingerprint(content) for content in contents
+        ]
+    runner.close()
+    runner.close()
+    assert shutdowns == 1
+
+
+def test_composite_starts_modrinth_and_curseforge_in_parallel() -> None:
+    started = {"modrinth": threading.Event(), "curseforge": threading.Event()}
+    release = threading.Event()
+
+    class BlockingMatcher:
+        def __init__(self, provider: str):
+            self.provider = provider
+
+        def match(self, content: bytes) -> None:
+            del content
+            started[self.provider].set()
+            assert release.wait(2)
+
+    matcher = CompositeProviderMatcher(
+        [BlockingMatcher("modrinth"), BlockingMatcher("curseforge")]
+    )
+    with package_inspect_module.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(matcher.match_all, b"content")
+        try:
+            assert started["modrinth"].wait(1)
+            assert started["curseforge"].wait(1)
+        finally:
+            release.set()
+        assert future.result() == ()
+
+
 def test_curseforge_matcher_requires_key_and_exact_hash(monkeypatch: pytest.MonkeyPatch) -> None:
     content = b"package bytes"
     calls: list[urllib.request.Request] = []
@@ -192,6 +312,233 @@ def test_default_matcher_enables_curseforge_only_with_environment_key(
         "modrinth",
         "curseforge",
     ]
+
+
+def test_project_service_owns_fingerprint_runner_only_for_default_matcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created: list[object] = []
+    closed: list[object] = []
+
+    class FakeRunner:
+        def __init__(self) -> None:
+            created.append(self)
+
+        def __call__(self, content: bytes) -> int:
+            return curseforge_fingerprint(content)
+
+        def close(self) -> None:
+            closed.append(self)
+
+    monkeypatch.setattr(project_module, "CurseForgeFingerprintRunner", FakeRunner)
+    default = ProjectService(tmp_path / "default")
+    custom = ProjectService(tmp_path / "custom", provider_matcher=NoMatch())
+    assert len(created) == 1
+    default.close()
+    default.close()
+    custom.close()
+    assert closed == created
+
+
+def test_project_close_cannot_overtake_provider_submit(
+    tmp_path: Path,
+) -> None:
+    from concurrent.futures import Future
+
+    service = ProjectService(tmp_path, provider_matcher=NoMatch())
+    service._provider_prefetch_executor.shutdown()
+    service._provider_executor.shutdown()
+    submit_entered = threading.Event()
+    release_submit = threading.Event()
+    close_done = threading.Event()
+    events: list[str] = []
+
+    class PrefetchExecutor:
+        def submit(self, *args: object, **kwargs: object) -> Future[None]:
+            del args, kwargs
+            raise AssertionError("closed service must not submit prefetch work")
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            assert wait and cancel_futures
+            events.append("prefetch-shutdown")
+
+    class ProviderExecutor:
+        def submit(self, *args: object, **kwargs: object) -> Future[tuple[ProviderMatch, ...]]:
+            del args, kwargs
+            submit_entered.set()
+            assert release_submit.wait(2)
+            assert "provider-shutdown" not in events
+            future: Future[tuple[ProviderMatch, ...]] = Future()
+            future.set_result(())
+            return future
+
+        def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
+            assert wait and cancel_futures
+            events.append("provider-shutdown")
+
+    service._provider_prefetch_executor = PrefetchExecutor()  # type: ignore[assignment]
+    service._provider_executor = ProviderExecutor()  # type: ignore[assignment]
+    lookup = threading.Thread(target=service._provider_enrichment, args=(b"content", "1"))
+    lookup.start()
+    assert submit_entered.wait(1)
+
+    def close() -> None:
+        service.close()
+        close_done.set()
+
+    closer = threading.Thread(target=close)
+    closer.start()
+    try:
+        assert not close_done.wait(0.1)
+        assert events == []
+    finally:
+        release_submit.set()
+    lookup.join(timeout=2)
+    closer.join(timeout=2)
+    assert close_done.is_set()
+    assert events == ["prefetch-shutdown", "provider-shutdown"]
+    with pytest.raises(RuntimeError, match="ProjectService is closed"):
+        service._provider_enrichment(b"other", "1")
+    hint = project_module._PackagePrefetch(tmp_path, "x.jar", ("file", 0, 0, 0), False, "mod")
+    service._schedule_package_prefetch("dev", (hint,))
+
+
+def test_routing_http_stays_responsive_while_large_fingerprints_run(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer_factory("client", operations=[])
+    game = tmp_path.parent / f"{tmp_path.name}-game"
+    game.mkdir()
+    setup = ProjectService(tmp_path, provider_matcher=NoMatch())
+    setup.link("client", "dev", game)
+    setup.close()
+    monkeypatch.setenv("CURSEFORGE_API_KEY", "dummy-test-key")
+    reservation = LocalState(tmp_path).reserve_web("dev")
+    server = McpackServer(tmp_path, "dev", reservation["nonce"])
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    service = server.service
+    composite = service.provider_matcher
+    modrinth, curseforge = composite.matchers  # type: ignore[attr-defined]
+    monkeypatch.setattr(modrinth, "match", lambda content: None)
+    lookup_pids: list[int] = []
+
+    def no_curseforge_match(fingerprint: int) -> dict[str, object]:
+        del fingerprint
+        lookup_pids.append(os.getpid())
+        return {"data": {"exactMatches": []}}
+
+    monkeypatch.setattr(curseforge, "lookup", no_curseforge_match)
+    original_fingerprinter = curseforge.fingerprinter
+    fingerprint_started = threading.Event()
+
+    def signaling_fingerprinter(content: bytes) -> int:
+        fingerprint_started.set()
+        return original_fingerprinter(content)
+
+    monkeypatch.setattr(curseforge, "fingerprinter", signaling_fingerprinter)
+    content = bytes(range(256)) * 49152 + b"\x01"
+    previous_interval = sys.getswitchinterval()
+    processes: tuple[object, ...] = ()
+    handler_release = threading.Event()
+    request = urllib.request.Request(
+        f"http://{server.expected_host}/api/v1/routing?target_layer=client",
+        headers={"Cookie": f"mcpack_session={server.browser_session}"},
+    )
+    try:
+        sys.setswitchinterval(5.0)
+        foreground_entered = threading.Event()
+        foreground_done = threading.Event()
+        foreground_errors: list[BaseException] = []
+        original_routing = service.routing_options
+
+        def gated_routing(*args: object, **kwargs: object) -> dict[str, object]:
+            foreground_entered.set()
+            assert fingerprint_started.wait(3)
+            return original_routing(*args, **kwargs)
+
+        monkeypatch.setattr(service, "routing_options", gated_routing)
+
+        def request_foreground() -> None:
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    assert response.status == 200
+                    assert json.load(response)["revision"] == 0
+            except BaseException as error:
+                foreground_errors.append(error)
+            finally:
+                foreground_done.set()
+
+        foreground = threading.Thread(target=request_foreground)
+        foreground.start()
+        assert foreground_entered.wait(1)
+        started = time.perf_counter()
+        assert service._provider_enrichment(content, "1")[0] == "pending"
+        assert fingerprint_started.wait(3)
+        assert foreground_done.wait(3)
+        elapsed = time.perf_counter() - started
+        foreground.join(timeout=1)
+        assert foreground_errors == []
+        assert elapsed < 1.0
+
+        runner = service._fingerprint_runner
+        assert runner is not None
+        deadline = time.monotonic() + 3
+        while runner._executor is None and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert runner._executor is not None
+        deadline = time.monotonic() + 3
+        while not runner._executor._processes and time.monotonic() < deadline:  # type: ignore[attr-defined]
+            time.sleep(0.001)
+        processes = tuple(runner._executor._processes.values())  # type: ignore[attr-defined]
+        assert processes
+
+        handler_entered = threading.Event()
+        handler_done = threading.Event()
+        close_done = threading.Event()
+
+        def blocked_routing(*args: object, **kwargs: object) -> dict[str, object]:
+            handler_entered.set()
+            assert handler_release.wait(3)
+            return original_routing(*args, **kwargs)
+
+        monkeypatch.setattr(service, "routing_options", blocked_routing)
+
+        def request_routing() -> None:
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    assert response.status == 200
+            finally:
+                handler_done.set()
+
+        handler = threading.Thread(target=request_routing)
+        handler.start()
+        assert handler_entered.wait(1)
+        server.shutdown()
+        thread.join(timeout=3)
+
+        def close_server() -> None:
+            server.server_close()
+            close_done.set()
+
+        closer = threading.Thread(target=close_server)
+        closer.start()
+        assert not close_done.wait(0.1)
+        assert any(process.is_alive() for process in processes)  # type: ignore[attr-defined]
+        handler_release.set()
+        handler.join(timeout=5)
+        closer.join(timeout=8)
+        assert handler_done.is_set()
+        assert close_done.is_set()
+    finally:
+        handler_release.set()
+        sys.setswitchinterval(previous_interval)
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+    assert lookup_pids == [os.getpid()]
+    assert all(lookup.status == "ready" for lookup in service._provider_matches.values())
+    assert all(not process.is_alive() for process in processes)  # type: ignore[attr-defined]
 
 
 def test_default_matcher_all_provider_failures_reach_retry(

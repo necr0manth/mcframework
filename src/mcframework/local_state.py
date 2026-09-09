@@ -199,10 +199,12 @@ class LocalState:
     def _path_lock(self, path: Path, timeout: float) -> Iterator[None]:
         handle = path.open("a+b")
         deadline = time.monotonic() + timeout
+        acquired = False
         try:
             while True:
                 try:
                     _lock_file(handle)
+                    acquired = True
                     break
                 except OSError:
                     if time.monotonic() >= deadline:
@@ -211,7 +213,8 @@ class LocalState:
             yield
         finally:
             try:
-                _unlock_file(handle)
+                if acquired:
+                    _unlock_file(handle)
             finally:
                 handle.close()
 

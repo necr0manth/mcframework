@@ -23,9 +23,10 @@ from .transport import LocalFilesystemInstance
 
 
 class McpackServer(ThreadingHTTPServer):
-    daemon_threads = True
+    daemon_threads = False
 
     def __init__(self, project: Path, instance: str, nonce: str):
+        self._owned_service: ProjectService | None = None
         self.project = project
         self.instance = instance
         self.nonce = nonce
@@ -38,6 +39,7 @@ class McpackServer(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", 0), Handler)
         try:
             self.service = ProjectService(project)
+            self._owned_service = self.service
             self.management_token = str(reservation["management_token"])
             self.browser_capability: str | None = str(reservation["browser_capability"])
             self.browser_session = secrets.token_urlsafe(32)
@@ -69,6 +71,15 @@ class McpackServer(ThreadingHTTPServer):
         except Exception:
             self.server_close()
             raise
+
+    def server_close(self) -> None:
+        service = self._owned_service
+        self._owned_service = None
+        try:
+            super().server_close()
+        finally:
+            if service is not None:
+                service.close()
 
     def bootstrap(self) -> dict[str, object]:
         result = self.service.bootstrap(self.instance, include_delta=False)
