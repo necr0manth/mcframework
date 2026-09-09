@@ -117,8 +117,10 @@ export function applyExplorerCapturePatch(state, patch, mode = 'all') {
  * @property {string[]} capture_modes
  * @property {string} [expected_sha256]
  * @property {boolean} [expected_absent]
+ * @property {string} [expected_kind]
+ * @property {string} [expected_status]
  *
- * @typedef {{ mode: string, provider_match?: Record<string, unknown> } & (
+ * @typedef {{ mode: string, provider_match?: Record<string, unknown>, expected_kind?: string, expected_status?: string } & (
  *   { expected_sha256: string, expected_absent?: never } |
  *   { expected_absent: true, expected_sha256?: never }
  * )} CaptureDecision
@@ -146,6 +148,12 @@ export function decisionsForPlan(items, choices) {
     decisions[item.id] = {
       mode,
       ...(hasHash ? { expected_sha256: item.expected_sha256 } : { expected_absent: true }),
+      ...(typeof item.expected_kind === 'string' && item.expected_kind
+        ? { expected_kind: item.expected_kind }
+        : {}),
+      ...(typeof item.expected_status === 'string' && item.expected_status
+        ? { expected_status: item.expected_status }
+        : {}),
     };
     if (mode === 'package' && choice?.provider_match) {
       if (choice.provider_match.confidence === 'fuzzy' && !choice.fuzzyConfirmed) {

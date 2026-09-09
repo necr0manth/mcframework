@@ -4,7 +4,7 @@ import FileExplorer from './FileExplorer.js';
 import { RoutingRuleEditor, WriteDestination } from './RoutingControls.js';
 import type { MetadataWrite } from './RoutingControls.js';
 import { captureCreatesMetadata, captureRoutingOperation, packageOwnedBy } from './routing-model.js';
-import { candidateKey, semanticCaptureAction } from './semantic-import.js';
+import { candidateKey, defaultProviderKey, orderedProviderCandidates, providerLookupPending, semanticCaptureAction, semanticItemReady } from './semantic-import.js';
 import { allMembersActive, buildMetadataTree, canImportDelta, deltaPresentation, featureSidebarSummary, packageActivationTarget, paginateDelta } from './view-model.js';
 
 type View = 'pack' | 'delta' | 'files';
@@ -40,7 +40,7 @@ type ProviderCandidate = {
   provider: string;
   project_id: string;
   version_id: string;
-  version: string;
+  version: string | null;
   download_url: string;
   confidence: 'exact' | 'fuzzy' | string;
   reason: string;
@@ -63,11 +63,13 @@ type DeltaItem = {
   actual_version: string;
   editable: boolean;
   enriched: boolean;
+  provider_lookup?: 'pending' | 'ready' | 'failed';
+  proposed_package_kind?: 'mod' | 'resourcepack' | 'shaderpack' | 'datapack';
   capture_modes: string[];
   reason: string;
   desired_sha256?: string;
   actual_sha256?: string;
-  jar_metadata: {
+  jar_metadata?: {
     loader: string;
     mod_ids: string[];
     name: string;
@@ -113,6 +115,8 @@ type CaptureDraft = {
   mode: 'capture' | 'import';
   providerKey: string;
   fuzzyConfirmed: boolean;
+  sourceTouched: boolean;
+  modeTouched: boolean;
   metadataWrite?: MetadataWrite;
 };
 
@@ -164,6 +168,7 @@ export default function App() {
   } | null>(null);
   const [captureDraft, setCaptureDraft] = useState<CaptureDraft | null>(null);
   const [captureError, setCaptureError] = useState('');
+  const [capturePollError, setCapturePollError] = useState('');
   const [detailBusy, setDetailBusy] = useState('');
   const [featureDialog, setFeatureDialog] = useState(false);
   const [featureChoice, setFeatureChoice] = useState('');
@@ -209,6 +214,14 @@ export default function App() {
     }).catch((reason: Error) => live && setError(reason.message));
     return () => { live = false; };
   }, []);
+
+  useEffect(() => () => { detailKey.current = ''; }, []);
+
+  useEffect(() => {
+    detailKey.current = '';
+    setDetailBusy('');
+    setCaptureDraft((current) => current && current.revision !== data?.revision ? null : current);
+  }, [data?.revision]);
 
   useEffect(() => {
     if (view !== 'delta' || !data || data.delta.loaded) return;
@@ -349,6 +362,7 @@ export default function App() {
     detailKey.current = requestKey;
     setDetailBusy(requestKey);
     setCaptureError('');
+    setCapturePollError('');
     setCaptureDraft({
       item,
       revision,
@@ -356,38 +370,16 @@ export default function App() {
       mode: canImport ? 'import' : 'capture',
       providerKey: 'local',
       fuzzyConfirmed: false,
+      sourceTouched: false,
+      modeTouched: false,
     });
     try {
       const detail = await detailLoader.load(requestKey, item.id, revision) as {
         revision: number;
         item: DeltaItem;
       };
-      if (
-        detailKey.current !== requestKey
-        || detail.revision !== revision
-        || client.revision !== revision
-      ) return;
-      setData((current) => {
-        if (current?.revision !== revision) return current;
-        return {
-          ...current,
-          delta: {
-            ...current.delta,
-            items: current.delta.items.map((entry) =>
-              entry.id === item.id ? detail.item : entry
-            ),
-          },
-        };
-      });
-      setCaptureDraft((current) => {
-        if (current?.revision !== revision || current.item.id !== item.id) return current;
-        const detailCanImport = canImportDelta(detail.item) && data.capabilities.package_import;
-        return {
-          ...current,
-          item: detail.item,
-          mode: detailCanImport ? 'import' : 'capture',
-        };
-      });
+      if (!applyCaptureDetail(requestKey, revision, detail)) return;
+      if (providerLookupPending(detail.item)) void pollCaptureDetail(requestKey, item.id, revision);
     } catch (reason) {
       if (reason instanceof ApiError && reason.code === 'revision_conflict') {
         if (detailKey.current === requestKey) closeCapture();
@@ -395,11 +387,93 @@ export default function App() {
         return;
       }
       if (detailKey.current === requestKey && client.revision === revision) {
-        setCaptureError(reason instanceof Error ? reason.message : 'Could not inspect this item');
+        setCapturePollError(reason instanceof Error ? reason.message : 'Could not inspect this item');
       }
     } finally {
       setDetailBusy((current) => current === requestKey ? '' : current);
     }
+  }
+
+  function applyCaptureDetail(
+    requestKey: string,
+    revision: number,
+    detail: { revision: number; item: DeltaItem },
+  ) {
+    if (
+      detailKey.current !== requestKey
+      || detail.revision !== revision
+      || client.revision !== revision
+    ) return false;
+    setData((current) => {
+      if (current?.revision !== revision) return current;
+      return {
+        ...current,
+        delta: {
+          ...current.delta,
+          items: current.delta.items.map((entry) =>
+            entry.id === detail.item.id ? detail.item : entry
+          ),
+        },
+      };
+    });
+    setCaptureDraft((current) => {
+      if (current?.revision !== revision || current.item.id !== detail.item.id) return current;
+      const detailCanImport = canImportDelta(detail.item) && data?.capabilities.package_import;
+      const selected = current.item.provider_candidates.find(
+        (candidate) => candidateKey(candidate) === current.providerKey,
+      );
+      const selectedStillPresent = detail.item.provider_candidates.some(
+        (candidate) => candidateKey(candidate) === current.providerKey,
+      );
+      const nextItem = current.sourceTouched && selected && !selectedStillPresent
+        ? { ...detail.item, provider_candidates: [...detail.item.provider_candidates, selected] }
+        : detail.item;
+      return {
+        ...current,
+        item: nextItem,
+        mode: current.modeTouched ? current.mode : detailCanImport ? 'import' : 'capture',
+        providerKey: current.sourceTouched ? current.providerKey : defaultProviderKey(detail.item),
+      };
+    });
+    return true;
+  }
+
+  async function pollCaptureDetail(requestKey: string, id: string, revision: number) {
+    while (detailKey.current === requestKey && client.revision === revision) {
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+      if (detailKey.current !== requestKey || client.revision !== revision) return;
+      try {
+        detailLoader.invalidate(requestKey);
+        const detail = await detailLoader.load(requestKey, id, revision) as {
+          revision: number;
+          item: DeltaItem;
+        };
+        if (!applyCaptureDetail(requestKey, revision, detail)) return;
+        if (!providerLookupPending(detail.item)) return;
+      } catch (reason) {
+        if (reason instanceof ApiError && reason.code === 'revision_conflict') {
+          if (detailKey.current === requestKey) closeCapture();
+          await refreshAfterConflict(reason);
+          return;
+        }
+        if (detailKey.current === requestKey) {
+          setCapturePollError(reason instanceof Error ? reason.message : 'Could not refresh package sources');
+        }
+        return;
+      }
+    }
+  }
+
+  function retryCaptureSources() {
+    if (!captureDraft) return;
+    setCapturePollError('');
+    if (!providerLookupPending(captureDraft.item)) {
+      void openCapture(captureDraft.item, captureDraft.revision);
+      return;
+    }
+    const requestKey = `${captureDraft.revision}:${captureDraft.item.id}`;
+    detailKey.current = requestKey;
+    void pollCaptureDetail(requestKey, captureDraft.item.id, captureDraft.revision);
   }
 
   function closeCapture() {
@@ -577,7 +651,7 @@ export default function App() {
         </div><footer><button className="secondary" onClick={() => setPackageEdit(null)}>Cancel</button><button className="primary" disabled={!!busy} onClick={() => void submitPackageEdit()}>Apply package change</button></footer>
       </section></div>}
 
-      {captureDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeCapture()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="capture-title"><header><div><p className="eyebrow">Semantic write</p><h2 id="capture-title">{deltaPresentation(captureDraft.item).title}</h2></div><button aria-label="Close" onClick={closeCapture}>×</button></header><div className="modal-body"><p>Only this semantic item will be written. Unrelated instance changes stay untouched.</p><TargetSelect layers={data.writable_layers} value={captureDraft.target} onChange={(target) => setCaptureDraft({ ...captureDraft, target })} />{detailBusy && <div className="inline-error" role="status">Inspecting this file and checking package metadata…</div>}{!detailBusy && canImportDelta(captureDraft.item) && data.capabilities.package_import && <fieldset><legend>Capture mode</legend><label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'import'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'import' })} /><span><strong>Import as package</strong><small>Use verified provider metadata or a local SHA-256 artifact.</small></span></label>{data.capabilities.capture && <label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'capture'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'capture', metadataWrite: undefined })} /><span><strong>Capture as file</strong><small>Preserve the change as a file operation.</small></span></label>}</fieldset>}{!detailBusy && captureDraft.mode === 'import' && <ImportChoices draft={captureDraft} selectedCandidate={selectedCandidate} onChange={setCaptureDraft} />}{captureCreatesMetadata(captureDraft) && <WriteDestination client={client} target={captureDraft.target} operation={captureRoutingOperation(captureDraft)} value={captureDraft.metadataWrite} origin="instance_capture" onChange={(metadataWrite) => setCaptureDraft({ ...captureDraft, metadataWrite })} />}{captureError && <div className="inline-error" role="alert"><span>{captureError}</span>{!captureDraft.item.enriched && <button className="secondary" onClick={() => void openCapture(captureDraft.item, captureDraft.revision)}>Retry</button>}</div>}</div><footer><button className="secondary" onClick={closeCapture}>Cancel</button><button className="primary" disabled={!!detailBusy || !captureDraft.item.enriched} onClick={() => void submitCapture()}>{detailBusy ? 'Inspecting…' : captureDraft.mode === 'import' ? 'Import package' : 'Capture change'}</button></footer></section></div>}
+      {captureDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeCapture()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="capture-title"><header><div><p className="eyebrow">Semantic write</p><h2 id="capture-title">{deltaPresentation(captureDraft.item).title}</h2></div><button aria-label="Close" onClick={closeCapture}>×</button></header><div className="modal-body"><p>Only this semantic item will be written. Unrelated instance changes stay untouched.</p><TargetSelect layers={data.writable_layers} value={captureDraft.target} onChange={(target) => setCaptureDraft({ ...captureDraft, target })} />{detailBusy && <div className="inline-error" role="status">Inspecting this file and checking package metadata…</div>}{providerLookupPending(captureDraft.item) && !capturePollError && <div className="inline-error" role="status">Checking remote package sources… Local artifact remains available.</div>}{captureDraft.item.provider_lookup === 'failed' && <div className="inline-error" role="status">Remote package sources are unavailable. You can still use the local artifact.</div>}{!detailBusy && canImportDelta(captureDraft.item) && data.capabilities.package_import && <fieldset><legend>Capture mode</legend><label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'import'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'import', modeTouched: true })} /><span><strong>Import as package</strong><small>Use verified provider metadata or a local SHA-256 artifact.</small></span></label>{data.capabilities.capture && <label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'capture'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'capture', modeTouched: true, metadataWrite: undefined })} /><span><strong>Capture as file</strong><small>Preserve the change as a file operation.</small></span></label>}</fieldset>}{!detailBusy && captureDraft.mode === 'import' && <ImportChoices draft={captureDraft} selectedCandidate={selectedCandidate} onChange={setCaptureDraft} />}{captureCreatesMetadata(captureDraft) && <WriteDestination client={client} target={captureDraft.target} operation={captureRoutingOperation(captureDraft)} value={captureDraft.metadataWrite} origin="instance_capture" onChange={(metadataWrite) => setCaptureDraft({ ...captureDraft, metadataWrite })} />}{capturePollError && <div className="inline-error" role="alert"><span>{capturePollError}</span><button className="secondary" onClick={retryCaptureSources}>Retry source lookup</button></div>}{captureError && <div className="inline-error" role="alert"><span>{captureError}</span></div>}</div><footer><button className="secondary" onClick={closeCapture}>Cancel</button><button className="primary" disabled={!!detailBusy || !semanticItemReady(captureDraft.item)} onClick={() => void submitCapture()}>{detailBusy ? 'Inspecting…' : captureDraft.mode === 'import' ? 'Import package' : 'Capture change'}</button></footer></section></div>}
 
       {featureDialog && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setFeatureDialog(false)}><section className="modal compact" role="dialog" aria-modal="true" aria-labelledby="feature-title"><header><div><p className="eyebrow">Temporary layer</p><h2 id="feature-title">Add feature</h2></div><button aria-label="Close" onClick={() => setFeatureDialog(false)}>×</button></header><div className="modal-body"><p>The instance will be relinked to a local temporary layer containing this feature.</p><label><span>Feature</span><select value={featureChoice} onChange={(event) => setFeatureChoice(event.target.value)}>{remainingFeatures.map((feature) => <option value={feature} key={feature}>{feature}</option>)}</select></label></div><footer><button className="secondary" onClick={() => setFeatureDialog(false)}>Cancel</button><button className="primary" disabled={!featureChoice} onClick={() => void addFeature()}>Add feature</button></footer></section></div>}
     </div>
@@ -609,10 +683,8 @@ function ImportChoices({ draft, selectedCandidate, onChange }: {
   onChange: (draft: CaptureDraft) => void;
 }) {
   const metadata = draft.item.jar_metadata;
-  const providerCandidates = draft.item.provider_candidates.filter(
-    (candidate) => candidate.provider !== 'local',
-  );
-  return <div className="import-panel">{(metadata.name || metadata.version || metadata.mod_ids.length > 0) && <section className="jar-details"><p className="eyebrow">Parsed JAR metadata</p><strong>{metadata.name || metadata.mod_ids.join(', ') || 'Unknown mod'}</strong><span>{[metadata.version, metadata.loader].filter(Boolean).join(' · ') || 'Version and loader unavailable'}</span>{metadata.mod_ids.length > 0 && <code>{metadata.mod_ids.join(', ')}</code>}{metadata.dependencies.length > 0 && <small>Dependencies: {metadata.dependencies.join(', ')}</small>}</section>}<fieldset className="provider-list"><legend>Artifact source</legend><label className="provider-choice"><input type="radio" name="provider" checked={draft.providerKey === 'local'} onChange={() => onChange({ ...draft, providerKey: 'local', fuzzyConfirmed: false })} /><span><strong>Local artifact</strong><small>Exact SHA-256 fallback{draft.item.actual_sha256 ? ` · ${draft.item.actual_sha256.slice(0, 12)}…` : ''}</small></span><Badge state="exact" /></label>{providerCandidates.map((candidate) => <label className="provider-choice" key={candidateKey(candidate)}><input type="radio" name="provider" checked={draft.providerKey === candidateKey(candidate)} onChange={() => onChange({ ...draft, providerKey: candidateKey(candidate), fuzzyConfirmed: false })} /><span><strong>{candidate.provider} · {candidate.version || candidate.version_id}</strong><small>{candidate.project_id}{candidate.reason ? ` · ${candidate.reason}` : ''}</small></span><Badge state={candidate.confidence} /></label>)}</fieldset>{selectedCandidate?.confidence === 'fuzzy' && <label className="fuzzy-confirm"><input type="checkbox" checked={draft.fuzzyConfirmed} onChange={(event) => onChange({ ...draft, fuzzyConfirmed: event.target.checked })} /><span><strong>Use this fuzzy match</strong><small>I reviewed the project and version identity. This match will not be selected automatically.</small></span></label>}</div>;
+  const providerCandidates = orderedProviderCandidates(draft.item);
+  return <div className="import-panel">{metadata && (metadata.name || metadata.version || metadata.mod_ids.length > 0) && <section className="jar-details"><p className="eyebrow">Parsed package metadata</p><strong>{metadata.name || metadata.mod_ids.join(', ') || 'Unknown package'}</strong><span>{[metadata.version, metadata.loader].filter(Boolean).join(' · ') || 'Version details unavailable'}</span>{metadata.mod_ids.length > 0 && <code>{metadata.mod_ids.join(', ')}</code>}{metadata.dependencies.length > 0 && <small>Dependencies: {metadata.dependencies.join(', ')}</small>}</section>}<fieldset className="provider-list"><legend>Artifact source</legend>{providerCandidates.map((candidate) => <label className="provider-choice" key={candidateKey(candidate)}><input type="radio" name="provider" checked={draft.providerKey === candidateKey(candidate)} onChange={() => onChange({ ...draft, providerKey: candidateKey(candidate), fuzzyConfirmed: false, sourceTouched: true })} /><span><strong>{candidate.provider} · {candidate.version || candidate.version_id}</strong><small>{candidate.project_id}{candidate.reason ? ` · ${candidate.reason}` : ''}</small></span><Badge state={candidate.confidence} /></label>)}<label className="provider-choice"><input type="radio" name="provider" checked={draft.providerKey === 'local'} onChange={() => onChange({ ...draft, providerKey: 'local', fuzzyConfirmed: false, sourceTouched: true })} /><span><strong>Local artifact</strong><small>Exact SHA-256 fallback{draft.item.actual_sha256 ? ` · ${draft.item.actual_sha256.slice(0, 12)}…` : ''}</small></span><Badge state="exact" /></label></fieldset>{selectedCandidate?.confidence === 'fuzzy' && <label className="fuzzy-confirm"><input type="checkbox" checked={draft.fuzzyConfirmed} onChange={(event) => onChange({ ...draft, fuzzyConfirmed: event.target.checked, sourceTouched: true })} /><span><strong>Use this fuzzy match</strong><small>I reviewed the project and version identity. This match will not be selected automatically.</small></span></label>}</div>;
 }
 
 function PackageDetails({ item }: { item: PackageItem }) {

@@ -8,7 +8,18 @@ import {
 } from './file-explorer-model.js';
 import { runAutoCaptureFlow } from './api.js';
 import type { CaptureChoice, CaptureDecisions } from './file-explorer-model.js';
-import { singleFileImportItem } from './semantic-import.js';
+import {
+  candidateKey,
+  defaultPackageChoice,
+  orderedProviderCandidates,
+  packagePlanItems,
+  packageProviderLookupPending,
+  preferredFolderChoices,
+  preferredProviderSelectable,
+  previousFolderWizardState,
+  reconcileFolderChoices,
+  singleFileImportItem,
+} from './semantic-import.js';
 import { WriteDestination } from './RoutingControls.js';
 import type { MetadataWrite } from './RoutingControls.js';
 
@@ -17,6 +28,7 @@ type Entry = {
   synthetic: boolean; ignored: boolean; status: string; changed: boolean;
   changed_count: number; actionable: boolean; reason: string; depth?: number;
   delta_id?: string | null; capture_modes?: string[];
+  proposed_package_kind?: string;
 };
 type Rule = {
   id: string; selector: { kind: string; path: string }; layer: string; source: string;
@@ -26,15 +38,26 @@ type PlanItem = {
   id: string; path: string; status: string; capture_modes: string[];
   supported?: boolean; reason?: string;
   expected_sha256?: string; expected_absent?: boolean;
+  expected_kind?: string; expected_status?: string;
+  proposed_package_id?: string; proposed_package_kind?: string;
+  provider_lookup?: 'pending' | 'ready' | 'failed';
+  provider_candidates?: Array<{
+    provider: string; project_id: string; version_id: string; version?: string | null;
+    confidence: string; reason?: string; download_url?: string;
+    hashes?: Record<string, unknown>; kind?: string; categories?: string[]; tags?: string[];
+  }>;
 };
-type Choice = CaptureChoice;
+type Choice = CaptureChoice & { userSelected?: boolean };
 type ExplorerPage = {
   parent: string; items: Entry[]; next_cursor: number | null; ignore_rules: Rule[];
 };
 type ExplorerPlan = {
   path: string; revision: number; items: PlanItem[];
   unsupported: Array<{ path: string; reason: string }>;
+  provider_lookup?: 'pending' | 'ready' | 'failed';
 };
+type WizardStep = 'strategy' | 'preferred' | 'items' | 'review';
+type WizardStrategy = 'preferred' | 'individual';
 type ExplorerClient = {
   files: (parent: string, options: Record<string, unknown>) => Promise<ExplorerPage>;
   filePlan: (path: string, targetLayer: string) => Promise<ExplorerPlan>;
@@ -73,6 +96,12 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   const [busy, setBusy] = useState('');
   const [plan, setPlan] = useState<ExplorerPlan | null>(null);
   const [choices, setChoices] = useState<Record<string, Choice>>({});
+  const [wizardStep, setWizardStep] = useState<WizardStep>('strategy');
+  const [wizardStrategy, setWizardStrategy] = useState<WizardStrategy | null>(null);
+  const [preferredProvider, setPreferredProvider] = useState<string | null>(null);
+  const [wizardItemIds, setWizardItemIds] = useState<string[]>([]);
+  const [wizardIndex, setWizardIndex] = useState(0);
+  const [planPollError, setPlanPollError] = useState('');
   const [ignoreDraft, setIgnoreDraft] = useState<{ item: Entry; write?: MetadataWrite } | null>(null);
   const childrenRef = useRef(children);
   const expandedRef = useRef(expanded);
@@ -82,6 +111,7 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   const scopeRef = useRef('');
   const revisionRef = useRef(data.revision);
   const requestGenerationRef = useRef(0);
+  const planGenerationRef = useRef(0);
 
   async function load(parent = '', cursor = 0) {
     const label = `load:${parent}`;
@@ -124,6 +154,8 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
     const scopeChanged = scopeRef.current !== scope;
     const revisionChanged = revisionRef.current !== data.revision;
     if (!scopeChanged && !revisionChanged) return;
+    ++planGenerationRef.current;
+    setPlan(null);
     scopeRef.current = scope;
     revisionRef.current = data.revision;
     const generation = ++requestGenerationRef.current;
@@ -169,7 +201,136 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
       .finally(() => setBusy((value) => value === label ? '' : value));
   }, [mode, showIgnored, targetLayer, data.revision]);
 
+  useEffect(() => () => { ++planGenerationRef.current; }, []);
+
   const rows = useMemo(() => flattenExplorer(children, expanded), [children, expanded]);
+
+  function closePlan() {
+    ++planGenerationRef.current;
+    setPlan(null);
+    setChoices({});
+    setWizardStep('strategy');
+    setWizardStrategy(null);
+    setPreferredProvider(null);
+    setWizardItemIds([]);
+    setWizardIndex(0);
+    setPlanPollError('');
+  }
+
+  function planIsPending(value: ExplorerPlan) {
+    return packageProviderLookupPending(value);
+  }
+
+  async function pollPlan(path: string, revision: number, generation: number) {
+    while (planGenerationRef.current === generation && revisionRef.current === revision) {
+      await new Promise((resolve) => window.setTimeout(resolve, 500));
+      if (planGenerationRef.current !== generation || revisionRef.current !== revision) return;
+      try {
+        const updated = await client.filePlan(path, targetLayer);
+        if (
+          planGenerationRef.current !== generation
+          || revisionRef.current !== revision
+          || updated.revision !== revision
+        ) return;
+        setPlan((current) => current?.path === path && current.revision === revision
+          ? updated
+          : current);
+        setChoices((current) => reconcileFolderChoices(
+          updated.items,
+          current,
+        ) as Record<string, Choice>);
+        setPlanPollError('');
+        if (!planIsPending(updated)) return;
+      } catch (reason) {
+        if (planGenerationRef.current === generation) {
+          setPlanPollError(reason instanceof Error ? reason.message : 'Could not refresh package sources');
+        }
+        return;
+      }
+    }
+  }
+
+  function retryPlanPolling() {
+    if (!plan) return;
+    setPlanPollError('');
+    const generation = ++planGenerationRef.current;
+    void pollPlan(plan.path, plan.revision, generation);
+  }
+
+  function choicesWithDefaults(
+    itemIds: string[],
+    base: Record<string, Choice> = {},
+  ) {
+    if (!plan) return base;
+    const updated = { ...base };
+    for (const id of itemIds) {
+      const item = plan.items.find((entry) => entry.id === id);
+      if (item && !updated[id]) updated[id] = defaultPackageChoice(item);
+    }
+    return updated;
+  }
+
+  function chooseStrategy(strategy: WizardStrategy) {
+    setWizardStrategy(strategy);
+  }
+
+  function continueStrategy() {
+    if (!plan || !wizardStrategy) return;
+    if (wizardStrategy === 'preferred') return setWizardStep('preferred');
+    const ids = packagePlanItems(plan.items).map((item: PlanItem) => item.id);
+    setChoices(choicesWithDefaults(ids, choices));
+    setWizardItemIds(ids);
+    setWizardIndex(0);
+    setWizardStep(ids.length ? 'items' : 'review');
+  }
+
+  function choosePreferredProvider(provider: string) {
+    if (!plan || !preferredProviderSelectable(plan, provider)) return;
+    setPreferredProvider(provider);
+  }
+
+  function continuePreferredProvider() {
+    if (!plan || !preferredProvider || !preferredProviderSelectable(plan, preferredProvider)) return;
+    const preferred = preferredFolderChoices(plan.items, preferredProvider);
+    const explicitChoices = Object.fromEntries(Object.entries(preferred.choices).map(
+      ([id, choice]) => [id, { ...choice, userSelected: true }],
+    )) as Record<string, Choice>;
+    setChoices(choicesWithDefaults(
+      preferred.unresolved,
+      explicitChoices,
+    ));
+    setWizardItemIds(preferred.unresolved);
+    setWizardIndex(0);
+    setWizardStep(preferred.unresolved.length ? 'items' : 'review');
+  }
+
+  function previousWizardStep() {
+    const previous = previousFolderWizardState({
+      step: wizardStep,
+      strategy: wizardStrategy,
+      preferredProvider,
+      choices,
+      itemIds: wizardItemIds,
+      index: wizardIndex,
+    });
+    setWizardStep(previous.step as WizardStep);
+    setWizardIndex(previous.index);
+  }
+
+  function nextWizardItem() {
+    const id = wizardItemIds[wizardIndex];
+    const choice = choices[id];
+    if (!choice) return;
+    if (choice.provider_match?.confidence === 'fuzzy' && !choice.fuzzyConfirmed) {
+      onError(`Confirm the fuzzy provider match for ${plan?.items.find((item) => item.id === id)?.path || id}`);
+      return;
+    }
+    if (!choice.userSelected) {
+      setChoices({ ...choices, [id]: { ...choice, userSelected: true } });
+    }
+    if (wizardIndex + 1 < wizardItemIds.length) setWizardIndex(wizardIndex + 1);
+    else setWizardStep('review');
+  }
 
   async function toggle(item: Entry) {
     if (item.type !== 'directory') return;
@@ -204,8 +365,7 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
     if (value.unsupported?.length) throw new Error(value.unsupported[0].reason);
     const unsupportedItem = value.items.find((entry) => entry.supported === false);
     if (unsupportedItem) throw new Error(unsupportedItem.reason || `${unsupportedItem.path} is not supported`);
-    const packageItems = value.items.filter((entry: PlanItem) =>
-      entry.capture_modes.includes('package') && entry.capture_modes.length > 1);
+    const packageItems = packagePlanItems(value.items);
     if (!packageItems.length) {
       const decisions = decisionsForPlan(value.items, {});
       await onMutate(
@@ -215,14 +375,26 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
       );
       return;
     }
+    const generation = ++planGenerationRef.current;
     setChoices({});
+    setWizardStep('strategy');
+    setWizardStrategy(null);
+    setPreferredProvider(null);
+    setWizardItemIds([]);
+    setWizardIndex(0);
+    setPlanPollError('');
     setPlan(value);
+    if (planIsPending(value)) void pollPlan(value.path, value.revision, generation);
   }
 
   async function reviewCapture(item: Entry) {
     const label = `capture:auto:${item.path}`;
     setBusy(label);
     try {
+      if (item.type === 'directory') {
+        await applyPlan(item, await client.filePlan(item.path, targetLayer));
+        return;
+      }
       const semanticItem = singleFileImportItem(item);
       if (semanticItem) {
         await onReviewImport(semanticItem, data.revision);
@@ -275,8 +447,7 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
         () => client.capturePath(plan.path, targetLayer, plan.revision, decisions),
         `${plan.path} and all changed descendants were sent atomically.`,
       );
-      setPlan(null);
-      if (!applied) return;
+      if (applied) closePlan();
     } catch (reason) {
       onError(reason instanceof Error ? reason.message : 'Could not capture files');
     } finally { setBusy((value) => value === label ? '' : value); }
@@ -296,6 +467,11 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
     } finally { setBusy((value) => value === label ? '' : value); }
   }
 
+  const wizardItem = plan?.items.find((item) => item.id === wizardItemIds[wizardIndex]);
+  const wizardChoice = wizardItem ? choices[wizardItem.id] : undefined;
+  const wizardChoiceNeedsConfirmation = wizardChoice?.provider_match?.confidence === 'fuzzy'
+    && !wizardChoice.fuzzyConfirmed;
+
   return <>
     <div className="page-heading files-heading"><div><p className="eyebrow">Local filesystem</p><h1>Files</h1><p>Actual files, desired ghost deletions and layer actions in one tree.</p></div><div className="explorer-controls"><label><span>Writable target</span><select value={targetLayer} onChange={(event) => onTargetLayer(event.target.value)}>{layers.map((layer) => <option value={layer.id} key={layer.id}>{layer.id}{layer.local ? ' · local' : ''}</option>)}</select></label><label><span>Order</span><select value={mode} onChange={(event) => setMode(event.target.value)}><option value="all">All files</option><option value="changed-first">Changed first</option><option value="changed-only">Changed only</option></select></label><label className="show-ignored"><input type="checkbox" checked={showIgnored} onChange={(event) => setShowIgnored(event.target.checked)} /> Show ignored</label></div></div>
     <div className="explorer-layout"><section className="file-tree" aria-label="Instance files">
@@ -312,6 +488,6 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
         <WriteDestination client={client} target={targetLayer} operation={{ type: 'ignore', selector: { kind: ignoreDraft.item.type === 'directory' ? 'subtree' : 'exact', path: ignoreDraft.item.path } }} value={ignoreDraft.write} onChange={(write) => setIgnoreDraft({ ...ignoreDraft, write })} />
       </div><footer><button className="secondary" onClick={() => setIgnoreDraft(null)}>Cancel</button><button className="primary" disabled={!!busy} onClick={() => void ignore(ignoreDraft.item, ignoreDraft.write)}>Add ignore</button></footer>
     </section></div>}
-    {plan && <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true"><header><div><p className="eyebrow">Atomic folder capture</p><h2>Choose package handling</h2></div><button onClick={() => setPlan(null)}>×</button></header><div className="modal-body"><p>Every changed descendant must have a valid decision before anything is written.</p>{plan.items.filter((item) => item.capture_modes.includes('package') && item.capture_modes.length > 1).map((item) => <fieldset key={item.id}><legend>{item.path}</legend>{item.capture_modes.includes('payload') && <label className="choice"><input type="radio" checked={choices[item.id]?.mode === 'payload'} onChange={() => setChoices({ ...choices, [item.id]: { mode: 'payload' } })} /><span><strong>Raw file</strong><small>Capture this JAR as ordinary payload.</small></span></label>}<label className="choice"><input type="radio" checked={choices[item.id]?.mode === 'package'} onChange={() => setChoices({ ...choices, [item.id]: { mode: 'package' } })} /><span><strong>Local package</strong><small>Store a verified local SHA-256 artifact.</small></span></label></fieldset>)}</div><footer><button onClick={() => setPlan(null)}>Cancel</button><button className="primary" disabled={!!busy} onClick={() => void submitPlan()}>Send all atomically</button></footer></section></div>}
+    {plan && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closePlan()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="folder-capture-title"><header><div><p className="eyebrow">Atomic folder capture</p><h2 id="folder-capture-title">{wizardStep === 'strategy' ? 'Choose package handling' : wizardStep === 'preferred' ? 'Choose a preferred source' : wizardStep === 'items' ? `Choose source ${wizardIndex + 1} of ${wizardItemIds.length}` : 'Review folder capture'}</h2></div><button aria-label="Close" onClick={closePlan}>×</button></header><div className="modal-body"><p>No files are written until you approve the final review.</p>{planIsPending(plan) && !planPollError && <div className="inline-error" role="status">Checking remote package sources… Local choices remain available.</div>}{planPollError && <div className="inline-error" role="alert"><span>{planPollError}</span><button className="secondary" onClick={retryPlanPolling}>Retry source lookup</button></div>}{wizardStep === 'strategy' && <fieldset><legend>Selection strategy</legend><label className="choice"><input type="radio" name="folder-strategy" checked={wizardStrategy === 'preferred'} onChange={() => chooseStrategy('preferred')} /><span><strong>Preferred source for all</strong><small>Use one source where an exact match exists, then review exceptions one at a time.</small></span></label><label className="choice"><input type="radio" name="folder-strategy" checked={wizardStrategy === 'individual'} onChange={() => chooseStrategy('individual')} /><span><strong>Choose each package</strong><small>Review one package at a time before the final atomic capture.</small></span></label></fieldset>}{wizardStep === 'preferred' && <fieldset><legend>Preferred artifact source</legend>{['modrinth', 'curseforge', 'local'].map((provider) => <label className="choice" key={provider}><input type="radio" name="preferred-provider" checked={preferredProvider === provider} disabled={!preferredProviderSelectable(plan, provider)} onChange={() => choosePreferredProvider(provider)} /><span><strong>{provider === 'modrinth' ? 'Modrinth' : provider === 'curseforge' ? 'CurseForge' : 'Local artifact'}</strong><small>{provider === 'local' ? 'Use verified local artifacts for every package.' : `Automatically use exact ${provider === 'modrinth' ? 'Modrinth' : 'CurseForge'} matches.`}</small></span></label>)}</fieldset>}{wizardStep === 'items' && wizardItem && <fieldset><legend>{wizardItem.path}</legend>{orderedProviderCandidates(wizardItem).map((candidate) => <label className="provider-choice" key={candidateKey(candidate)}><input type="radio" name={`folder-provider-${wizardItem.id}`} checked={candidateKey(wizardChoice?.provider_match || {}) === candidateKey(candidate)} onChange={() => setChoices({ ...choices, [wizardItem.id]: { mode: 'package', provider_match: candidate, userSelected: true } })} /><span><strong>{candidate.provider} · {candidate.version || candidate.version_id}</strong><small>{candidate.project_id}{candidate.reason ? ` · ${candidate.reason}` : ''}</small></span><span className={`badge activation-${candidate.confidence}`}>{candidate.confidence}</span></label>)}<label className="provider-choice"><input type="radio" name={`folder-provider-${wizardItem.id}`} checked={wizardChoice?.mode === 'package' && !wizardChoice.provider_match} onChange={() => setChoices({ ...choices, [wizardItem.id]: { mode: 'package', userSelected: true } })} /><span><strong>Local artifact</strong><small>Use the verified local file.</small></span><span className="badge activation-exact">exact</span></label>{wizardItem.capture_modes.includes('payload') && <label className="provider-choice"><input type="radio" name={`folder-provider-${wizardItem.id}`} checked={wizardChoice?.mode === 'payload'} onChange={() => setChoices({ ...choices, [wizardItem.id]: { mode: 'payload', userSelected: true } })} /><span><strong>Raw file</strong><small>Capture this package file as ordinary payload.</small></span></label>}{wizardChoice?.provider_match?.confidence === 'fuzzy' && <label className="fuzzy-confirm"><input type="checkbox" checked={wizardChoice.fuzzyConfirmed === true} onChange={(event) => setChoices({ ...choices, [wizardItem.id]: { ...wizardChoice, fuzzyConfirmed: event.target.checked } })} /><span><strong>Use this fuzzy match</strong><small>I reviewed the project and version identity.</small></span></label>}</fieldset>}{wizardStep === 'review' && <div><p>Review {packagePlanItems(plan.items).length} package choices. The folder is sent with one atomic request.</p>{packagePlanItems(plan.items).map((item: PlanItem) => { const choice = choices[item.id]; const provider = String(choice?.provider_match?.provider || (choice?.mode === 'payload' ? 'raw file' : 'local')); return <fieldset key={item.id}><legend>{item.path}</legend><p>{provider}</p></fieldset>; })}</div>}</div><footer><button className="secondary" onClick={closePlan}>Cancel</button>{wizardStep !== 'strategy' && <button className="secondary" disabled={!!busy} onClick={previousWizardStep}>Back</button>}{wizardStep === 'strategy' && <button className="primary" disabled={!!busy || !wizardStrategy} onClick={continueStrategy}>Continue</button>}{wizardStep === 'preferred' && <button className="primary" disabled={!!busy || !preferredProvider || !preferredProviderSelectable(plan, preferredProvider)} onClick={continuePreferredProvider}>Continue</button>}{wizardStep === 'items' && <button className="primary" disabled={!!busy || !wizardChoice || wizardChoiceNeedsConfirmation} onClick={nextWizardItem}>{wizardIndex + 1 < wizardItemIds.length ? 'Next package' : 'Review choices'}</button>}{wizardStep === 'review' && <button className="primary" disabled={!!busy} onClick={() => void submitPlan()}>Send all atomically</button>}</footer></section></div>}
   </>;
 }

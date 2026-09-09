@@ -121,20 +121,7 @@ export function normalizeDeltaItem(item, index = 0) {
         ? asObject(value.jar_metadata).dependencies.map(String)
         : [],
     },
-    provider_candidates: asList(value.provider_candidates).map((candidate) => {
-      const entry = asObject(candidate);
-      return {
-        ...entry,
-        provider: text(entry.provider),
-        project_id: text(entry.project_id),
-        version_id: text(entry.version_id),
-        version: text(entry.version),
-        download_url: text(entry.download_url),
-        confidence: text(entry.confidence, 'fuzzy'),
-        reason: text(entry.reason),
-        hashes: asObject(entry.hashes),
-      };
-    }),
+    provider_candidates: asList(value.provider_candidates).map(asObject),
     editable: value.editable !== false,
     enriched: value.enriched !== false,
     capture_modes: Array.isArray(value.capture_modes) ? value.capture_modes.map(String) : [],
