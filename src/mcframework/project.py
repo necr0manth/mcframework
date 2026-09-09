@@ -99,6 +99,15 @@ class _ProviderLookup:
     future: Future[tuple[ProviderMatch, ...]] | None = None
 
 
+@dataclass(frozen=True)
+class _PackagePrefetch:
+    root: Path
+    path: str
+    expected: tuple[str, int, int, int]
+    declared: bool
+    kind: str | None
+
+
 _edit_journals: ContextVar[tuple[Any, ...]] = ContextVar("metadata_edit_journals", default=())
 _edit_destinations: ContextVar[tuple[tuple[Any, str | None, str | None], ...]] = ContextVar(
     "metadata_edit_destinations", default=()
@@ -144,10 +153,13 @@ class ProjectService:
         self.provider_matcher = provider_matcher or default_provider_matcher()
         self.metadata: MetadataParser = metadata_parser or JsonMetadataParser()
         self._provider_matches: dict[str, _ProviderLookup] = {}
-        self._provider_prefetches: set[tuple[str, str, tuple[str, int, int, int]]] = set()
+        self._provider_prefetches: set[_PackagePrefetch] = set()
         self._provider_lock = threading.RLock()
         self._provider_executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="mcpack-provider"
+        )
+        self._provider_prefetch_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mcpack-package-prefetch"
         )
         self._explorer_snapshots: dict[str, ExplorerSnapshot] = {}
         self._context_lock = threading.RLock()
@@ -817,6 +829,7 @@ class ProjectService:
             cursor=cursor,
             limit=limit,
         )
+        prefetches: list[_PackagePrefetch] = []
         for item in page["items"]:
             path = str(item["path"])
             if (
@@ -828,7 +841,29 @@ class ProjectService:
                 continue
             expected = snapshot.scan.entry_generations.get(path)
             if expected is not None:
-                self._schedule_package_prefetch(instance, path, expected)
+                delta = next(
+                    (
+                        delta
+                        for delta in snapshot.delta_items
+                        if str(delta["id"]) == str(item["delta_id"])
+                        and str(delta["path"]) == path
+                    ),
+                    None,
+                )
+                if delta is not None:
+                    inferred_kind = self._package_kind_for_path(path)
+                    proposed_kind = delta.get("proposed_package_kind")
+                    prefetches.append(
+                        _PackagePrefetch(
+                            snapshot.scan.root,
+                            path,
+                            expected,
+                            delta.get("package_id") is not None,
+                            str(proposed_kind) if proposed_kind is not None else inferred_kind,
+                        )
+                    )
+        if prefetches:
+            self._schedule_package_prefetch(instance, tuple(prefetches))
         page["ignore_rules"] = self.ignore_rules(instance, target_layer)
         return page
 
@@ -1909,21 +1944,21 @@ class ProjectService:
         return tuple(sorted(matches, key=lambda match: order.get(match.provider, 2)))
 
     def _schedule_package_prefetch(
-        self, instance: str, path: str, expected: tuple[str, int, int, int]
+        self, instance: str, hints: tuple[_PackagePrefetch, ...]
     ) -> None:
-        key = (instance, path, expected)
         with self._provider_lock:
-            if key in self._provider_prefetches:
+            pending = tuple(hint for hint in hints if hint not in self._provider_prefetches)
+            if not pending:
                 return
-            self._provider_prefetches.add(key)
-        future = self._provider_executor.submit(
-            self._prefetch_package_path, instance, path, expected
+            self._provider_prefetches.update(pending)
+        future = self._provider_prefetch_executor.submit(
+            self._prefetch_package_paths, instance, pending
         )
-        future.add_done_callback(partial(self._finish_package_prefetch, key))
+        future.add_done_callback(partial(self._finish_package_prefetch, pending))
 
     def _finish_package_prefetch(
         self,
-        key: tuple[str, str, tuple[str, int, int, int]],
+        hints: tuple[_PackagePrefetch, ...],
         future: Future[None],
     ) -> None:
         try:
@@ -1932,23 +1967,41 @@ class ProjectService:
             pass
         finally:
             with self._provider_lock:
-                self._provider_prefetches.discard(key)
+                self._provider_prefetches.difference_update(hints)
 
-    def _prefetch_package_path(
-        self, instance: str, path: str, expected: tuple[str, int, int, int]
+    def _prefetch_package_paths(
+        self, instance: str, hints: tuple[_PackagePrefetch, ...]
     ) -> None:
         context = self.instance_context(instance)
-        target = context.instance.path.joinpath(*path.split("/"))
-        content = target.read_bytes()
-        current = target.stat(follow_symlinks=False)
-        if ("file", current.st_mtime_ns, current.st_size, current.st_ino) != expected:
+        root = context.instance.path.resolve()
+        for hint in hints:
+            if hint.root != root:
+                continue
+            package = self._package_for_path(context, hint.path)
+            self._prefetch_package_path(
+                replace(
+                    hint,
+                    declared=package is not None or hint.declared,
+                    kind=str(package.kind) if package is not None else hint.kind,
+                )
+            )
+
+    def _prefetch_package_path(self, hint: _PackagePrefetch) -> None:
+        target = hint.root.joinpath(*hint.path.split("/"))
+        try:
+            before = target.stat(follow_symlinks=False)
+            if ("file", before.st_mtime_ns, before.st_size, before.st_ino) != hint.expected:
+                return
+            content = target.read_bytes()
+            after = target.stat(follow_symlinks=False)
+        except OSError:
             return
-        package = self._package_for_path(context, path)
-        kind = str(package.kind) if package is not None else self._package_kind_for_path(path)
-        metadata = self._package_content_metadata(path, content, kind=kind)
-        if metadata is None and package is None:
+        if ("file", after.st_mtime_ns, after.st_size, after.st_ino) != hint.expected:
             return
-        version = metadata.version if kind == "mod" and metadata is not None else None
+        metadata = self._package_content_metadata(hint.path, content, kind=hint.kind)
+        if metadata is None and not hint.declared:
+            return
+        version = metadata.version if hint.kind == "mod" and metadata is not None else None
         self._provider_enrichment(content, version, allow_remote=metadata is not None)
 
     def _finish_provider_lookup(
@@ -2233,6 +2286,71 @@ class ProjectService:
             item["logical_id"] = package.logical_identity
         return item, content
 
+    def _cached_delta_selection(
+        self,
+        context: InstanceContext,
+        snapshot: ExplorerSnapshot,
+        delta_id: str,
+    ) -> tuple[dict[str, Any], bytes | None] | None:
+        if (
+            not snapshot.context_verified
+            or snapshot.scan.root != context.instance.path.resolve()
+            or snapshot.context_fingerprint != self._context_fingerprint(context)
+            or not self._snapshot_auto_payload_epochs_match(snapshot)
+        ):
+            return None
+        matches_id = [
+            item for item in snapshot.delta_items if str(item.get("id")) == delta_id
+        ]
+        if len(matches_id) != 1:
+            return None
+        selected = dict(matches_id[0])
+        try:
+            path = normalize_relative_path(str(selected["path"]))
+        except (KeyError, MetadataError):
+            return None
+        matching_paths = [
+            candidate
+            for candidate in set(snapshot.scan.files) | set(context.files)
+            if self._delta_id(candidate) == delta_id
+        ]
+        if len(matching_paths) != 1 or matching_paths[0] != path:
+            return None
+        if any(selector.contains(path) for selector in context.resolution.state.ignore):
+            raise MetadataError(f"instance delta item does not exist: {delta_id!r}")
+        entry = snapshot.entries.get(path)
+        if (
+            entry is None
+            or str(entry.get("delta_id")) != delta_id
+            or entry.get("type") != "file"
+        ):
+            return None
+        target = snapshot.scan.root.joinpath(*path.split("/"))
+        expected = snapshot.scan.entry_generations.get(path)
+        if expected is None:
+            if entry.get("actual"):
+                return None
+            try:
+                target.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                return selected, None
+            except OSError:
+                return None
+            return None
+        if expected[0] != "file" or not entry.get("actual"):
+            return None
+        try:
+            before = target.stat(follow_symlinks=False)
+            if ("file", before.st_mtime_ns, before.st_size, before.st_ino) != expected:
+                return None
+            content = target.read_bytes()
+            after = target.stat(follow_symlinks=False)
+        except OSError:
+            return None
+        if ("file", after.st_mtime_ns, after.st_size, after.st_ino) != expected:
+            return None
+        return selected, content
+
     @staticmethod
     def _inspect_jar_content(content: bytes) -> Any:
         with tempfile.TemporaryDirectory(prefix="mcpack-jar-inspect-") as directory:
@@ -2242,7 +2360,17 @@ class ProjectService:
 
     def delta_detail(self, instance: str, delta_id: str) -> dict[str, Any]:
         context = self.instance_context(instance)
-        selected, content = self._quick_delta_selection(context, delta_id)
+        snapshot = self._explorer_snapshots.get(instance)
+        cached = (
+            self._cached_delta_selection(context, snapshot, delta_id)
+            if snapshot is not None
+            else None
+        )
+        selected, content = (
+            cached
+            if cached is not None
+            else self._quick_delta_selection(context, delta_id)
+        )
         item = dict(selected)
         if content is None:
             item["enriched"] = True

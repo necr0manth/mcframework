@@ -439,7 +439,7 @@ def test_declared_pack_at_arbitrary_destination_uses_declaration_kind(
     assert service.instance_context("dev").files["custom/package.bin"] == changed
 
 
-def test_visible_package_page_queues_bounded_background_enrichment(
+def test_visible_package_page_queues_one_background_enrichment_batch(
     layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     layer_factory("client", operations=[])
@@ -468,11 +468,11 @@ def test_visible_package_page_queues_bounded_background_enrichment(
     elapsed = time.perf_counter() - begin
     try:
         deadline = time.monotonic() + 1
-        while started < 4 and time.monotonic() < deadline:
+        while started < 1 and time.monotonic() < deadline:
             time.sleep(0.001)
         assert len(page["items"]) == 8
         assert elapsed < 0.5
-        assert started == 4
+        assert started == 1
     finally:
         release.set()
 

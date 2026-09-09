@@ -569,6 +569,199 @@ def test_warm_700_file_capture_is_one_linear_batch(
     assert len([path for path in resolved.files if path.startswith("bulk/")]) == 700
 
 
+def test_package_page_prefetch_batches_real_jars_without_instance_listing(
+    layer_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Any,
+) -> None:
+    layer_factory("client", operations=[])
+    game = game_path(tmp_path)
+    mods = game / "mods"
+    mods.mkdir(parents=True)
+    archive = BytesIO()
+    with zipfile.ZipFile(archive, "w") as jar:
+        jar.writestr("fabric.mod.json", '{"id":"fixture","version":"1"}')
+    jar_content = archive.getvalue()
+    for index in range(240):
+        (mods / f"fixture-{index:04}.jar").write_bytes(jar_content)
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+    scans = 0
+    original_scan = project_module.scan_instance
+
+    def scan(*args: object, **kwargs: object) -> Any:
+        nonlocal scans
+        scans += 1
+        return original_scan(*args, **kwargs)
+
+    monkeypatch.setattr(project_module, "scan_instance", scan)
+    snapshot_started = time.perf_counter()
+    service.explorer_snapshot("dev")
+    snapshot_elapsed = time.perf_counter() - snapshot_started
+    counts = {"contexts": 0, "enriched": 0}
+    original_context = service.instance_context
+
+    def context(*args: object, **kwargs: object) -> Any:
+        counts["contexts"] += 1
+        return original_context(*args, **kwargs)
+
+    def enrich(
+        content: bytes, version: str | None, *, allow_remote: bool = True
+    ) -> tuple[str, list[dict[str, object]]]:
+        del content, version, allow_remote
+        counts["enriched"] += 1
+        return "ready", []
+
+    def fail_list(*args: object, **kwargs: object) -> tuple[str, ...]:
+        del args, kwargs
+        raise AssertionError("package prefetch must not enumerate the instance")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(service, "instance_context", context)
+        patch.setattr(service, "ignore_rules", lambda *args, **kwargs: [])
+        patch.setattr(service, "_provider_enrichment", enrich)
+        patch.setattr(LocalFilesystemInstance, "list_files", fail_list)
+        page_started = time.perf_counter()
+        page = service.explorer_page("dev", "mods", limit=200)
+        page_elapsed = time.perf_counter() - page_started
+        deadline = time.monotonic() + 10
+        while service._provider_prefetches and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+    record_property("package_snapshot_240_seconds", f"{snapshot_elapsed:.6f}")
+    record_property("package_page_200_seconds", f"{page_elapsed:.6f}")
+    assert len(page["items"]) == 200
+    assert not service._provider_prefetches
+    assert counts == {"contexts": 1, "enriched": 200}
+    assert scans == 1
+
+
+def test_warm_delta_detail_is_path_specific_and_stale_or_ignored_falls_back(
+    layer_factory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    record_property: Any,
+) -> None:
+    layer_factory("client", operations=[])
+    game = game_path(tmp_path)
+    mods = game / "mods"
+    mods.mkdir(parents=True)
+    for index in range(300):
+        (game / f"unrelated-{index:04}.txt").write_bytes(bytes([index % 251]) * 1024)
+    archive = BytesIO()
+    with zipfile.ZipFile(archive, "w") as jar:
+        jar.writestr("fabric.mod.json", '{"id":"selected","version":"1"}')
+    selected = mods / "selected.jar"
+    selected.write_bytes(archive.getvalue())
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+    snapshot = service.explorer_snapshot("dev")
+    delta_id = str(snapshot.entries["mods/selected.jar"]["delta_id"])
+    context = service.instance_context("dev")
+    baseline_lists = 0
+    original_list = LocalFilesystemInstance.list_files
+
+    def baseline_list(transport: LocalFilesystemInstance) -> tuple[str, ...]:
+        nonlocal baseline_lists
+        baseline_lists += 1
+        return original_list(transport)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(LocalFilesystemInstance, "list_files", baseline_list)
+        baseline_started = time.perf_counter()
+        service._quick_delta_selection(context, delta_id)
+        baseline_elapsed = time.perf_counter() - baseline_started
+
+    counts = {"contexts": 0, "reads": 0, "stats": 0, "scans": 0}
+    original_context = service.instance_context
+    original_read_bytes = Path.read_bytes
+    original_stat = Path.stat
+
+    def count_context(*args: object, **kwargs: object) -> Any:
+        counts["contexts"] += 1
+        return original_context(*args, **kwargs)
+
+    def count_read_bytes(path: Path) -> bytes:
+        if path == selected:
+            counts["reads"] += 1
+        return original_read_bytes(path)
+
+    def count_stat(path: Path, *args: object, **kwargs: object) -> Any:
+        if path == selected:
+            counts["stats"] += 1
+        return original_stat(path, *args, **kwargs)
+
+    def fail_list(*args: object, **kwargs: object) -> tuple[str, ...]:
+        del args, kwargs
+        raise AssertionError("warm delta detail must not enumerate the instance")
+
+    def fail_scan(*args: object, **kwargs: object) -> Any:
+        del args, kwargs
+        counts["scans"] += 1
+        raise AssertionError("warm delta detail must not scan the instance")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(service, "instance_context", count_context)
+        patch.setattr(Path, "read_bytes", count_read_bytes)
+        patch.setattr(Path, "stat", count_stat)
+        patch.setattr(LocalFilesystemInstance, "list_files", fail_list)
+        patch.setattr(project_module, "scan_instance", fail_scan)
+        patch.setattr(service, "_provider_enrichment", lambda *args, **kwargs: ("ready", []))
+        warm_started = time.perf_counter()
+        detail = service.delta_detail("dev", delta_id)
+        warm_elapsed = time.perf_counter() - warm_started
+
+    record_property("delta_detail_list_baseline_301_seconds", f"{baseline_elapsed:.6f}")
+    record_property("delta_detail_snapshot_301_seconds", f"{warm_elapsed:.6f}")
+    assert baseline_lists == 1
+    assert counts == {"contexts": 1, "reads": 1, "stats": 2, "scans": 0}
+    assert detail["actual_sha256"] == hashlib.sha256(selected.read_bytes()).hexdigest()
+
+    selected.write_bytes(selected.read_bytes() + b"changed")
+    stale_lists = 0
+
+    def stale_list(transport: LocalFilesystemInstance) -> tuple[str, ...]:
+        nonlocal stale_lists
+        stale_lists += 1
+        return original_list(transport)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(LocalFilesystemInstance, "list_files", stale_list)
+        patch.setattr(service, "_provider_enrichment", lambda *args, **kwargs: ("ready", []))
+        refreshed = service.delta_detail("dev", delta_id)
+    assert stale_lists == 1
+    assert refreshed["actual_sha256"] == hashlib.sha256(selected.read_bytes()).hexdigest()
+
+    service.add_ignore("dev", "mods/selected.jar", "exact", "client")
+    with monkeypatch.context() as patch:
+        patch.setattr(LocalFilesystemInstance, "list_files", fail_list)
+        with pytest.raises(MetadataError, match="does not exist"):
+            service.delta_detail("dev", delta_id)
+
+
+def test_warm_delta_detail_preserves_delta_id_collision_rejection(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer_factory("client", operations=[])
+    game = game_path(tmp_path)
+    game.mkdir(parents=True)
+    (game / "selected.txt").write_text("selected")
+    (game / "collision.txt").write_text("collision")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+    snapshot = service.explorer_snapshot("dev")
+    delta_id = str(snapshot.entries["selected.txt"]["delta_id"])
+    original_delta_id = service._delta_id
+
+    def collide(path: str) -> str:
+        return delta_id if path == "collision.txt" else original_delta_id(path)
+
+    monkeypatch.setattr(service, "_delta_id", collide)
+    with pytest.raises(MetadataError, match="does not exist"):
+        service.delta_detail("dev", delta_id)
+
+
 def test_stale_folder_sha_rejects_before_any_write(layer_factory, tmp_path: Path) -> None:
     layer_factory("client", operations=[])
     game = game_path(tmp_path)
