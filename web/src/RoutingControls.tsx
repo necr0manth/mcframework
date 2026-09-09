@@ -130,7 +130,7 @@ export function RoutingRuleEditor({ client, target, busy, onSave, onUpgrade, onD
     </section>}
     <label><span>Save rule in</span><select value={scope} onChange={(event) => setScope(event.target.value)}><option value="layer">Selected layer · tracked and inherited</option><option value="instance">This instance · local state only</option></select></label>
     {scope === 'layer' && <label><span>Rule declaration file (from layer root)</span><input value={source} onChange={(event) => setSource(event.target.value)} /></label>}
-    {scope === 'instance' && <p>Local destinations resolve relative to the selected layer’s .pack directory.</p>}
+    {scope === 'instance' && <p>Local destinations resolve relative to the nearest .pack directory.</p>}
     <label className="choice"><input type="checkbox" checked={advanced} onChange={(event) => {
       if (event.target.checked && !raw) {
         try { setRaw(JSON.stringify(makeRoutingRule({ ...form, id: form.id || 'my-rule' }), null, 2)); }
@@ -145,7 +145,7 @@ export function RoutingRuleEditor({ client, target, busy, onSave, onUpgrade, onD
       <label><span>Package kind</span><select value={form.packageKind} onChange={(event) => edit('packageKind', event.target.value)}><option value="">Any</option><option value="mod">Mod</option><option value="resourcepack">Resource pack</option><option value="shaderpack">Shader pack</option><option value="datapack">Data pack</option></select></label>
       <label><span>Operation origin</span><select value={form.origin} onChange={(event) => edit('origin', event.target.value)}><option value="">Any</option><option value="user">User</option><option value="automatic_dependency">Automatic dependency</option><option value="instance_capture">Instance capture</option></select></label>
       <label><span>Package categories (all, comma-separated)</span><input value={form.categories} onChange={(event) => edit('categories', event.target.value)} placeholder="magic, library" /></label>
-      <label><span>Destination path base</span><select value={form.pathMode} onChange={(event) => edit('pathMode', event.target.value)}><option value="local">Relative to rule declaration file</option><option value="layer">From layer root</option></select></label>
+      <label><span>Destination path base</span><select value={form.pathMode} onChange={(event) => edit('pathMode', event.target.value)}><option value="local">Relative to nearest .pack directory</option><option value="layer">From layer root</option></select></label>
       <label><span>Destination metadata file</span><input value={form.file} onChange={(event) => edit('file', event.target.value)} />
         <small>Shorthand may omit the <code>.pack</code> segment and <code>.json</code> extension; explicit paths remain valid.</small></label>
       {form.types.split(',').map((type) => type.trim()).every((type) => supportsRoutingSection({ type, id: 'preview' })) &&
