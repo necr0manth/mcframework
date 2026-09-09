@@ -16,6 +16,20 @@ export function flattenExplorer(children, expanded, parent = '', depth = 0) {
   return result;
 }
 
+export function toggleExplorerDirectory(expanded, path, loaded) {
+  const updated = new Set(expanded);
+  if (updated.has(path)) {
+    updated.delete(path);
+    return { expanded: updated, loadParent: null };
+  }
+  updated.add(path);
+  return { expanded: updated, loadParent: loaded ? null : path };
+}
+
+export function explorerTreeNavigationDisabled(busy, loading, path) {
+  return Boolean(busy) || loading.has(`load:${path}`);
+}
+
 export function explorerRefreshRequests(children, expanded, loadedPages) {
   const parents = [''];
   for (const parent of Object.keys(loadedPages || {})) {

@@ -2,9 +2,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   applyExplorerCapturePatch,
   decisionsForPlan,
+  explorerTreeNavigationDisabled,
   flattenExplorer,
   mergeExplorerPage,
   refreshExplorerState,
+  toggleExplorerDirectory,
 } from './file-explorer-model.js';
 import { runAutoCaptureFlow } from './api.js';
 import type { CaptureChoice, CaptureDecisions } from './file-explorer-model.js';
@@ -95,6 +97,7 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   const [rules, setRules] = useState<Rule[]>([]);
   const [loadedPages, setLoadedPages] = useState<Record<string, number[]>>({ '': [0] });
   const [busy, setBusy] = useState('');
+  const [loading, setLoading] = useState(new Set<string>());
   const [plan, setPlan] = useState<ExplorerPlan | null>(null);
   const [choices, setChoices] = useState<Record<string, Choice>>({});
   const [wizardStep, setWizardStep] = useState<WizardStep>('strategy');
@@ -118,7 +121,7 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
     const label = `load:${parent}`;
     const generation = requestGenerationRef.current;
     const revision = revisionRef.current;
-    setBusy(label);
+    setLoading((value) => new Set(value).add(label));
     try {
       const page = await client.files(parent, {
         mode, showIgnored, cursor, limit: 200, targetLayer,
@@ -146,7 +149,11 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
     } catch (reason) {
       onError(reason instanceof Error ? reason.message : 'Could not load files');
     } finally {
-      setBusy((value) => value === label ? '' : value);
+      setLoading((value) => {
+        const updated = new Set(value);
+        updated.delete(label);
+        return updated;
+      });
     }
   }
 
@@ -344,14 +351,14 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
 
   async function toggle(item: Entry) {
     if (item.type !== 'directory') return;
-    const opened = new Set(expanded);
-    if (opened.has(item.path)) opened.delete(item.path);
-    else {
-      opened.add(item.path);
-      if (!children[item.path]) await load(item.path);
-    }
+    const { expanded: opened, loadParent } = toggleExplorerDirectory(
+      expandedRef.current,
+      item.path,
+      Boolean(childrenRef.current[item.path]),
+    );
     expandedRef.current = opened;
     setExpanded(opened);
+    if (loadParent !== null) await load(loadParent);
   }
 
   async function ignore(item: Entry, write?: MetadataWrite) {
@@ -481,17 +488,18 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   const wizardChoice = wizardItem ? choices[wizardItem.id] : undefined;
   const wizardChoiceNeedsConfirmation = wizardChoice?.provider_match?.confidence === 'fuzzy'
     && !wizardChoice.fuzzyConfirmed;
+  const actionBusy = Boolean(busy) || loading.size > 0;
 
   return <>
     <div className="page-heading files-heading"><div><p className="eyebrow">Local filesystem</p><h1>Files</h1><p>Actual files, desired ghost deletions and layer actions in one tree.</p></div><div className="explorer-controls"><label><span>Writable target</span><select value={targetLayer} onChange={(event) => onTargetLayer(event.target.value)}>{layers.map((layer) => <option value={layer.id} key={layer.id}>{layer.id}{layer.local ? ' · local' : ''}</option>)}</select></label><label><span>Order</span><select value={mode} onChange={(event) => setMode(event.target.value)}><option value="all">All files</option><option value="changed-first">Changed first</option><option value="changed-only">Changed only</option></select></label><label className="show-ignored"><input type="checkbox" checked={showIgnored} onChange={(event) => setShowIgnored(event.target.checked)} /> Show ignored</label></div></div>
     <div className="explorer-layout"><section className="file-tree" aria-label="Instance files">
       {rows.length ? rows.map((item: Entry) => <div className={`file-row ${item.synthetic ? 'ghost' : ''} ${item.ignored ? 'ignored' : ''} ${item.changed ? 'changed' : ''}`} style={{ paddingLeft: `${14 + (item.depth || 0) * 22}px` }} key={item.path}>
-        <button className="file-main" disabled={!!busy} onClick={() => void toggle(item)} title={item.reason || item.path}><span>{item.type === 'directory' ? (expanded.has(item.path) ? '▾' : '▸') : item.type === 'symlink' ? '↗' : '·'}</span><strong>{item.name}</strong>{item.synthetic && <em>deleted</em>}{item.ignored && <em>ignored</em>}{item.changed_count > 0 && <small>{item.status !== 'unchanged' ? item.status : `${item.changed_count} changed`}</small>}</button>
-        <div className="file-actions"><button disabled={!!busy || !item.actionable || item.ignored} onClick={() => setIgnoreDraft({ item })}>Ignore</button><button className="primary" disabled={!!busy || item.changed_count === 0 || !item.actionable} onClick={() => void reviewCapture(item)}>Send to layer</button></div>
+        <button className="file-main" disabled={explorerTreeNavigationDisabled(busy, loading, item.path)} onClick={() => void toggle(item)} title={item.reason || item.path}><span>{item.type === 'directory' ? (expanded.has(item.path) ? '▾' : '▸') : item.type === 'symlink' ? '↗' : '·'}</span><strong>{item.name}</strong>{item.synthetic && <em>deleted</em>}{item.ignored && <em>ignored</em>}{item.changed_count > 0 && <small>{item.status !== 'unchanged' ? item.status : `${item.changed_count} changed`}</small>}</button>
+        <div className="file-actions"><button disabled={actionBusy || !item.actionable || item.ignored} onClick={() => setIgnoreDraft({ item })}>Ignore</button><button className="primary" disabled={actionBusy || item.changed_count === 0 || !item.actionable} onClick={() => void reviewCapture(item)}>Send to layer</button></div>
       </div>) : <div className="empty"><h2>No files in this mode</h2><p>Change the filter or enable ignored files.</p></div>}
-      {next[''] !== null && next[''] !== undefined && <button className="load-more" disabled={!!busy} onClick={() => void load('', next[''] || 0)}>Load more</button>}
-      {Object.entries(next).filter(([parent, cursor]) => parent && cursor !== null).map(([parent, cursor]) => <button className="load-more" disabled={!!busy} key={parent} onClick={() => void load(parent, cursor || 0)}>Load more in {parent}</button>)}
-    </section><aside className="ignore-inspector"><p className="eyebrow">Selected layer</p><h2>Ignore rules</h2>{rules.length ? rules.map((rule) => <article key={rule.id}><code>{rule.selector.kind}: {rule.selector.path}</code><small>{rule.own ? 'Own rule' : `Inherited from ${rule.layer}`}</small>{rule.removable && <button disabled={!!busy} onClick={() => void removeRule(rule)}>Remove</button>}</article>) : <p>No ignore rules apply in this composition.</p>}</aside></div>
+      {next[''] !== null && next[''] !== undefined && <button className="load-more" disabled={explorerTreeNavigationDisabled(busy, loading, '')} onClick={() => void load('', next[''] || 0)}>Load more</button>}
+      {Object.entries(next).filter(([parent, cursor]) => parent && cursor !== null).map(([parent, cursor]) => <button className="load-more" disabled={explorerTreeNavigationDisabled(busy, loading, parent)} key={parent} onClick={() => void load(parent, cursor || 0)}>Load more in {parent}</button>)}
+    </section><aside className="ignore-inspector"><p className="eyebrow">Selected layer</p><h2>Ignore rules</h2>{rules.length ? rules.map((rule) => <article key={rule.id}><code>{rule.selector.kind}: {rule.selector.path}</code><small>{rule.own ? 'Own rule' : `Inherited from ${rule.layer}`}</small>{rule.removable && <button disabled={actionBusy} onClick={() => void removeRule(rule)}>Remove</button>}</article>) : <p>No ignore rules apply in this composition.</p>}</aside></div>
     {ignoreDraft && <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="ignore-title">
       <header><h2 id="ignore-title">Ignore {ignoreDraft.item.path}</h2><button aria-label="Close" onClick={() => setIgnoreDraft(null)}>×</button></header>
       <div className="modal-body"><label><span>Writable target</span><select value={targetLayer} onChange={(event) => onTargetLayer(event.target.value)}>{layers.map((layer) => <option key={layer.id} value={layer.id}>{layer.id}</option>)}</select></label>

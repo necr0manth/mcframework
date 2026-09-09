@@ -765,24 +765,114 @@ def test_warm_delta_detail_preserves_delta_id_collision_rejection(
 def test_warm_delta_detail_rejects_delta_id_collision_added_after_snapshot(
     layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    layer_factory("client", operations=[])
+    layer_factory(
+        "client", operations=[], payload={"unrelated/desired.txt": "desired"}
+    )
     game = game_path(tmp_path)
-    game.mkdir(parents=True)
+    (game / "unrelated").mkdir(parents=True)
+    desired = game / "unrelated/desired.txt"
+    desired.write_text("desired")
     (game / "selected.txt").write_text("selected")
     service = ProjectService(tmp_path)
     service.link("client", "dev", game)
     snapshot = service.explorer_snapshot("dev")
     delta_id = str(snapshot.entries["selected.txt"]["delta_id"])
     original_delta_id = service._delta_id
+    original_generation_matches = project_module.scan_generation_matches
+    original_stat = Path.stat
+    desired_collections: list[tuple[str, ...]] = []
+    desired_stats = 0
+
+    def generation_matches(scan, desired_files):
+        desired_collections.append(tuple(sorted(desired_files)))
+        return original_generation_matches(scan, desired_files)
+
+    def stat(path: Path, *args: object, **kwargs: object) -> Any:
+        nonlocal desired_stats
+        if path == desired:
+            desired_stats += 1
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(project_module, "scan_generation_matches", generation_matches)
+    monkeypatch.setattr(Path, "stat", stat)
+    assert service.delta_detail("dev", delta_id)["path"] == "selected.txt"
+    assert desired_stats == 0
 
     (game / "collision.txt").write_text("collision")
+    fallback_lists = 0
+    original_list = LocalFilesystemInstance.list_files
+
+    def list_files(transport: LocalFilesystemInstance) -> tuple[str, ...]:
+        nonlocal fallback_lists
+        fallback_lists += 1
+        return original_list(transport)
 
     def collide(path: str) -> str:
         return delta_id if path == "collision.txt" else original_delta_id(path)
 
+    monkeypatch.setattr(LocalFilesystemInstance, "list_files", list_files)
     monkeypatch.setattr(service, "_delta_id", collide)
     with pytest.raises(MetadataError, match="does not exist"):
         service.delta_detail("dev", delta_id)
+    assert desired_collections == [(), ()]
+    assert fallback_lists == 1
+
+
+def test_delta_http_compute_does_not_block_files_and_rejects_revision_race(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer_factory("client", operations=[])
+    game = game_path(tmp_path)
+    (game / "empty").mkdir(parents=True)
+    (game / "visible.txt").write_text("visible")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+    service.explorer_snapshot("dev")
+    entered = threading.Event()
+    release = threading.Event()
+    files_done = threading.Event()
+    original_diff = service.instance_diff
+    responses: dict[str, object] = {}
+
+    def blocked_diff(*args: object, **kwargs: object) -> dict[str, Any]:
+        entered.set()
+        if not release.wait(5):
+            raise AssertionError("test did not release delta computation")
+        return original_diff(*args, **kwargs)
+
+    def get_delta(opener: urllib.request.OpenerDirector, base: str) -> None:
+        try:
+            opener.open(base + "api/v1/delta", timeout=5).read()
+        except urllib.error.HTTPError as exc:
+            responses["delta_status"] = exc.code
+
+    def get_files(opener: urllib.request.OpenerDirector, base: str) -> None:
+        try:
+            responses["files"] = json.loads(
+                opener.open(base + "api/v1/files?parent=empty", timeout=5).read()
+            )
+        finally:
+            files_done.set()
+
+    with auto_capture_server(tmp_path, service) as (server, opener, base):
+        monkeypatch.setattr(service, "instance_diff", blocked_diff)
+        delta_thread = threading.Thread(target=get_delta, args=(opener, base), daemon=True)
+        files_thread = threading.Thread(target=get_files, args=(opener, base), daemon=True)
+        delta_thread.start()
+        assert entered.wait(2)
+        files_thread.start()
+        try:
+            assert files_done.wait(2), "files route was blocked by delta computation"
+            with server.state.mutation_lock(server.instance):
+                server.commit_revision()
+        finally:
+            release.set()
+        files_thread.join(timeout=5)
+        delta_thread.join(timeout=5)
+
+    assert responses["files"]["parent"] == "empty"
+    assert responses["files"]["items"] == []
+    assert responses["delta_status"] == 409
 
 
 def test_stale_folder_sha_rejects_before_any_write(layer_factory, tmp_path: Path) -> None:

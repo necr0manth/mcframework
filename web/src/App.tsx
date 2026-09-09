@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ApiClient, ApiError, createKeyedRequestLoader, createRevisionedDeltaLoader, mergeDeltaForRevision, runRevisionedMutation } from './api.js';
+import { ApiClient, ApiError, createKeyedRequestLoader, createRevisionedDeltaLoader, mergeDeltaForRevision, recoverDeltaRevisionConflict, runRevisionedMutation } from './api.js';
 import FileExplorer from './FileExplorer.js';
 import { RoutingRuleEditor, WriteDestination } from './RoutingControls.js';
 import type { MetadataWrite } from './RoutingControls.js';
@@ -230,7 +230,11 @@ export default function App() {
     deltaLoader.load(revision).then((delta: Bootstrap['delta']) => {
       if (!live) return;
       setData((current) => mergeDeltaForRevision(current, revision, delta));
-    }).catch((reason: Error) => live && setError(reason.message));
+    }).catch(async (reason: Error) => {
+      if (!live) return;
+      if (await recoverDeltaRevisionConflict(reason, refreshAfterConflict)) return;
+      setError(reason.message);
+    });
     return () => { live = false; };
   }, [view, data?.delta.loaded, data?.revision, deltaLoader]);
 

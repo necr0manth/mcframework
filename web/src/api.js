@@ -222,6 +222,12 @@ export function createRevisionedDeltaLoader(loadDelta) {
   };
 }
 
+export async function recoverDeltaRevisionConflict(error, refreshAfterConflict) {
+  if (!(error instanceof ApiError) || error.code !== 'revision_conflict') return false;
+  await refreshAfterConflict(error);
+  return true;
+}
+
 export function createKeyedRequestLoader(loadValue) {
   const requests = new Map();
   return {

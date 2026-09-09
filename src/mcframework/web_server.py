@@ -76,12 +76,12 @@ class McpackServer(ThreadingHTTPServer):
         result["revision"] = self.revision
         return result
 
-    def delta(self) -> dict[str, object]:
+    def delta(self, revision: int | None = None) -> dict[str, object]:
         context = self.service.instance_context(self.instance)
         result = self.service.instance_diff(context, enrich_actual=False)
         result["loaded"] = True
         result["complete"] = False
-        result["revision"] = self.revision
+        result["revision"] = self.revision if revision is None else revision
         return result
 
     def consume_browser_capability(self, candidate: str) -> bool:
@@ -148,7 +148,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/v1/delta":
                 with self.server.state.mutation_lock(self.server.instance):
-                    self._json(self.server.delta())
+                    revision = self.server.revision
+                result = self.server.delta(revision)
+                with self.server.state.mutation_lock(self.server.instance):
+                    if revision != self.server.revision:
+                        raise RevisionConflict(revision, self.server.revision)
+                self._json(result)
                 return
             if parsed.path == "/api/v1/routing":
                 query = parse_qs(parsed.query)

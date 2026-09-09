@@ -9,16 +9,19 @@ import {
   errorMessage,
   mergeDeltaForRevision,
   normalizeBootstrap,
+  recoverDeltaRevisionConflict,
   runAutoCaptureFlow,
   runRevisionedMutation,
 } from '../src/api.js';
 import {
   applyExplorerCapturePatch,
   decisionsForPlan,
+  explorerTreeNavigationDisabled,
   explorerRefreshRequests,
   flattenExplorer,
   mergeExplorerPage,
   refreshExplorerState,
+  toggleExplorerDirectory,
 } from '../src/file-explorer-model.js';
 import {
   allMembersActive,
@@ -209,6 +212,36 @@ test('retries the same delta revision after a transient request failure', async 
 
   assert.equal(recovered.loaded, true);
   assert.deepEqual(calls.map((call) => call.url), ['/api/v1/delta', '/api/v1/delta']);
+});
+
+test('delta revision conflict refreshes and allows a retry at the new revision', async () => {
+  let attempts = 0;
+  const conflict = new ApiError('stale revision', 409, 'revision_conflict', {
+    expected: 7, actual: 8,
+  });
+  const loader = createRevisionedDeltaLoader(async () => {
+    attempts += 1;
+    if (attempts === 1) throw conflict;
+    return { revision: 8, items: [], summary: {}, loaded: true };
+  });
+  let refreshed = null;
+
+  let reason;
+  try {
+    await loader.load(7);
+  } catch (error) {
+    reason = error;
+  }
+  assert.equal(await recoverDeltaRevisionConflict(reason, async (error) => {
+    refreshed = error.details.actual;
+  }), true);
+  assert.equal(refreshed, 8);
+  assert.equal((await loader.load(8)).revision, 8);
+  assert.equal(attempts, 2);
+
+  assert.equal(await recoverDeltaRevisionConflict(new Error('offline'), () => {
+    assert.fail('ordinary errors must not trigger conflict refresh');
+  }), false);
 });
 
 test('detail loader keys requests by revision and item, evicts rejection, and preserves stale data', async () => {
@@ -619,6 +652,18 @@ test('file tree helpers preserve lazy children and changed-only server order', (
     flattenExplorer(second, new Set(['config'])).map((item) => item.path),
     ['config', 'config/a.txt', 'mods'],
   );
+});
+
+test('file tree expands before lazy loading and scopes loading disables to its parent', () => {
+  const opening = toggleExplorerDirectory(new Set(), 'mods', false);
+  assert.deepEqual([...opening.expanded], ['mods']);
+  assert.equal(opening.loadParent, 'mods');
+
+  const loading = new Set(['load:mods']);
+  assert.equal(explorerTreeNavigationDisabled('', loading, 'mods'), true);
+  assert.equal(explorerTreeNavigationDisabled('', loading, 'config'), false);
+  assert.equal(explorerTreeNavigationDisabled('refresh:files:2', loading, 'config'), true);
+  assert.equal(explorerTreeNavigationDisabled('capture:config', loading, 'config'), true);
 });
 
 test('compact capture patch updates exact loaded scope and ancestors without collapsing state', () => {
