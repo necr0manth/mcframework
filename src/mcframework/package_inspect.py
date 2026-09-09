@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -69,6 +72,15 @@ class ProviderMatch:
 
 class ProviderMatcher(Protocol):
     def match(self, content: bytes) -> ProviderMatch | None: ...
+
+
+def normalize_package_kind(value: str | None) -> str | None:
+    """Return the package-kind spelling used by metadata declarations."""
+    if value == "shader":
+        return "shaderpack"
+    if value in {"mod", "resourcepack", "datapack", "modpack", "shaderpack"}:
+        return value
+    return None
 
 
 def file_hashes(content: bytes) -> dict[str, str]:
@@ -156,6 +168,7 @@ class ModrinthMatcher:
     """Official anonymous exact-hash lookup. Network failures are a normal no-match."""
 
     endpoint = "https://api.modrinth.com/v2/version_file/{digest}?algorithm=sha512"
+    provider = "modrinth"
     project_endpoint = "https://api.modrinth.com/v2/project/{project_id}"
     project_cache_limit = 128
 
@@ -175,10 +188,9 @@ class ModrinthMatcher:
                 raw = json.loads(response.read())
             if not isinstance(raw, dict) or raw.get("id") != project_id:
                 return None
-            kind = raw.get("project_type")
-            if not isinstance(kind, str) or kind not in (
-                "mod", "resourcepack", "datapack", "modpack", "shader"
-            ):
+            raw_kind = raw.get("project_type")
+            kind = normalize_package_kind(raw_kind if isinstance(raw_kind, str) else None)
+            if kind is None:
                 return None
             categories = _string_list(raw.get("categories"), "categories")
             additional = _string_list(raw.get("additional_categories"), "additional_categories")
@@ -199,7 +211,7 @@ class ModrinthMatcher:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 raw = json.loads(response.read())
-        except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        except (OSError, urllib.error.URLError, UnicodeError, json.JSONDecodeError):
             return None
         if not isinstance(raw, dict):
             return None
@@ -222,6 +234,12 @@ class ModrinthMatcher:
         if not isinstance(project_id, str) or not isinstance(version_id, str):
             return None
         project = self._project(project_id)
+        loaders = raw.get("loaders")
+        version_kind = (
+            "datapack"
+            if isinstance(loaders, list) and "datapack" in loaders
+            else None
+        )
         return ProviderMatch(
             "modrinth",
             project_id,
@@ -229,16 +247,52 @@ class ModrinthMatcher:
             _optional_text(raw.get("version_number")),
             str(selected["url"]),
             hashes,
-            kind=project[0] if project else None,
+            kind=version_kind or (project[0] if project else None),
             categories=project[1] if project else (),
             tags=project[1] if project else (),
         )
 
 
+def curseforge_fingerprint(content: bytes) -> int:
+    """CurseForge's unsigned MurmurHash2 over whitespace-filtered bytes."""
+    filtered = bytes(value for value in content if value not in {9, 10, 13, 32})
+    length = len(filtered)
+    value = (1 ^ length) & 0xFFFFFFFF
+    offset = 0
+    while length >= 4:
+        block = int.from_bytes(filtered[offset : offset + 4], "little")
+        block = (block * 0x5BD1E995) & 0xFFFFFFFF
+        block ^= block >> 24
+        block = (block * 0x5BD1E995) & 0xFFFFFFFF
+        value = ((value * 0x5BD1E995) ^ block) & 0xFFFFFFFF
+        offset += 4
+        length -= 4
+    if length == 3:
+        value ^= filtered[offset + 2] << 16
+    if length >= 2:
+        value ^= filtered[offset + 1] << 8
+    if length >= 1:
+        value ^= filtered[offset]
+        value = (value * 0x5BD1E995) & 0xFFFFFFFF
+    value ^= value >> 13
+    value = (value * 0x5BD1E995) & 0xFFFFFFFF
+    value ^= value >> 15
+    return value & 0xFFFFFFFF
+
+
+def _usable_download_url(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    parsed = urllib.parse.urlparse(value)
+    return value if parsed.scheme in {"http", "https"} and bool(parsed.netloc) else None
+
+
 class CurseForgeFingerprintMatcher:
-    """Optional official fingerprint endpoint; the caller must supply the integer fingerprint."""
+    """Optional official exact-fingerprint adapter."""
 
     endpoint = "https://api.curseforge.com/v1/fingerprints"
+    provider = "curseforge"
+    download_endpoint = "https://api.curseforge.com/v1/mods/{mod_id}/files/{file_id}/download-url"
 
     def __init__(self, api_key: str, timeout: float = 10.0):
         self.api_key = api_key
@@ -259,9 +313,128 @@ class CurseForgeFingerprintMatcher:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 value = json.loads(response.read())
-        except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        except (OSError, urllib.error.URLError, UnicodeError, json.JSONDecodeError):
             return None
         return value if isinstance(value, dict) else None
+
+    def _download_url(self, mod_id: int | str, file_id: int | str) -> str | None:
+        request = urllib.request.Request(
+            self.download_endpoint.format(
+                mod_id=urllib.parse.quote(str(mod_id), safe=""),
+                file_id=urllib.parse.quote(str(file_id), safe=""),
+            ),
+            headers={"x-api-key": self.api_key, "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = json.loads(response.read())
+        except (OSError, urllib.error.URLError, UnicodeError, json.JSONDecodeError):
+            return None
+        return _usable_download_url(raw.get("data")) if isinstance(raw, dict) else None
+
+    def match(self, content: bytes) -> ProviderMatch | None:
+        if not self.api_key.strip():
+            return None
+        fingerprint = curseforge_fingerprint(content)
+        raw = self.lookup(fingerprint)
+        data = raw.get("data") if isinstance(raw, dict) else None
+        matches = data.get("exactMatches") if isinstance(data, dict) else None
+        if not isinstance(matches, list):
+            return None
+        hashes = file_hashes(content)
+        md5 = hashlib.md5(content).hexdigest()  # noqa: S324 - provider identity only
+        for candidate in matches:
+            if not isinstance(candidate, dict):
+                continue
+            file = candidate.get("file")
+            if not isinstance(file, dict) or file.get("fileFingerprint") != fingerprint:
+                continue
+            remote_hashes = file.get("hashes")
+            if not isinstance(remote_hashes, list):
+                continue
+            recognized = []
+            for item in remote_hashes:
+                if not isinstance(item, dict) or not isinstance(item.get("value"), str):
+                    continue
+                algorithm = item.get("algo")
+                expected = (
+                    {1: hashes["sha1"], 2: md5}.get(algorithm)
+                    if isinstance(algorithm, int)
+                    else None
+                )
+                if expected is not None:
+                    recognized.append(item["value"].casefold() == expected)
+            if not recognized or not all(recognized):
+                continue
+            mod_id = file.get("modId", candidate.get("id"))
+            file_id = file.get("id")
+            if not isinstance(mod_id, (str, int)) or not isinstance(file_id, (str, int)):
+                continue
+            download_url = _usable_download_url(file.get("downloadUrl"))
+            if download_url is None:
+                download_url = self._download_url(mod_id, file_id)
+            if download_url is None:
+                continue
+            return ProviderMatch(
+                "curseforge",
+                str(mod_id),
+                str(file_id),
+                _optional_text(file.get("displayName")),
+                download_url,
+                hashes,
+                reason="CurseForge returned the exact file fingerprint and hash",
+            )
+        return None
+
+
+class CompositeProviderMatcher:
+    """Ordered provider matcher used for enrichment and explicit selection."""
+
+    def __init__(self, matchers: Iterable[ProviderMatcher]):
+        self.matchers = tuple(matchers)
+
+    def match_all(self, content: bytes) -> tuple[ProviderMatch, ...]:
+        if not self.matchers:
+            return ()
+        with ThreadPoolExecutor(
+            max_workers=len(self.matchers), thread_name_prefix="mcpack-provider-adapter"
+        ) as pool:
+            matches = tuple(
+                pool.map(lambda matcher: self._safe_match(matcher, content), self.matchers)
+            )
+        return tuple(match for match in matches if match is not None)
+
+    @staticmethod
+    def _safe_match(matcher: ProviderMatcher, content: bytes) -> ProviderMatch | None:
+        try:
+            return matcher.match(content)
+        except Exception:
+            return None
+
+    def match(self, content: bytes) -> ProviderMatch | None:
+        for matcher in self.matchers:
+            match = self._safe_match(matcher, content)
+            if match is not None:
+                return match
+        return None
+
+    def match_provider(self, provider: str, content: bytes) -> ProviderMatch | None:
+        for matcher in self.matchers:
+            declared = getattr(matcher, "provider", None)
+            if declared is not None and declared != provider:
+                continue
+            match = self._safe_match(matcher, content)
+            if match is not None and match.provider == provider:
+                return match
+        return None
+
+
+def default_provider_matcher() -> ProviderMatcher:
+    matchers: list[ProviderMatcher] = [ModrinthMatcher()]
+    api_key = os.environ.get("CURSEFORGE_API_KEY", "").strip()
+    if api_key:
+        matchers.append(CurseForgeFingerprintMatcher(api_key))
+    return CompositeProviderMatcher(matchers)
 
 
 def confirmed_provider_match(value: object, content: bytes) -> ProviderMatch | None:
@@ -277,13 +450,15 @@ def confirmed_provider_match(value: object, content: bytes) -> ProviderMatch | N
         raise MetadataError("provider_match confidence must be exact or fuzzy")
     hashes = value.get("hashes")
     url = value.get("download_url")
-    if not isinstance(hashes, dict) or not isinstance(url, str):
+    confirmed_url = _usable_download_url(url)
+    if not isinstance(hashes, dict) or confirmed_url is None:
         raise MetadataError("confirmed provider_match needs download_url and hashes")
     actual = file_hashes(content)
     if not any(hashes.get(name) == actual[name] for name in ("sha512", "sha1", "sha256")):
-        raise MetadataError("confirmed provider file hashes do not match the instance JAR")
-    kind = value.get("kind")
-    if kind is not None and (not isinstance(kind, str) or not kind):
+        raise MetadataError("confirmed provider file hashes do not match the instance package")
+    raw_kind = value.get("kind")
+    kind = normalize_package_kind(raw_kind if isinstance(raw_kind, str) else None)
+    if raw_kind is not None and kind is None:
         raise MetadataError("provider_match kind must be a non-empty string or null")
     categories = _string_list(value.get("categories", []), "categories")
     tags = _string_list(value.get("tags", []), "tags")
@@ -292,7 +467,7 @@ def confirmed_provider_match(value: object, content: bytes) -> ProviderMatch | N
         str(value["project_id"]),
         str(value["version_id"]),
         _optional_text(value.get("version")),
-        url,
+        confirmed_url,
         actual,
         str(confidence),
         "explicit user confirmation" if confidence == "fuzzy" else "confirmed exact match",

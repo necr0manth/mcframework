@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import time
 import zipfile
 from pathlib import Path
 
@@ -61,15 +62,20 @@ def detail_from_both_entries(service: ProjectService, matcher: Matcher, entry: s
     plan = service.explorer_plan("dev", "mods/selected.jar")
     planned = plan["items"][0]
     assert explorer_entry["delta_id"] == planned["id"]
-    assert not planned.get("provider_candidates")
-    assert matcher.calls == 0, "Files planning must keep provider lookup lazy"
+    assert planned["provider_candidates"][0]["provider"] == "local"
+    assert planned["provider_lookup"] in {"pending", "ready"}
     delta = service.instance_diff(service.instance_context("dev"), enrich_actual=False)
     selected = next(item for item in delta["items"] if item["path"] == planned["path"])
     assert planned["id"] == selected["id"]
-    from_files = service.delta_detail("dev", planned["id"])
+    deadline = time.monotonic() + 1
+    while True:
+        from_files = service.delta_detail("dev", planned["id"])
+        if from_files["provider_lookup"] != "pending" or time.monotonic() >= deadline:
+            break
+        time.sleep(0.001)
     from_delta = service.delta_detail("dev", selected["id"])
     assert from_files == from_delta
-    assert matcher.calls == 1, "the same selected content must reuse provider candidates"
+    assert matcher.calls == 1, "the same selected content must use one provider lookup"
     assert from_files["actual_sha256"] == planned["expected_sha256"]
     assert from_files["jar_metadata"]["mod_ids"] == ["selected"]
     assert from_files["capture_modes"] == ["package", "payload"]

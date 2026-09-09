@@ -4,19 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import io
 import json
 import os
 import re
 import stat
 import tempfile
 import threading
+import zipfile
 from collections.abc import Iterable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
-from functools import wraps
+from functools import partial, wraps
 from pathlib import Path
 from typing import Any
 
@@ -51,12 +53,13 @@ from .operations import (
     operation_to_json,
 )
 from .package_inspect import (
-    ModrinthMatcher,
     ProviderMatch,
     ProviderMatcher,
     confirmed_provider_match,
+    default_provider_matcher,
     file_hashes,
     inspect_jar,
+    normalize_package_kind,
 )
 from .paths import atomic_write, confined_path, matches, normalize_relative_path
 from .preparation import ContentDigests, IncrementalPreparer, content_digest
@@ -81,6 +84,13 @@ class _ContextCache:
     preparer: IncrementalPreparer = field(default_factory=IncrementalPreparer)
     context: InstanceContext | None = None
     generations: tuple[tuple[Path, Generation], ...] = ()
+
+
+@dataclass
+class _ProviderLookup:
+    status: str = "pending"
+    matches: tuple[ProviderMatch, ...] = ()
+    future: Future[tuple[ProviderMatch, ...]] | None = None
 
 
 _edit_journals: ContextVar[tuple[Any, ...]] = ContextVar("metadata_edit_journals", default=())
@@ -125,9 +135,14 @@ class ProjectService:
     ):
         self.project = Path(project or Path.cwd()).resolve()
         self.state = LocalState(self.project)
-        self.provider_matcher = provider_matcher or ModrinthMatcher()
+        self.provider_matcher = provider_matcher or default_provider_matcher()
         self.metadata: MetadataParser = metadata_parser or JsonMetadataParser()
-        self._provider_matches: dict[str, list[dict[str, object]]] = {}
+        self._provider_matches: dict[str, _ProviderLookup] = {}
+        self._provider_prefetches: set[tuple[str, str, tuple[str, int, int, int]]] = set()
+        self._provider_lock = threading.RLock()
+        self._provider_executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="mcpack-provider"
+        )
         self._explorer_snapshots: dict[str, ExplorerSnapshot] = {}
         self._context_lock = threading.RLock()
         self._contexts: dict[str, _ContextCache] = {}
@@ -532,29 +547,29 @@ class ProjectService:
             summary["remove"] += 1
 
         for path in sorted(actual_only):
-            package_metadata = (
-                inspect_jar(context.instance.path / Path(path))
-                if enrich_actual and path.lower().endswith(".jar")
-                else None
-            )
+            package_kind = self._package_kind_for_path(path)
+            package_metadata = None
+            if enrich_actual and package_kind is not None:
+                package_metadata = self._package_content_metadata(path, actual_content[path])
             item = self._delta_item(context, "add", path)
-            if not enrich_actual and path.lower().endswith(".jar"):
+            if not enrich_actual and package_kind is not None:
                 item["kind"] = "package"
             if enrich_actual:
                 item["actual_sha256"] = actual_hashes[path]
             item["capture_modes"] = (
                 ["package", "payload"]
                 if package_metadata is not None
-                or (not enrich_actual and path.lower().endswith(".jar"))
+                or (not enrich_actual and package_kind is not None)
                 else ["payload"]
             )
             item["enriched"] = enrich_actual
             if package_metadata is not None:
                 item["kind"] = "package"
-                item["jar_metadata"] = package_metadata.document()
-                item["provider_candidates"] = self._provider_candidates(
-                    actual_content[path], package_metadata.version
-                )
+                item["proposed_package_kind"] = package_kind
+                version = package_metadata.version if package_kind == "mod" else None
+                if package_kind == "mod":
+                    item["jar_metadata"] = package_metadata.document()
+                self._set_provider_fields(item, actual_content[path], version)
             items.append(item)
             summary["add"] += 1
 
@@ -565,7 +580,7 @@ class ProjectService:
                 continue
             package = self._package_for_path(context, path)
             metadata = (
-                inspect_jar(context.instance.path / Path(path))
+                self._package_content_metadata(path, current_content, kind=str(package.kind))
                 if enrich_actual and package
                 else None
             )
@@ -573,6 +588,7 @@ class ProjectService:
             if (
                 package is not None
                 and metadata is not None
+                and package.kind == "mod"
                 and metadata.version is not None
                 and package.version is not None
                 and _version_is_newer(metadata.version, package.version)
@@ -600,12 +616,14 @@ class ProjectService:
                 item["desired_version"] = package.version
                 item["logical_id"] = package.logical_identity
                 if enrich_actual:
-                    item["provider_candidates"] = self._provider_candidates(
+                    version = metadata.version if package.kind == "mod" and metadata else None
+                    self._set_provider_fields(
+                        item,
                         current_content,
-                        metadata.version if metadata is not None else None,
+                        version,
                         allow_remote=metadata is not None,
                     )
-            if metadata is not None:
+            if metadata is not None and package is not None and package.kind == "mod":
                 item["jar_metadata"] = metadata.document()
                 item["actual_version"] = metadata.version
             items.append(item)
@@ -785,15 +803,57 @@ class ProjectService:
         limit: int = 200,
         target_layer: str | None = None,
     ) -> dict[str, Any]:
-        page = self.explorer_snapshot(instance).page(
+        snapshot = self._empty_page_snapshot(instance, parent)
+        page = snapshot.page(
             parent,
             mode=mode,
             show_ignored=show_ignored,
             cursor=cursor,
             limit=limit,
         )
+        for item in page["items"]:
+            path = str(item["path"])
+            if (
+                item.get("type") != "file"
+                or not item.get("actual")
+                or item.get("delta_id") is None
+                or "package" not in item.get("capture_modes", [])
+            ):
+                continue
+            expected = snapshot.scan.entry_generations.get(path)
+            if expected is not None:
+                self._schedule_package_prefetch(instance, path, expected)
         page["ignore_rules"] = self.ignore_rules(instance, target_layer)
         return page
+
+    def _empty_page_snapshot(self, instance: str, parent: str) -> ExplorerSnapshot:
+        cached = self._explorer_snapshots.get(instance)
+        try:
+            normalized = normalize_relative_path(parent) if parent else ""
+        except MetadataError:
+            return self.explorer_snapshot(instance)
+        if (
+            cached is None
+            or cached.children.get(normalized, ())
+            or not self._snapshot_auto_payload_epochs_match(cached)
+            or not self._snapshot_source_generations_match(cached)
+        ):
+            return self.explorer_snapshot(instance)
+        expected = cached.scan.entry_generations.get(normalized)
+        if expected is None or expected[0] != "directory":
+            return self.explorer_snapshot(instance)
+        target = (
+            cached.scan.root
+            if not normalized
+            else cached.scan.root.joinpath(*normalized.split("/"))
+        )
+        try:
+            current = target.stat(follow_symlinks=False)
+        except OSError:
+            return self.explorer_snapshot(instance)
+        if ("directory", current.st_mtime_ns, current.st_size, current.st_ino) != expected:
+            return self.explorer_snapshot(instance)
+        return cached
 
     def explorer_plan(
         self, instance: str, path: str, target_layer: str | None = None
@@ -832,6 +892,11 @@ class ProjectService:
                 if source_entry is not None and source_entry["actual"]:
                     content = transport.read(item_path)
                     planned["expected_sha256"] = hashlib.sha256(content).hexdigest()
+                    if (
+                        self._package_kind_for_path(item_path) is not None
+                        or self._package_for_path(context, item_path) is not None
+                    ):
+                        self._enrich_package_item(context, planned, content)
                 else:
                     planned["expected_absent"] = True
                 reason = self._same_layer_capture_reason(physical_target, item)
@@ -1150,12 +1215,23 @@ class ProjectService:
                             f"delta {item_id} requires expected_absent from its file plan"
                         )
                 self._revalidate_batch_item(context, target, item, content)
-                if (
-                    mode == "package"
-                    and item.get("package_id") is None
-                    and (content is None or self._inspect_jar_content(content) is None)
-                ):
-                    raise MetadataError(f"package capture requires a valid JAR: {item_path!r}")
+                if mode == "package":
+                    existing_id = item.get("package_id")
+                    existing_kind = (
+                        str(context.resolution.state.packages[str(existing_id)].kind)
+                        if existing_id is not None
+                        else None
+                    )
+                    if content is None or (
+                        self._package_content_metadata(
+                            item_path, content, kind=existing_kind
+                        )
+                        is None
+                        and (existing_id is None or existing_kind != "mod")
+                    ):
+                        raise MetadataError(
+                            f"package capture requires a valid package: {item_path!r}"
+                        )
                 captured.append((item, mode, content))
 
             payload_writes: dict[Path, bytes] = {}
@@ -1192,6 +1268,7 @@ class ProjectService:
                     )
                     if match is not None:
                         operation = additions[-1]
+                        self._validate_provider_kind(match, str(operation["kind"]))
                         # The exact instance bytes are already available. Seed the
                         # normal artifact cache so validating this import stays offline.
                         digest = hashlib.sha256(content).hexdigest()
@@ -1203,8 +1280,6 @@ class ProjectService:
                             "sha256": digest,
                         }
                         operation["update_policy"] = "latest_compatible"
-                        if match.kind is not None:
-                            operation["kind"] = match.kind
                         if match.version is not None:
                             operation["version"] = match.version
                         operation_contexts[str(operation["id"])] = self._provider_routing_context(
@@ -1386,14 +1461,16 @@ class ProjectService:
                 digest = hashlib.sha256(content).hexdigest()
                 item["actual_sha256"] = digest
                 item["expected_sha256"] = digest
-                item["enriched"] = package is None and not item_path.lower().endswith(".jar")
+                item["enriched"] = (
+                    package is None and self._package_kind_for_path(item_path) is None
+                )
                 if desired is not None:
                     item["desired_sha256"] = hashlib.sha256(desired).hexdigest()
                 if package is not None:
                     item["capture_modes"] = ["package"]
                     item["desired_version"] = package.version
                     item["logical_id"] = package.logical_identity
-                elif item_path.lower().endswith(".jar"):
+                elif self._package_kind_for_path(item_path) is not None:
                     item["kind"] = "package"
                     item["capture_modes"] = ["package", "payload"]
                 else:
@@ -1682,7 +1759,12 @@ class ProjectService:
     ) -> tuple[Path, dict[str, Any]]:
         package = context.resolution.state.packages[package_id]
         digest = hashlib.sha256(content).hexdigest()
-        artifact = target / METADATA_DIR / "artifacts" / f"{digest}.jar"
+        artifact = (
+            target
+            / METADATA_DIR
+            / "artifacts"
+            / f"{digest}{self._artifact_suffix(str(package.kind))}"
+        )
         operation: dict[str, Any] = {
             "type": "package",
             "id": package.identity,
@@ -1716,13 +1798,14 @@ class ProjectService:
         reserved_ids: set[str],
     ) -> tuple[Path, dict[str, Any]]:
         digest = hashlib.sha256(content).hexdigest()
-        artifact = target / METADATA_DIR / "artifacts" / f"{digest}.jar"
+        kind = self._infer_package_kind(destination)
+        artifact = target / METADATA_DIR / "artifacts" / f"{digest}{self._artifact_suffix(kind)}"
         package_id = self._allocate_package_id(destination, digest, reserved_ids)
         reserved_ids.add(package_id)
         return artifact, {
             "type": "package",
             "id": package_id,
-            "kind": self._infer_package_kind(destination),
+            "kind": kind,
             "activation": "enabled",
             "destination": destination,
             "source": {
@@ -1795,31 +1878,165 @@ class ProjectService:
                     )
         return None
 
+    @staticmethod
+    def _local_provider_candidate(content: bytes, version: str | None) -> dict[str, object]:
+        hashes = file_hashes(content)
+        return {
+            "provider": "local",
+            "project_id": "",
+            "version_id": hashes["sha256"],
+            "version": version,
+            "download_url": "",
+            "hashes": hashes,
+            "confidence": "exact",
+            "reason": "local exact-SHA256 fallback",
+        }
+
+    def _run_provider_lookup(self, content: bytes) -> tuple[ProviderMatch, ...]:
+        match_all = getattr(self.provider_matcher, "match_all", None)
+        if callable(match_all):
+            matches = tuple(match_all(content))
+        else:
+            match = self.provider_matcher.match(content)
+            matches = () if match is None else (match,)
+        order = {"modrinth": 0, "curseforge": 1}
+        return tuple(sorted(matches, key=lambda match: order.get(match.provider, 2)))
+
+    def _schedule_package_prefetch(
+        self, instance: str, path: str, expected: tuple[str, int, int, int]
+    ) -> None:
+        key = (instance, path, expected)
+        with self._provider_lock:
+            if key in self._provider_prefetches:
+                return
+            self._provider_prefetches.add(key)
+        future = self._provider_executor.submit(
+            self._prefetch_package_path, instance, path, expected
+        )
+        future.add_done_callback(partial(self._finish_package_prefetch, key))
+
+    def _finish_package_prefetch(
+        self,
+        key: tuple[str, str, tuple[str, int, int, int]],
+        future: Future[None],
+    ) -> None:
+        try:
+            future.result()
+        except Exception:
+            pass
+        finally:
+            with self._provider_lock:
+                self._provider_prefetches.discard(key)
+
+    def _prefetch_package_path(
+        self, instance: str, path: str, expected: tuple[str, int, int, int]
+    ) -> None:
+        context = self.instance_context(instance)
+        target = context.instance.path.joinpath(*path.split("/"))
+        content = target.read_bytes()
+        current = target.stat(follow_symlinks=False)
+        if ("file", current.st_mtime_ns, current.st_size, current.st_ino) != expected:
+            return
+        package = self._package_for_path(context, path)
+        kind = str(package.kind) if package is not None else self._package_kind_for_path(path)
+        metadata = self._package_content_metadata(path, content, kind=kind)
+        if metadata is None and package is None:
+            return
+        version = metadata.version if kind == "mod" and metadata is not None else None
+        self._provider_enrichment(content, version, allow_remote=metadata is not None)
+
+    def _finish_provider_lookup(
+        self, digest: str, future: Future[tuple[ProviderMatch, ...]]
+    ) -> None:
+        try:
+            matches = future.result()
+        except Exception:
+            status = "failed"
+            matches = ()
+        else:
+            status = "ready"
+        with self._provider_lock:
+            lookup = self._provider_matches.get(digest)
+            if lookup is not None and lookup.future is future:
+                lookup.status = status
+                lookup.matches = matches
+
+    def _provider_enrichment(
+        self, content: bytes, version: str | None, *, allow_remote: bool = True
+    ) -> tuple[str, list[dict[str, object]]]:
+        local = self._local_provider_candidate(content, version)
+        if not allow_remote:
+            return "ready", [local]
+        digest = str(local["hashes"]["sha512"])  # type: ignore[index]
+        with self._provider_lock:
+            lookup = self._provider_matches.get(digest)
+            if lookup is None:
+                lookup = _ProviderLookup()
+                self._provider_matches[digest] = lookup
+                future = self._provider_executor.submit(self._run_provider_lookup, content)
+                lookup.future = future
+                future.add_done_callback(partial(self._finish_provider_lookup, digest))
+            status = lookup.status
+            matches = lookup.matches
+        return status, [local, *(match.document() for match in matches)]
+
+    def _set_provider_fields(
+        self,
+        item: dict[str, Any],
+        content: bytes,
+        version: str | None,
+        *,
+        allow_remote: bool = True,
+    ) -> None:
+        status, candidates = self._provider_enrichment(
+            content, version, allow_remote=allow_remote
+        )
+        item["provider_lookup"] = status
+        item["provider_candidates"] = candidates
+
     def _provider_candidates(
         self, content: bytes, version: str | None, *, allow_remote: bool = True
     ) -> list[dict[str, object]]:
-        hashes = file_hashes(content)
-        cached = self._provider_matches.get(hashes["sha512"])
-        if cached is not None:
-            return cached
-        candidates: list[dict[str, object]] = [
-            {
-                "provider": "local",
-                "project_id": "",
-                "version_id": hashes["sha256"],
-                "version": version,
-                "download_url": "",
-                "hashes": hashes,
-                "confidence": "exact",
-                "reason": "local exact-SHA256 fallback",
-            }
-        ]
-        if allow_remote:
-            match = self.provider_matcher.match(content)
-            if match is not None:
-                candidates.append(match.document())
-        self._provider_matches[hashes["sha512"]] = candidates
-        return candidates
+        """Compatibility wrapper for callers that only consume the candidate list."""
+        return self._provider_enrichment(content, version, allow_remote=allow_remote)[1]
+
+    def _enrich_package_item(
+        self, context: InstanceContext, item: dict[str, Any], content: bytes
+    ) -> None:
+        path = normalize_relative_path(str(item["path"]))
+        package = self._package_for_path(context, path)
+        inferred_kind = self._package_kind_for_path(path)
+        metadata = self._package_content_metadata(
+            path,
+            content,
+            kind=str(package.kind) if package is not None else None,
+        )
+        if package is None and (inferred_kind is None or metadata is None):
+            item["kind"] = "file"
+            item["capture_modes"] = ["payload"]
+            item["enriched"] = True
+            return
+        package_kind = (
+            normalize_package_kind(str(package.kind))
+            if package is not None
+            else inferred_kind
+        )
+        if package_kind is None:
+            package_kind = self._infer_package_kind(path)
+        digest = hashlib.sha256(content).hexdigest()
+        item["kind"] = "package"
+        item["proposed_package_id"] = self._proposed_package_id(context, path, digest)
+        item["proposed_package_kind"] = package_kind
+        item["capture_modes"] = ["package"] if package is not None else ["package", "payload"]
+        version = metadata.version if package_kind == "mod" and metadata is not None else None
+        self._set_provider_fields(item, content, version, allow_remote=metadata is not None)
+        if package_kind == "mod" and metadata is not None:
+            item["jar_metadata"] = metadata.document()
+            item["actual_version"] = metadata.version
+        if package is not None:
+            item["desired_version"] = package.version
+            item["logical_id"] = package.logical_identity
+        item["enriched"] = True
 
     @staticmethod
     def _package_for_path(context: InstanceContext, path: str) -> Any:
@@ -1857,11 +2074,47 @@ class ProjectService:
 
     @staticmethod
     def _infer_package_kind(path: str) -> str:
+        if path.startswith("shaderpacks/"):
+            return "shaderpack"
         if path.startswith("resourcepacks/"):
             return "resourcepack"
         if path.startswith("datapacks/"):
             return "datapack"
         return "mod"
+
+    @classmethod
+    def _package_kind_for_path(cls, path: str) -> str | None:
+        normalized = path.casefold()
+        kind = cls._infer_package_kind(normalized)
+        if normalized.endswith(".jar"):
+            return "mod"
+        if kind == "mod":
+            return None
+        return kind if normalized.endswith(".zip") else None
+
+    @classmethod
+    def _package_content_metadata(
+        cls, path: str, content: bytes, *, kind: str | None = None
+    ) -> Any:
+        kind = (
+            normalize_package_kind(kind)
+            if kind is not None
+            else cls._package_kind_for_path(path)
+        )
+        if kind == "mod":
+            return cls._inspect_jar_content(content)
+        if kind is None:
+            return None
+        try:
+            with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                archive.infolist()
+        except (OSError, zipfile.BadZipFile):
+            return None
+        return True
+
+    @staticmethod
+    def _artifact_suffix(kind: str) -> str:
+        return ".jar" if kind == "mod" else ".zip"
 
     @staticmethod
     def _package_import_operations(
@@ -1938,7 +2191,7 @@ class ProjectService:
             return item, None
         if path not in desired:
             item = self._delta_item(context, "add", path)
-            if path.lower().endswith(".jar"):
+            if self._package_kind_for_path(path) is not None:
                 item["kind"] = "package"
                 item["capture_modes"] = ["package", "payload"]
             else:
@@ -1979,50 +2232,32 @@ class ProjectService:
         item["actual_sha256"] = hashlib.sha256(content).hexdigest()
         path = normalize_relative_path(str(item["path"]))
         package = self._package_for_path(context, path)
-        if not path.lower().endswith(".jar"):
+        if package is None and self._package_kind_for_path(path) is None:
             item["enriched"] = True
             return item
-        metadata = self._inspect_jar_content(content)
-        if metadata is None and package is None:
-            item["kind"] = "file"
-            item["capture_modes"] = ["payload"]
-            item["enriched"] = True
+        self._enrich_package_item(context, item, content)
+        metadata = self._package_content_metadata(
+            path, content, kind=str(package.kind) if package is not None else None
+        )
+        if item["kind"] != "package":
             return item
-        item["kind"] = "package"
-        item["proposed_package_id"] = self._proposed_package_id(
-            context, path, str(item["actual_sha256"])
-        )
-        item["proposed_package_kind"] = (
-            str(package.kind) if package is not None else self._infer_package_kind(path)
-        )
-        item["capture_modes"] = ["package"] if package is not None else ["package", "payload"]
-        item["provider_candidates"] = self._provider_candidates(
-            content,
-            metadata.version if metadata is not None else None,
-            allow_remote=metadata is not None,
-        )
-        if metadata is not None:
-            item["jar_metadata"] = metadata.document()
-            item["actual_version"] = metadata.version
-        if package is not None:
-            item["desired_version"] = package.version
-            item["logical_id"] = package.logical_identity
-            if (
-                metadata is not None
-                and metadata.version is not None
-                and package.version is not None
-                and _version_is_newer(metadata.version, package.version)
-                and (
-                    {
-                        package.identity,
-                        package.logical_identity,
-                        *(tuple([package.alias]) if package.alias is not None else ()),
-                    }
-                    & set(metadata.mod_ids)
-                )
-            ):
-                item["status"] = "update"
-        item["enriched"] = True
+        if (
+            package is not None
+            and package.kind == "mod"
+            and metadata is not None
+            and metadata.version is not None
+            and package.version is not None
+            and _version_is_newer(metadata.version, package.version)
+            and (
+                {
+                    package.identity,
+                    package.logical_identity,
+                    *(tuple([package.alias]) if package.alias is not None else ()),
+                }
+                & set(metadata.mod_ids)
+            )
+        ):
+            item["status"] = "update"
         return item
 
     def bootstrap(self, name: str, *, include_delta: bool = True) -> dict[str, Any]:
@@ -2466,6 +2701,12 @@ class ProjectService:
         path = normalize_relative_path(item["path"])
         package_id = item.get("package_id")
         if package_id is not None and content is not None:
+            package = context.resolution.state.packages[str(package_id)]
+            if (
+                package.kind != "mod"
+                and self._package_content_metadata(path, content, kind=str(package.kind)) is None
+            ):
+                raise MetadataError(f"package capture requires a readable ZIP: {path!r}")
             self._capture_package_artifact(context, target, str(package_id), path, content)
             return
         if item["status"] == "rename" and content is not None:
@@ -2539,19 +2780,46 @@ class ProjectService:
             delta_id,
             expected_sha256=expected_sha256,
         )
-        if item["status"] == "remove" or not item["path"].lower().endswith(".jar"):
-            raise MetadataError("package import requires an existing changed or extra JAR")
+        item_path = str(item["path"])
+        inferred_kind = self._package_kind_for_path(item_path)
+        existing_package = self._package_for_path(context, item_path)
+        if item["status"] == "remove" or (inferred_kind is None and existing_package is None):
+            raise MetadataError("package import requires an existing changed or extra package")
         target = self._editable_target(instance, context, target_layer)
-        metadata = self._inspect_jar_content(content) if content is not None else None
-        if content is None or metadata is None:
-            raise MetadataError("package import requires a valid changed or extra JAR")
+        metadata = (
+            self._package_content_metadata(
+                item_path,
+                content,
+                kind=str(existing_package.kind) if existing_package is not None else None,
+            )
+            if content is not None
+            else None
+        )
+        package_kind = (
+            normalize_package_kind(str(existing_package.kind))
+            if existing_package is not None
+            else inferred_kind
+        )
+        if (
+            content is None
+            or package_kind is None
+            or (metadata is None and (existing_package is None or package_kind != "mod"))
+        ):
+            raise MetadataError("package import requires a valid changed or extra package")
         digest = hashlib.sha256(content).hexdigest()
         match = self._selected_provider_match(provider_match, content)
+        if match is not None:
+            self._validate_provider_kind(match, package_kind)
         artifact: Path | None = None
         artifact_existed = False
         cached: Path | None = None
         if match is None:
-            artifact = target / METADATA_DIR / "artifacts" / f"{digest}.jar"
+            artifact = (
+                target
+                / METADATA_DIR
+                / "artifacts"
+                / f"{digest}{self._artifact_suffix(package_kind)}"
+            )
             artifact_existed = artifact.exists()
             source = {
                 "provider": "local",
@@ -2565,18 +2833,10 @@ class ProjectService:
                 "sha256": digest,
             }
             cached = self.state.root / "cache" / "sha256" / digest[:2] / digest
-        existing_package = self._package_for_path(context, str(item["path"]))
         package_id = self._proposed_package_id(context, str(item["path"]), digest)
-        package_kind = (
-            match.kind
-            if match is not None and match.kind is not None
-            else existing_package.kind
-            if existing_package is not None
-            else self._infer_package_kind(str(item["path"]))
-        )
         version = (
             (match.version if match is not None else None)
-            or metadata.version
+            or (metadata.version if package_kind == "mod" and metadata is not None else None)
             or (existing_package.version if existing_package is not None else None)
         )
         operations_path = target / METADATA_DIR / "local-edits.json"
@@ -2682,10 +2942,28 @@ class ProjectService:
             isinstance(value, dict) and value.get("provider") == "local"
         ):
             return None
-        if value == "modrinth":
-            candidate = self.provider_matcher.match(content)
+        if isinstance(value, str) and value in {"modrinth", "curseforge"}:
+            match_provider = getattr(self.provider_matcher, "match_provider", None)
+            candidate = (
+                match_provider(value, content)
+                if callable(match_provider)
+                else self.provider_matcher.match(content)
+            )
+            if candidate is not None and candidate.provider != value:
+                candidate = None
             return candidate if candidate is not None and candidate.confidence == "exact" else None
         return confirmed_provider_match(value, content)
+
+    @staticmethod
+    def _validate_provider_kind(match: ProviderMatch, expected_kind: str) -> None:
+        if match.kind is None:
+            return
+        provider_kind = normalize_package_kind(match.kind)
+        if (
+            provider_kind not in {"mod", "shaderpack", "resourcepack", "datapack"}
+            or provider_kind != expected_kind
+        ):
+            raise MetadataError("provider package kind does not match the selected package")
 
     @staticmethod
     def _provider_routing_context(match: ProviderMatch) -> dict[str, Any]:
@@ -3187,9 +3465,12 @@ class ProjectService:
         if kind == "activation":
             return "mods/.pack/disabled.json"
         if kind == "package":
-            folder = {"mod": "mods", "resourcepack": "resourcepacks", "datapack": "datapacks"}.get(
-                str(operation.get("kind", "mod")), "mods"
-            )
+            folder = {
+                "mod": "mods",
+                "shaderpack": "shaderpacks",
+                "resourcepack": "resourcepacks",
+                "datapack": "datapacks",
+            }.get(str(operation.get("kind", "mod")), "mods")
             filename = "mods" if folder == "mods" else "packs"
             if origin == "automatic_dependency":
                 filename = "dependencies"
@@ -3431,7 +3712,12 @@ class ProjectService:
     ) -> None:
         package = context.resolution.state.packages[package_id]
         digest = hashlib.sha256(content).hexdigest()
-        artifact = target / METADATA_DIR / "artifacts" / f"{digest}.jar"
+        artifact = (
+            target
+            / METADATA_DIR
+            / "artifacts"
+            / f"{digest}{self._artifact_suffix(str(package.kind))}"
+        )
         artifact_existed = artifact.exists()
         self._record_edit_paths(artifact)
         atomic_write(artifact, content)
