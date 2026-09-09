@@ -312,6 +312,16 @@ export class ApiClient {
     };
   }
 
+  async retryProviderLookups() {
+    const payload = asObject(await this.request('/api/v1/providers/retry', {
+      method: 'POST', body: {},
+    }));
+    if (Number(payload.revision) !== this.revision) {
+      throw new Error('Provider retry response revision is stale');
+    }
+    return Number(payload.retried ?? 0);
+  }
+
   async addFeature(feature) {
     return this.remember(await this.request('/api/v1/features', { method: 'POST', body: { feature } }));
   }

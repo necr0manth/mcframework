@@ -464,16 +464,29 @@ export default function App() {
     }
   }
 
-  function retryCaptureSources() {
-    if (!captureDraft) return;
-    setCapturePollError('');
-    if (!providerLookupPending(captureDraft.item)) {
-      void openCapture(captureDraft.item, captureDraft.revision);
-      return;
-    }
-    const requestKey = `${captureDraft.revision}:${captureDraft.item.id}`;
+  async function retryCaptureSources() {
+    const draft = captureDraft;
+    if (!draft) return;
+    const requestKey = `${draft.revision}:${draft.item.id}`;
     detailKey.current = requestKey;
-    void pollCaptureDetail(requestKey, captureDraft.item.id, captureDraft.revision);
+    setCapturePollError('');
+    try {
+      await client.retryProviderLookups();
+      if (detailKey.current !== requestKey || client.revision !== draft.revision) return;
+      detailLoader.invalidate(requestKey);
+      const detail = await detailLoader.load(requestKey, draft.item.id, draft.revision) as {
+        revision: number;
+        item: DeltaItem;
+      };
+      if (!applyCaptureDetail(requestKey, draft.revision, detail)) return;
+      if (providerLookupPending(detail.item)) {
+        void pollCaptureDetail(requestKey, draft.item.id, draft.revision);
+      }
+    } catch (reason) {
+      if (detailKey.current === requestKey) {
+        setCapturePollError(reason instanceof Error ? reason.message : 'Could not retry package sources');
+      }
+    }
   }
 
   function closeCapture() {
@@ -651,7 +664,7 @@ export default function App() {
         </div><footer><button className="secondary" onClick={() => setPackageEdit(null)}>Cancel</button><button className="primary" disabled={!!busy} onClick={() => void submitPackageEdit()}>Apply package change</button></footer>
       </section></div>}
 
-      {captureDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeCapture()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="capture-title"><header><div><p className="eyebrow">Semantic write</p><h2 id="capture-title">{deltaPresentation(captureDraft.item).title}</h2></div><button aria-label="Close" onClick={closeCapture}>×</button></header><div className="modal-body"><p>Only this semantic item will be written. Unrelated instance changes stay untouched.</p><TargetSelect layers={data.writable_layers} value={captureDraft.target} onChange={(target) => setCaptureDraft({ ...captureDraft, target })} />{detailBusy && <div className="inline-error" role="status">Inspecting this file and checking package metadata…</div>}{providerLookupPending(captureDraft.item) && !capturePollError && <div className="inline-error" role="status">Checking remote package sources… Local artifact remains available.</div>}{captureDraft.item.provider_lookup === 'failed' && <div className="inline-error" role="status">Remote package sources are unavailable. You can still use the local artifact.</div>}{!detailBusy && canImportDelta(captureDraft.item) && data.capabilities.package_import && <fieldset><legend>Capture mode</legend><label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'import'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'import', modeTouched: true })} /><span><strong>Import as package</strong><small>Use verified provider metadata or a local SHA-256 artifact.</small></span></label>{data.capabilities.capture && <label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'capture'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'capture', modeTouched: true, metadataWrite: undefined })} /><span><strong>Capture as file</strong><small>Preserve the change as a file operation.</small></span></label>}</fieldset>}{!detailBusy && captureDraft.mode === 'import' && <ImportChoices draft={captureDraft} selectedCandidate={selectedCandidate} onChange={setCaptureDraft} />}{captureCreatesMetadata(captureDraft) && <WriteDestination client={client} target={captureDraft.target} operation={captureRoutingOperation(captureDraft)} value={captureDraft.metadataWrite} origin="instance_capture" onChange={(metadataWrite) => setCaptureDraft({ ...captureDraft, metadataWrite })} />}{capturePollError && <div className="inline-error" role="alert"><span>{capturePollError}</span><button className="secondary" onClick={retryCaptureSources}>Retry source lookup</button></div>}{captureError && <div className="inline-error" role="alert"><span>{captureError}</span></div>}</div><footer><button className="secondary" onClick={closeCapture}>Cancel</button><button className="primary" disabled={!!detailBusy || !semanticItemReady(captureDraft.item)} onClick={() => void submitCapture()}>{detailBusy ? 'Inspecting…' : captureDraft.mode === 'import' ? 'Import package' : 'Capture change'}</button></footer></section></div>}
+      {captureDraft && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closeCapture()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="capture-title"><header><div><p className="eyebrow">Semantic write</p><h2 id="capture-title">{deltaPresentation(captureDraft.item).title}</h2></div><button aria-label="Close" onClick={closeCapture}>×</button></header><div className="modal-body"><p>Only this semantic item will be written. Unrelated instance changes stay untouched.</p><TargetSelect layers={data.writable_layers} value={captureDraft.target} onChange={(target) => setCaptureDraft({ ...captureDraft, target })} />{detailBusy && <div className="inline-error" role="status">Inspecting this file and checking package metadata…</div>}{providerLookupPending(captureDraft.item) && !capturePollError && <div className="inline-error" role="status">Checking remote package sources… Local artifact remains available.</div>}{captureDraft.item.provider_lookup === 'failed' && !capturePollError && <div className="inline-error" role="status"><span>Remote package sources are unavailable. You can still use the local artifact.</span><button className="secondary" onClick={() => void retryCaptureSources()}>Retry source lookup</button></div>}{!detailBusy && canImportDelta(captureDraft.item) && data.capabilities.package_import && <fieldset><legend>Capture mode</legend><label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'import'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'import', modeTouched: true })} /><span><strong>Import as package</strong><small>Use verified provider metadata or a local SHA-256 artifact.</small></span></label>{data.capabilities.capture && <label className="choice"><input type="radio" name="capture-mode" checked={captureDraft.mode === 'capture'} onChange={() => setCaptureDraft({ ...captureDraft, mode: 'capture', modeTouched: true, metadataWrite: undefined })} /><span><strong>Capture as file</strong><small>Preserve the change as a file operation.</small></span></label>}</fieldset>}{!detailBusy && captureDraft.mode === 'import' && <ImportChoices draft={captureDraft} selectedCandidate={selectedCandidate} onChange={setCaptureDraft} />}{captureCreatesMetadata(captureDraft) && <WriteDestination client={client} target={captureDraft.target} operation={captureRoutingOperation(captureDraft)} value={captureDraft.metadataWrite} origin="instance_capture" onChange={(metadataWrite) => setCaptureDraft({ ...captureDraft, metadataWrite })} />}{capturePollError && <div className="inline-error" role="alert"><span>{capturePollError}</span><button className="secondary" onClick={() => void retryCaptureSources()}>Retry source lookup</button></div>}{captureError && <div className="inline-error" role="alert"><span>{captureError}</span></div>}</div><footer><button className="secondary" onClick={closeCapture}>Cancel</button><button className="primary" disabled={!!detailBusy || !semanticItemReady(captureDraft.item)} onClick={() => void submitCapture()}>{detailBusy ? 'Inspecting…' : captureDraft.mode === 'import' ? 'Import package' : 'Capture change'}</button></footer></section></div>}
 
       {featureDialog && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setFeatureDialog(false)}><section className="modal compact" role="dialog" aria-modal="true" aria-labelledby="feature-title"><header><div><p className="eyebrow">Temporary layer</p><h2 id="feature-title">Add feature</h2></div><button aria-label="Close" onClick={() => setFeatureDialog(false)}>×</button></header><div className="modal-body"><p>The instance will be relinked to a local temporary layer containing this feature.</p><label><span>Feature</span><select value={featureChoice} onChange={(event) => setFeatureChoice(event.target.value)}>{remainingFeatures.map((feature) => <option value={feature} key={feature}>{feature}</option>)}</select></label></div><footer><button className="secondary" onClick={() => setFeatureDialog(false)}>Cancel</button><button className="primary" disabled={!featureChoice} onClick={() => void addFeature()}>Add feature</button></footer></section></div>}
     </div>

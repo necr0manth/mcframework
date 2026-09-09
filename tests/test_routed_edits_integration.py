@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from mcframework.errors import MetadataError, ResolutionError, UnsafePathError
+from mcframework.operations import operation_from_json
 from mcframework.package_inspect import ProviderMatch, file_hashes
 from mcframework.project import ProjectService
 
@@ -35,6 +36,14 @@ def package(identity: str = "magic") -> dict:
         "destination": f"mods/{identity}.jar",
         "source": {"provider": "local", "location": "unused.jar", "sha256": "0" * 64},
     }
+
+
+@pytest.mark.parametrize("kind", ["modpack", "shader", "plugin", "", None, True])
+def test_package_declaration_rejects_noncanonical_kind(kind: object):
+    with pytest.raises(ResolutionError, match="package kind"):
+        operation_from_json(
+            {**package(), "kind": kind}, source=".pack/packages.json", index=0
+        )
 
 
 def service_for(tmp_path: Path, root: Path) -> ProjectService:
@@ -109,7 +118,61 @@ def test_preview_is_pure_and_schema_one_rejects_unreadable_nested_destination(tm
     assert not service.state.feature_root("dev").exists()
 
 
-@pytest.mark.parametrize("destination", [".pack/layer.json", "payload.json", "../out/.pack/x.json"])
+def test_metadata_destination_shorthand_is_shared_by_plan_context_preview_and_rule_save(
+    tmp_path: Path,
+):
+    root = layer(tmp_path, "client")
+    service = service_for(tmp_path, root)
+    operation = {"type": "ignore", "selector": {"kind": "exact", "path": "logs/a.txt"}}
+    expected = root / "mods/.pack/mods.json"
+
+    assert service.plan_metadata_writes(
+        root, [operation], destination="mods/mods"
+    ).writes[0].path == expected
+    with service.metadata_destination("mods/mods.json"):
+        assert service.plan_metadata_writes(root, [operation]).writes[0].path == expected
+    assert service.preview_routing(
+        "dev", operation, "client", file="mods/.pack/mods"
+    )["writes"][0]["file"] == "mods/.pack/mods.json"
+
+    service.save_routing_rule(
+        "dev", rule("shorthand", "ignored.json"), "layer", "client", file="mods/mods"
+    )
+    saved = service._routing_rules_for_layer(root)
+    assert expected.is_file()
+    assert saved[0].source_file == "mods/.pack/mods.json"
+
+
+def test_schema_two_deep_metadata_uses_literal_pack_as_local_base(tmp_path: Path):
+    root = layer(tmp_path, "client")
+    service = service_for(tmp_path, root)
+    operation = package()
+    operation["destination"] = "mods/.pack/magic.jar"
+    destination = root / "mods/.pack/sub/file.json"
+
+    plan = service.plan_metadata_writes(
+        root, [operation], destination="mods/.pack/sub/file.json"
+    )
+    service._apply_metadata_plan(plan, root)
+
+    assert plan.writes[0].path == destination
+    assert json.loads(destination.read_text())["operations"][0]["destination"] == "magic.jar"
+    assert service._loader().load(root).producers[0].operations[0].package.destination == (
+        "mods/.pack/magic.jar"
+    )
+
+    schema_one = layer(tmp_path, "legacy", schema=1)
+    with pytest.raises(MetadataError, match="schema 2"):
+        service.plan_metadata_writes(
+            schema_one, [operation], destination="mods/.pack/sub/file.json"
+        )
+    with pytest.raises((MetadataError, UnsafePathError), match="destination"):
+        service.plan_metadata_writes(
+            root, [operation], destination="mods/.pack/sub/.pack/file.json"
+        )
+
+
+@pytest.mark.parametrize("destination", [".pack/layer.json", "../out/.pack/x.json"])
 def test_plan_rejects_control_payload_and_escaping_destinations(tmp_path: Path, destination: str):
     root = layer(tmp_path, "client")
     service = service_for(tmp_path, root)

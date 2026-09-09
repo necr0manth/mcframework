@@ -84,14 +84,11 @@ def test_optional_enrichment_failure_keeps_verified_match(monkeypatch, optional_
     assert match.kind is None and match.categories == match.tags == ()
 
 
-@pytest.mark.parametrize("offline", [False, True])
-def test_no_project_request_without_exact_match(monkeypatch, offline):
+def test_no_project_request_without_exact_match(monkeypatch):
     calls = []
 
     def urlopen(request, timeout):
         calls.append(request.full_url)
-        if offline:
-            raise urllib.error.URLError("offline")
         raw = version()
         raw["files"][0]["hashes"]["sha512"] = "0" * 128
         return response(raw)
@@ -99,6 +96,15 @@ def test_no_project_request_without_exact_match(monkeypatch, offline):
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     assert ModrinthMatcher().match(CONTENT) is None
     assert len(calls) == 1 and "/version_file/" in calls[0]
+
+
+def test_modrinth_transport_failure_is_not_a_no_match(monkeypatch):
+    def urlopen(request, timeout):
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    with pytest.raises(urllib.error.URLError, match="offline"):
+        ModrinthMatcher().match(CONTENT)
 
 
 def test_project_cache_is_bounded_and_ids_are_url_encoded(monkeypatch):

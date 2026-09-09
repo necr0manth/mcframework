@@ -278,6 +278,16 @@ def operation_from_json(
         )
     if kind == "package":
         package_id = required_string(raw, "id", source)
+        package_kind = raw.get("kind", "mod")
+        if not isinstance(package_kind, str) or package_kind not in {
+            "mod",
+            "resourcepack",
+            "shaderpack",
+            "datapack",
+        }:
+            raise ResolutionError(
+                f"{source}: package kind must be mod, resourcepack, shaderpack, or datapack"
+            )
         source_raw = raw.get("source")
         if not isinstance(source_raw, dict):
             raise ResolutionError(f"{source}: package source must be an object")
@@ -298,7 +308,7 @@ def operation_from_json(
             PackageDeclaration(
                 identity=package_id,
                 logical_identity=str(raw.get("logical_id", package_id)),
-                kind=str(raw.get("kind", "mod")),
+                kind=package_kind,
                 source=ArtifactSource(provider, location, sha256),
                 destination=normalize_relative_path(required_string(raw, "destination", source)),
                 activation=activation,

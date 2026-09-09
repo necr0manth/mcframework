@@ -41,7 +41,13 @@ from .explorer import (
 from .generations import Generation, generation
 from .loader import MARKER_FILE, METADATA_DIR, WorkspaceLoader
 from .local_state import InstanceRecord, LinkRecord, LocalState, validate_name
-from .metadata import JsonMetadataParser, MetadataParser, decode_record_paths, encode_record_paths
+from .metadata import (
+    JsonMetadataParser,
+    MetadataParser,
+    decode_record_paths,
+    encode_record_paths,
+    normalize_metadata_destination,
+)
 from .metadata_write import MetadataWrite, MetadataWritePlan
 from .model import Activation, IgnoreSelector, PackState, Resolution, SelectorKind, frozen_map
 from .operations import (
@@ -1961,6 +1967,18 @@ class ProjectService:
                 lookup.status = status
                 lookup.matches = matches
 
+    def retry_failed_provider_lookups(self) -> int:
+        """Forget completed provider failures so the next read starts a fresh lookup."""
+        with self._provider_lock:
+            failed = [
+                digest
+                for digest, lookup in self._provider_matches.items()
+                if lookup.status == "failed"
+            ]
+            for digest in failed:
+                del self._provider_matches[digest]
+        return len(failed)
+
     def _provider_enrichment(
         self, content: bytes, version: str | None, *, allow_remote: bool = True
     ) -> tuple[str, list[dict[str, object]]]:
@@ -3154,7 +3172,7 @@ class ProjectService:
     ) -> Iterator[None]:
         """One request's explicit layer-root destination; never moves existing records."""
         if file is not None:
-            normalize_relative_path(file)
+            file = normalize_metadata_destination(file)
         if section is not None and (not isinstance(section, str) or not section):
             raise MetadataError("section must be a non-empty string")
         token = _edit_destinations.set((*_edit_destinations.get(), (self, file, section)))
@@ -3345,7 +3363,7 @@ class ProjectService:
             raise MetadataError("routing rule scope must be layer or instance")
         context = self.instance_context(instance, prepare=False)
         target = self._target_path(instance, context, target_layer)
-        source = file or ".pack/routing.json"
+        source = normalize_metadata_destination(file or ".pack/routing.json")
         rule = operation_from_json(
             raw, source=source if scope == "layer" else ".pack/instance-routing.json", index=0
         )
@@ -3434,11 +3452,12 @@ class ProjectService:
 
     def _metadata_destination(self, layer: Path, relative: str, schema: int) -> Path:
         path = confined_path(layer, relative)
+        relative_parts = path.relative_to(layer).parts
+        directory_parts = relative_parts[:-1]
         if (
             path.suffix not in self.metadata.extensions
-            or path.parent.name != METADATA_DIR
+            or directory_parts.count(METADATA_DIR) != 1
             or path.name == MARKER_FILE
-            or METADATA_DIR in path.parent.relative_to(layer).parts[:-1]
         ):
             supported = ", ".join(self.metadata.extensions)
             raise MetadataError(
@@ -3497,6 +3516,8 @@ class ProjectService:
                 destination = destination if destination is not None else chosen_file
                 section = section if section is not None else chosen_section
                 break
+        if destination is not None:
+            destination = normalize_metadata_destination(destination)
         if section is not None and not any(
             operation.get("type") in {"package", "activation", "group"}
             and isinstance(operation.get("id"), str)

@@ -161,4 +161,6 @@ def normalize_metadata_destination(value: str) -> str:
         parts[-1] += ".json"
     if METADATA_DIRECTORY not in parts:
         parts.insert(len(parts) - 1, METADATA_DIRECTORY)
+    if parts.count(METADATA_DIRECTORY) != 1:
+        raise UnsafePathError("metadata destination must contain exactly one .pack directory")
     return normalize_relative_path("/".join(parts))

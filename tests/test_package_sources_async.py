@@ -5,6 +5,7 @@ import io
 import json
 import threading
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -29,6 +30,37 @@ class NoMatch:
     def match(self, content: bytes) -> ProviderMatch | None:
         del content
         return None
+
+
+def test_failed_provider_lookup_can_be_retried(tmp_path: Path) -> None:
+    class Flaky:
+        calls = 0
+
+        def match(self, content: bytes) -> None:
+            del content
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("provider unavailable")
+
+    matcher = Flaky()
+    service = ProjectService(tmp_path, provider_matcher=matcher)
+    content = archive("mod")
+
+    deadline = time.monotonic() + 2
+    status = "pending"
+    while status == "pending" and time.monotonic() < deadline:
+        status, _ = service._provider_enrichment(content, "1")
+        time.sleep(0.01)
+    assert status == "failed"
+    assert service.retry_failed_provider_lookups() == 1
+
+    deadline = time.monotonic() + 2
+    status = "pending"
+    while status == "pending" and time.monotonic() < deadline:
+        status, _ = service._provider_enrichment(content, "1")
+        time.sleep(0.01)
+    assert status == "ready"
+    assert matcher.calls == 2
 
 
 def archive(kind: str) -> bytes:
@@ -160,6 +192,83 @@ def test_default_matcher_enables_curseforge_only_with_environment_key(
         "modrinth",
         "curseforge",
     ]
+
+
+def test_default_matcher_all_provider_failures_reach_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    content = archive("mod")
+    failing = True
+
+    def urlopen(request: urllib.request.Request, timeout: float):
+        del timeout
+        if failing:
+            if "api.modrinth.com" in request.full_url:
+                return io.BytesIO(b"not-json")
+            raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", {}, None)
+        if "api.modrinth.com" in request.full_url:
+            raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+        return io.BytesIO(b'{"data":{"exactMatches":[]}}')
+
+    monkeypatch.setenv("CURSEFORGE_API_KEY", "configured")
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    service = ProjectService(tmp_path, provider_matcher=default_provider_matcher())
+
+    deadline = time.monotonic() + 2
+    status = "pending"
+    while status == "pending" and time.monotonic() < deadline:
+        status, _ = service._provider_enrichment(content, "1")
+        time.sleep(0.01)
+    assert status == "failed"
+    assert service.retry_failed_provider_lookups() == 1
+
+    failing = False
+    deadline = time.monotonic() + 2
+    while status != "ready" and time.monotonic() < deadline:
+        status, candidates = service._provider_enrichment(content, "1")
+        time.sleep(0.01)
+    assert status == "ready"
+    assert [candidate["provider"] for candidate in candidates] == ["local"]
+
+
+def test_default_composite_keeps_partial_match_or_no_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = b"package bytes"
+    hashes = file_hashes(content)
+    mode = "curseforge-no-match"
+
+    def urlopen(request: urllib.request.Request, timeout: float):
+        del timeout
+        if mode == "curseforge-no-match":
+            if "api.modrinth.com" in request.full_url:
+                raise urllib.error.URLError("modrinth offline")
+            return io.BytesIO(b'{"data":{"exactMatches":[]}}')
+        if "api.curseforge.com" in request.full_url:
+            raise urllib.error.URLError("curseforge offline")
+        value = (
+            {
+                "id": "project",
+                "project_type": "mod",
+                "categories": [],
+                "additional_categories": [],
+            }
+            if "/project/" in request.full_url
+            else {
+                "id": "version",
+                "project_id": "project",
+                "files": [{"url": "https://cdn/file", "hashes": hashes}],
+            }
+        )
+        return io.BytesIO(json.dumps(value).encode())
+
+    monkeypatch.setenv("CURSEFORGE_API_KEY", "configured")
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    assert default_provider_matcher().match_all(content) == ()  # type: ignore[attr-defined]
+
+    mode = "modrinth-match"
+    matches = default_provider_matcher().match_all(content)  # type: ignore[attr-defined]
+    assert [match.provider for match in matches] == ["modrinth"]
 
 
 def test_composite_order_and_modrinth_shader_normalization(monkeypatch: pytest.MonkeyPatch) -> None:

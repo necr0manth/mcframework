@@ -84,6 +84,22 @@ function response(payload, status = 200) {
   });
 }
 
+test('provider retry preserves revision and sends authenticated mutation', async () => {
+  let request;
+  const client = new ApiClient(async (url, options) => {
+    request = { url, options };
+    return response({ ok: true, revision: 7, retried: 2 });
+  });
+  client.csrf = 'csrf-token';
+  client.revision = 7;
+
+  assert.equal(await client.retryProviderLookups(), 2);
+  assert.equal(request.url, '/api/v1/providers/retry');
+  assert.equal(request.options.method, 'POST');
+  assert.equal(request.options.headers.get('X-Mcpack-CSRF'), 'csrf-token');
+  assert.equal(request.options.headers.get('If-Match'), '"7"');
+});
+
 test('normalizes revision, metadata hierarchy and provider evidence', () => {
   const result = normalizeBootstrap(completeBootstrap);
 

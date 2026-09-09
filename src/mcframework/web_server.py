@@ -241,6 +241,12 @@ class Handler(BaseHTTPRequestHandler):
                     raise MetadataError("metadata_write must contain only file and section")
                 destination = self._optional_string(metadata_write, "file")
                 section = self._optional_string(metadata_write, "section")
+                if method == "POST" and parsed.path == "/api/v1/providers/retry":
+                    retried = self.server.service.retry_failed_provider_lookups()
+                    self._json(
+                        {"ok": True, "revision": self.server.revision, "retried": retried}
+                    )
+                    return
                 if method == "POST" and parsed.path == "/api/v1/routing/schema/preview":
                     plan = self.server.service.preview_schema_upgrade(
                         self.server.instance, self._optional_string(body, "target_layer")

@@ -165,7 +165,7 @@ def inspect_jar(path: Path) -> JarMetadata | None:
 
 
 class ModrinthMatcher:
-    """Official anonymous exact-hash lookup. Network failures are a normal no-match."""
+    """Official anonymous exact-hash lookup."""
 
     endpoint = "https://api.modrinth.com/v2/version_file/{digest}?algorithm=sha512"
     provider = "modrinth"
@@ -211,8 +211,10 @@ class ModrinthMatcher:
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 raw = json.loads(response.read())
-        except (OSError, urllib.error.URLError, UnicodeError, json.JSONDecodeError):
-            return None
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return None
+            raise
         if not isinstance(raw, dict):
             return None
         files = raw.get("files", [])
@@ -310,11 +312,8 @@ class CurseForgeFingerprintMatcher:
                 "Accept": "application/json",
             },
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                value = json.loads(response.read())
-        except (OSError, urllib.error.URLError, UnicodeError, json.JSONDecodeError):
-            return None
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            value = json.loads(response.read())
         return value if isinstance(value, dict) else None
 
     def _download_url(self, mod_id: int | str, file_id: int | str) -> str | None:
@@ -325,11 +324,8 @@ class CurseForgeFingerprintMatcher:
             ),
             headers={"x-api-key": self.api_key, "Accept": "application/json"},
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                raw = json.loads(response.read())
-        except (OSError, urllib.error.URLError, UnicodeError, json.JSONDecodeError):
-            return None
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            raw = json.loads(response.read())
         return _usable_download_url(raw.get("data")) if isinstance(raw, dict) else None
 
     def match(self, content: bytes) -> ProviderMatch | None:
@@ -399,33 +395,56 @@ class CompositeProviderMatcher:
         with ThreadPoolExecutor(
             max_workers=len(self.matchers), thread_name_prefix="mcpack-provider-adapter"
         ) as pool:
-            matches = tuple(
-                pool.map(lambda matcher: self._safe_match(matcher, content), self.matchers)
-            )
-        return tuple(match for match in matches if match is not None)
-
-    @staticmethod
-    def _safe_match(matcher: ProviderMatcher, content: bytes) -> ProviderMatch | None:
-        try:
-            return matcher.match(content)
-        except Exception:
-            return None
+            futures = [pool.submit(matcher.match, content) for matcher in self.matchers]
+            matches: list[ProviderMatch] = []
+            failures: list[Exception] = []
+            successful_lookups = 0
+            for future in futures:
+                try:
+                    match = future.result()
+                except Exception as error:
+                    failures.append(error)
+                else:
+                    successful_lookups += 1
+                    if match is not None:
+                        matches.append(match)
+        if successful_lookups == 0 and failures:
+            raise failures[0]
+        return tuple(matches)
 
     def match(self, content: bytes) -> ProviderMatch | None:
+        failures: list[Exception] = []
+        successful_lookups = 0
         for matcher in self.matchers:
-            match = self._safe_match(matcher, content)
+            try:
+                match = matcher.match(content)
+            except Exception as error:
+                failures.append(error)
+                continue
+            successful_lookups += 1
             if match is not None:
                 return match
+        if successful_lookups == 0 and failures:
+            raise failures[0]
         return None
 
     def match_provider(self, provider: str, content: bytes) -> ProviderMatch | None:
+        failures: list[Exception] = []
+        successful_lookups = 0
         for matcher in self.matchers:
             declared = getattr(matcher, "provider", None)
             if declared is not None and declared != provider:
                 continue
-            match = self._safe_match(matcher, content)
+            try:
+                match = matcher.match(content)
+            except Exception as error:
+                failures.append(error)
+                continue
+            successful_lookups += 1
             if match is not None and match.provider == provider:
                 return match
+        if successful_lookups == 0 and failures:
+            raise failures[0]
         return None
 
 

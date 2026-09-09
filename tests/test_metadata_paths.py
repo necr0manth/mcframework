@@ -86,7 +86,15 @@ def test_metadata_destination_shorthand_preserves_explicit_paths(value: str, exp
 
 
 @pytest.mark.parametrize(
-    "value", ["../mods/mods", "/mods/mods", "C:/mods/mods", r"C:\mods\mods", "mods/.pack"]
+    "value",
+    [
+        "../mods/mods",
+        "/mods/mods",
+        "C:/mods/mods",
+        r"C:\mods\mods",
+        "mods/.pack",
+        "mods/.pack/sub/.pack/file.json",
+    ],
 )
 def test_metadata_destination_shorthand_rejects_unsafe_or_directory_paths(value: str):
     with pytest.raises(UnsafePathError):
