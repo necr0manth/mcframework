@@ -8,7 +8,10 @@ import {
   defaultProviderKey,
   orderedProviderCandidates,
   preferredFolderChoices,
-  preferredProviderSelectable,
+  preferredProviderReady,
+  packageLookupProgress,
+  packageLookupIssues,
+  packageLookupMessage,
   previousFolderWizardState,
   reconcileFolderChoices,
   semanticCaptureAction,
@@ -86,11 +89,13 @@ for (const status of ['add', 'changed']) {
 test('Files routes JARs to inspection even when cheap snapshot only offers payload', () => {
   assert.equal(singleFileImportItem(entry).id, entry.delta_id);
   assert.equal(singleFileImportItem({ ...entry, path: 'mods/MOD.JAR' }).enriched, false);
+  assert.equal(singleFileImportItem({ ...entry, path: 'mods/mod.jar.disabled' }).enriched, false);
+  assert.equal(singleFileImportItem({ ...entry, path: 'mods/MOD.JAR.DISABLED' }).enriched, false);
   const stale = singleFileImportItem({ ...entry, enriched: true });
   assert.throws(() => semanticCaptureAction({}, { item: stale }), /inspection/);
   for (const change of [
     { type: 'directory' }, { actual: false }, { type: 'symlink' },
-    { delta_id: null }, { path: 'config/options.txt' },
+    { delta_id: null }, { path: 'config/options.txt' }, { path: 'mods/mod.jar.disabled.bak' },
   ]) assert.equal(singleFileImportItem({ ...entry, ...change }), null);
 });
 
@@ -176,20 +181,22 @@ test('preferred folder source applies exact matches and leaves missing or fuzzy 
   });
 });
 
-test('pending preferred sources unlock when ready and individual defaults only update untouched choices', () => {
+test('remote preference waits for settled sources and refresh preserves explicit local and raw choices', () => {
   const pending = {
     provider_lookup: 'pending',
     items: [
       { id: 'touched', capture_modes: ['package'], provider_lookup: 'pending', provider_candidates: [] },
+      { id: 'raw', capture_modes: ['package', 'payload'], provider_lookup: 'pending', provider_candidates: [] },
       { id: 'untouched', capture_modes: ['package'], provider_lookup: 'pending', provider_candidates: [] },
     ],
   };
-  assert.equal(preferredProviderSelectable(pending, 'modrinth'), false);
-  assert.equal(preferredProviderSelectable(pending, 'curseforge'), false);
-  assert.equal(preferredProviderSelectable(pending, 'local'), true);
+  assert.equal(preferredProviderReady(pending, 'modrinth'), false);
+  assert.equal(preferredProviderReady(pending, 'curseforge'), false);
+  assert.equal(preferredProviderReady(pending, 'local'), true);
   const pendingChoices = {
     touched: { ...defaultPackageChoice(pending.items[0]), userSelected: true },
-    untouched: defaultPackageChoice(pending.items[1]),
+    raw: { mode: 'payload', userSelected: true },
+    untouched: defaultPackageChoice(pending.items[2]),
   };
   const ready = {
     provider_lookup: 'ready',
@@ -199,10 +206,20 @@ test('pending preferred sources unlock when ready and individual defaults only u
       provider_candidates: [{ ...candidate, version_id: `ready-${index}` }],
     })),
   };
-  assert.equal(preferredProviderSelectable(ready, 'modrinth'), true);
+  assert.equal(preferredProviderReady(ready, 'modrinth'), true);
   const reconciled = reconcileFolderChoices(ready.items, pendingChoices);
   assert.equal(reconciled.touched.provider_match, undefined, 'manual local remains local');
   assert.equal(reconciled.touched.userSelected, true);
+  assert.deepEqual(reconciled.raw, { mode: 'payload', userSelected: true });
+  assert.deepEqual(packageLookupProgress(pending), { completed: 0, total: 3 });
+  assert.deepEqual(packageLookupProgress(ready), { completed: 3, total: 3 });
+  const mixed = { items: [ready.items[0], pending.items[1]] };
+  assert.equal(preferredProviderReady(mixed, 'modrinth'), false);
+  assert.equal(preferredProviderReady({ items: [{ ...pending.items[0], provider_lookup: 'failed' }] }, 'modrinth'), true);
+  assert.match(packageLookupMessage(pending.items[0]), /Still checking/);
+  assert.match(packageLookupMessage({ provider_lookup: 'failed' }), /incomplete/);
+  assert.match(packageLookupMessage({ provider_lookup: 'ready' }), /No remote matches/);
+  assert.equal(packageLookupMessage(ready.items[0]), '');
   assert.equal(reconciled.untouched.provider_match.provider, 'modrinth');
 });
 
@@ -287,4 +304,33 @@ test('folder stays outside single import and local choices preserve all atomic e
     a: { mode: 'package', expected_sha256: 'hash-a', expected_kind: 'file', expected_status: 'changed' },
     b: { mode: 'payload', expected_sha256: 'hash-b' },
   });
+});
+
+
+test('partial lookup diagnostics keep successful matches and distinguish incomplete from absent', () => {
+  const error = { provider: 'curseforge', code: 'http_401', message: 'API key is invalid or expired.', retryable: true };
+  const matched = { id: 'matched', capture_modes: ['package'], provider_lookup: 'failed', provider_candidates: [candidate], provider_errors: [error] };
+  const unmatched = { ...matched, id: 'unmatched', provider_candidates: [] };
+  const issues = packageLookupIssues({ items: [matched, unmatched] });
+  assert.equal(issues.count, 2);
+  assert.deepEqual(issues.errors, [error]);
+  assert.equal(issues.retryable, true);
+  assert.match(packageLookupMessage(unmatched), /incomplete/);
+  assert.doesNotMatch(packageLookupMessage(unmatched), /No remote matches/);
+  assert.match(packageLookupMessage(matched), /Available matches/);
+  assert.deepEqual(orderedProviderCandidates(matched), [candidate]);
+  const preferred = preferredFolderChoices([matched, unmatched], 'modrinth');
+  assert.deepEqual(preferred.unresolved, ['unmatched']);
+  assert.deepEqual(preferred.choices.matched.provider_match, candidate);
+});
+
+test('unconfigured provider is an incomplete lookup warning without pointless retry', () => {
+  const item = { capture_modes: ['package'], provider_lookup: 'ready', provider_errors: [
+    { provider: 'curseforge', code: 'not_configured', message: 'API key is not configured.', retryable: false },
+  ] };
+  assert.match(packageLookupMessage(item), /incomplete/);
+  assert.equal(packageLookupIssues({ items: [item] }).retryable, false);
+  assert.equal(packageLookupIssues({ items: [item] }).count, 1);
+  assert.equal(packageLookupIssues({ items: [{ ...item, provider_lookup: 'failed', provider_errors: [] }] }).retryable, true);
+  assert.match(packageLookupMessage({ capture_modes: ['package'], provider_lookup: 'ready', provider_errors: [] }), /No remote matches/);
 });

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import posixpath
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
@@ -199,8 +200,16 @@ class AddIgnoreSelector:
 
 
 type DomainOperation = (
-    PutFile | RemoveFile | RemovePaths | PatchProperties | DeclarePackage |
-    SetPackageActivation | AddDependency | DeclareGroup | DeclareSection | AddPruneSelector
+    PutFile
+    | RemoveFile
+    | RemovePaths
+    | PatchProperties
+    | DeclarePackage
+    | SetPackageActivation
+    | AddDependency
+    | DeclareGroup
+    | DeclareSection
+    | AddPruneSelector
 )
 type MetadataRecord = Operation | RoutingRule
 
@@ -277,7 +286,16 @@ def operation_from_json(
             tuple(removed),
         )
     if kind == "package":
-        package_id = required_string(raw, "id", source)
+        package_id = raw.get("id")
+        source_raw = raw.get("source")
+        if not isinstance(source_raw, dict):
+            raise ResolutionError(f"{source}: package source must be an object")
+        provider = required_string(source_raw, "provider", source).lower()
+        location = required_string(source_raw, "location", source)
+        if not isinstance(package_id, str) or not package_id:
+            # The text frontend normally supplies this, while the fallback keeps
+            # generated/legacy records deterministic as well.
+            package_id = f"anon:{provider}:{location}"
         package_kind = raw.get("kind", "mod")
         if not isinstance(package_kind, str) or package_kind not in {
             "mod",
@@ -288,14 +306,16 @@ def operation_from_json(
             raise ResolutionError(
                 f"{source}: package kind must be mod, resourcepack, shaderpack, or datapack"
             )
-        source_raw = raw.get("source")
-        if not isinstance(source_raw, dict):
-            raise ResolutionError(f"{source}: package source must be an object")
-        provider = required_string(source_raw, "provider", source)
-        location = required_string(source_raw, "location", source)
-        sha256 = required_string(source_raw, "sha256", source).lower()
-        if len(sha256) != 64 or any(char not in "0123456789abcdef" for char in sha256):
+        sha256_value = source_raw.get("sha256", "")
+        if not isinstance(sha256_value, str):
+            raise ResolutionError(f"{source}: package sha256 must be a string")
+        sha256 = sha256_value.lower()
+        if sha256 and (len(sha256) != 64 or any(char not in "0123456789abcdef" for char in sha256)):
             raise ResolutionError(f"{source}: package sha256 must be 64 lowercase hex digits")
+        if not sha256 and provider not in {"local", "direct_url", "modrinth", "curseforge"}:
+            raise ResolutionError(f"{source}: package sha256 is required for provider {provider!r}")
+        if provider == "direct_url" and not sha256:
+            raise ResolutionError(f"{source}: direct_url packages require an explicit sha256")
         activation = parse_activation(raw.get("activation", "available"), source)
         try:
             policy = UpdatePolicy(str(raw.get("update_policy", "fixed")).lower())
@@ -304,13 +324,33 @@ def operation_from_json(
         auto = raw.get("automatic_requires", [])
         if not isinstance(auto, list) or not all(isinstance(item, str) for item in auto):
             raise ResolutionError(f"{source}: automatic_requires must be a string array")
+        destination_value = raw.get("destination", "")
+        if not isinstance(destination_value, str):
+            raise ResolutionError(f"{source}: package destination must be a string")
+        if not destination_value:
+            if provider == "local":
+                filename = posixpath.basename(location.replace("\\", "/"))
+            elif provider == "direct_url":
+                from urllib.parse import unquote, urlsplit
+
+                filename = posixpath.basename(unquote(urlsplit(location).path))
+            else:
+                filename = ""
+            destination_value = (
+                f"{package_kind_directory(package_kind)}/{filename}" if filename else ""
+            )
+        logical_id = raw.get("logical_id", package_id)
+        if not isinstance(logical_id, str) or not logical_id:
+            raise ResolutionError(f"{source}: package logical_id must be a non-empty string")
         return DeclarePackage(
             PackageDeclaration(
                 identity=package_id,
-                logical_identity=str(raw.get("logical_id", package_id)),
+                logical_identity=logical_id,
                 kind=package_kind,
                 source=ArtifactSource(provider, location, sha256),
-                destination=normalize_relative_path(required_string(raw, "destination", source)),
+                destination=(
+                    normalize_relative_path(destination_value) if destination_value else ""
+                ),
                 activation=activation,
                 alias=str(raw["alias"]) if "alias" in raw else None,
                 version=str(raw["version"]) if "version" in raw else None,
@@ -319,6 +359,8 @@ def operation_from_json(
                 layer_precedence=layer_precedence,
                 source_file=source,
                 source_index=index,
+                logical_identity_explicit="logical_id" in raw,
+                automatic_requires_explicit="automatic_requires" in raw,
             )
         )
     if kind == "activation":
@@ -391,6 +433,15 @@ def required_string(raw: Mapping[str, Any], key: str, source: str) -> str:
     return value
 
 
+def package_kind_directory(kind: str) -> str:
+    return {
+        "mod": "mods",
+        "resourcepack": "resourcepacks",
+        "shaderpack": "shaderpacks",
+        "datapack": "datapacks",
+    }[kind]
+
+
 def parse_activation(value: Any, source: str) -> Activation:
     try:
         result = Activation(str(value).lower())
@@ -428,10 +479,23 @@ def apply_local_operations(
 ) -> PackState:
     """Compose independently reduced domain data and web policy for legacy callers."""
     domain_operations = tuple(
-        op for op in operations if isinstance(op, (
-            PutFile, RemoveFile, RemovePaths, PatchProperties, DeclarePackage,
-            SetPackageActivation, AddDependency, DeclareGroup, DeclareSection, AddPruneSelector,
-        ))
+        op
+        for op in operations
+        if isinstance(
+            op,
+            (
+                PutFile,
+                RemoveFile,
+                RemovePaths,
+                PatchProperties,
+                DeclarePackage,
+                SetPackageActivation,
+                AddDependency,
+                DeclareGroup,
+                DeclareSection,
+                AddPruneSelector,
+            ),
+        )
     )
     content, catalog = apply_domain_operations(
         parent.content, parent.package_catalog, domain_operations, precedence
@@ -441,8 +505,14 @@ def apply_local_operations(
         tuple(op for op in operations if isinstance(op, AddIgnoreSelector)),
     )
     return PackState(
-        content.files, content.exclusions, catalog.packages, catalog.dependencies,
-        catalog.groups, catalog.sections, content.prune, policy.ignore,
+        content.files,
+        content.exclusions,
+        catalog.packages,
+        catalog.dependencies,
+        catalog.groups,
+        catalog.sections,
+        content.prune,
+        policy.ignore,
     )
 
 
@@ -455,8 +525,10 @@ def apply_web_policy(
 
 
 def apply_domain_operations(
-    content: ContentState, catalog: PackageState,
-    operations: tuple[DomainOperation, ...], precedence: int,
+    content: ContentState,
+    catalog: PackageState,
+    operations: tuple[DomainOperation, ...],
+    precedence: int,
 ) -> tuple[ContentState, PackageState]:
     """Merge a domain-only local delta against immutable content and package inputs."""
     validate_same_layer(operations)
@@ -487,11 +559,27 @@ def apply_domain_operations(
     activation_operations = tuple(
         operation for operation in operations if isinstance(operation, SetPackageActivation)
     )
+    declared_identities = {
+        operation.package.identity
+        for operation in operations
+        if isinstance(operation, DeclarePackage)
+    }
     for operation in activation_operations:
-        if operation.identity not in catalog.packages:
+        if (
+            operation.activation is Activation.DISABLED
+            and operation.identity not in catalog.packages
+            and operation.identity not in declared_identities
+        ):
             raise ResolutionError(
-                f"same-layer activation cannot target package absent from immutable "
-                f"parent state: {operation.identity!r}; set activation on the declaration"
+                f"disable must target a package inherited from parent state: "
+                f"{operation.identity!r}"
+            )
+        if (
+            operation.identity not in catalog.packages
+            and operation.identity not in declared_identities
+        ):
+            raise ResolutionError(
+                f"activation cannot target undeclared package: {operation.identity!r}"
             )
 
     for operation in operations:
@@ -523,8 +611,8 @@ def apply_domain_operations(
             sections[operation.section.identity] = operation.section
         elif isinstance(operation, AddPruneSelector) and operation.pattern not in prune:
             prune.append(operation.pattern)
-    # Activation operations read only the immutable parent state. Applying their
-    # already-validated delta last makes the local merge independent of source order.
+    # Applying the activation delta last makes the local merge independent of source
+    # order, including when its declaration is in this layer.
     for operation in activation_operations:
         packages[operation.identity] = replace(
             packages[operation.identity], activation=operation.activation
@@ -558,6 +646,21 @@ def validate_same_layer(operations: tuple[Operation, ...]) -> None:
                 raise MergeConflict(
                     f"same layer both writes {path!r} and excludes it with {glob.pattern!r}"
                 )
+    disabled_packages = {
+        operation.identity
+        for operation in operations
+        if isinstance(operation, SetPackageActivation)
+        and operation.activation is Activation.DISABLED
+    }
+    for operation in operations:
+        if (
+            isinstance(operation, AddDependency)
+            and operation.dependency.target in disabled_packages
+        ):
+            raise MergeConflict(
+                f"same-layer disable conflicts with dependency target "
+                f"{operation.dependency.target!r}"
+            )
     # File-level operations conflict even when their fine-grained resources differ.
     for index, (path, operation) in enumerate(exact_files):
         for other_path, other in exact_files[index + 1 :]:
@@ -609,9 +712,7 @@ def operation_to_json(
 ) -> dict[str, Any]:
     """Stable diagnostic representation used by manifests and CLI output."""
     if isinstance(operation, RoutingRule):
-        write: dict[str, Any] = {
-            "file": {"path": operation.file, "path_mode": operation.path_mode}
-        }
+        write: dict[str, Any] = {"file": {"path": operation.file, "path_mode": operation.path_mode}}
         if operation.section is not None:
             write["section"] = operation.section
         return {

@@ -20,7 +20,7 @@ from .model import (
     Resolution,
     frozen_map,
 )
-from .operations import MetadataRecord, PutFile, apply_local_operations
+from .operations import DeclarePackage, MetadataRecord, PutFile, apply_local_operations
 
 
 class LayerComposer:
@@ -38,9 +38,11 @@ class LayerComposer:
         validate_parameter_value(bound)
         definition = layer if isinstance(layer, LayerDefinition) else self.loader.load(layer)
         self._precedence = 0
-        state, trace = self._apply(definition, bound, PackState(), ())
+        state, trace, _context = self._apply(definition, bound, PackState(), (), (None, None))
         state, active = resolve_dependencies(state, self.automatic_dependencies)
-        return Resolution(state, active, tuple(trace))
+        return Resolution(
+            state, active, tuple(trace), automatic_dependencies=self.automatic_dependencies
+        )
 
     def _apply(
         self,
@@ -48,19 +50,48 @@ class LayerComposer:
         parameters: Mapping[str, Any],
         input_state: PackState,
         stack: tuple[str, ...],
-    ) -> tuple[PackState, list[LayerApplicationTrace]]:
+        inherited_context: tuple[str | None, str | None],
+    ) -> tuple[PackState, list[LayerApplicationTrace], tuple[str | None, str | None]]:
         canonical = str(Path(layer.root).resolve())
         if canonical in stack:
             cycle = " -> ".join((*stack[stack.index(canonical) :], canonical))
             raise ResolutionError(f"layer parent cycle: {cycle}")
         state = input_state
         trace: list[LayerApplicationTrace] = []
+        minecraft, loader = inherited_context
+        parent_contexts: list[tuple[str | None, str | None]] = []
         for reference in layer.parents:
             child_parameters = dict(parameters)
             child_parameters.update(reference.parameters)
             parent = self.loader.resolve_parent(layer, reference)
-            state, parent_trace = self._apply(parent, child_parameters, state, (*stack, canonical))
+            state, parent_trace, parent_context = self._apply(
+                parent, child_parameters, state, (*stack, canonical), inherited_context
+            )
+            parent_contexts.append(parent_context)
             trace.extend(parent_trace)
+
+        for field_name, declared in (("minecraft", layer.minecraft), ("loader", layer.loader)):
+            inherited_values = {
+                context[0 if field_name == "minecraft" else 1]
+                for context in parent_contexts
+                if context[0 if field_name == "minecraft" else 1] is not None
+            }
+            if declared is None and len(inherited_values) > 1:
+                raise ResolutionError(
+                    f"layer {layer.identity!r} inherits conflicting {field_name} contexts"
+                )
+        if parent_contexts:
+            minecraft = next(
+                (context[0] for context in reversed(parent_contexts) if context[0] is not None),
+                minecraft,
+            )
+            loader = next(
+                (context[1] for context in reversed(parent_contexts) if context[1] is not None),
+                loader,
+            )
+
+        minecraft = layer.minecraft if layer.minecraft is not None else minecraft
+        loader = layer.loader if layer.loader is not None else loader
 
         self._precedence += 1
         precedence = self._precedence
@@ -68,6 +99,15 @@ class LayerComposer:
         operations: list[MetadataRecord] = []
         for producer in layer.producers:
             concrete = producer.produce(parameters)
+            concrete = tuple(
+                replace(
+                    operation,
+                    package=replace(operation.package, minecraft=minecraft, loader=loader),
+                )
+                if isinstance(operation, DeclarePackage)
+                else operation
+                for operation in concrete
+            )
             producer.validate(concrete)
             operations.extend(concrete)
             produced.append(ProducedOperationTrace(producer.name, producer.source, concrete))
@@ -86,7 +126,7 @@ class LayerComposer:
                 str(Path(layer.root).resolve()),
             )
         )
-        return state, trace
+        return state, trace, (minecraft, loader)
 
 
 class Resolver(LayerComposer):
@@ -133,7 +173,9 @@ def resolve_package_dependencies(
                 packages[target].activation if target in packages else groups[target].activation
             )
             if activation is Activation.DISABLED:
-                raise ResolutionError(f"explicit dependency target is disabled: {target!r}")
+                # An explicit disable in a later layer overrides dependency
+                # activation; the source package remains active.
+                continue
             if target not in active_nodes:
                 active_nodes.add(target)
                 queue.append(target)
@@ -154,9 +196,9 @@ def resolve_package_dependencies(
                     continue
                 usable = [item for item in candidates if item.activation is not Activation.DISABLED]
                 if not usable:
-                    raise ResolutionError(
-                        f"automatic dependency {logical_id!r} has only disabled candidates"
-                    )
+                    # A later explicit disable wins over dependency closure. The
+                    # dependent stays active with an unsatisfied requirement.
+                    continue
                 best_precedence = max(item.layer_precedence for item in usable)
                 best = [item for item in usable if item.layer_precedence == best_precedence]
                 if len(best) != 1:
@@ -175,6 +217,8 @@ def resolve_package_dependencies(
     active = tuple(packages[item] for item in sorted(active_nodes) if item in packages)
     destinations: dict[str, str] = {}
     for package in active:
+        if not package.destination:
+            continue  # Provider resolution supplies the selected filename first.
         previous = destinations.get(package.destination)
         if previous is not None and previous != package.identity:
             raise ResolutionError(

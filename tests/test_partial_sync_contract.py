@@ -1,11 +1,71 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
 
 from mcframework.cli import main
 from mcframework.project import ProjectService
+
+
+def test_cli_sync_prune_preserves_disabled_declared_mod(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = b"artifact"
+    (tmp_path / "artifact.jar").write_bytes(content)
+    layer_factory(
+        "client",
+        operations=[
+            {
+                "type": "package",
+                "id": "kept",
+                "kind": "mod",
+                "activation": "disabled",
+                "destination": "mods/kept.jar",
+                "source": {
+                    "provider": "local",
+                    "location": "artifact.jar",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                },
+            },
+            {
+                "type": "package",
+                "id": "available",
+                "kind": "mod",
+                "activation": "available",
+                "destination": "mods/available.jar",
+                "source": {
+                    "provider": "local",
+                    "location": "artifact.jar",
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                },
+            },
+            {"type": "prune", "glob": "mods/**"},
+        ],
+    )
+    instance = tmp_path.parent / f"{tmp_path.name}-instance"
+    (instance / "mods").mkdir(parents=True)
+    kept = instance / "mods/kept.jar.disabled"
+    available = instance / "mods/available.jar.disabled"
+    unrelated = instance / "mods/unrelated.jar.disabled"
+    kept.write_bytes(b"kept-local")
+    available.write_bytes(b"available")
+    unrelated.write_bytes(b"unrelated")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", instance)
+    before = service.instance_diff(service.instance_context("dev"))
+    assert [item["path"] for item in before["items"]] == [
+        "mods/unrelated.jar.disabled"
+    ]
+
+    monkeypatch.chdir(tmp_path)
+    assert main(["sync", "dev"]) == 0
+
+    assert kept.read_bytes() == b"kept-local"
+    assert not (instance / "mods/kept.jar").exists()
+    assert available.read_bytes() == b"available"
+    assert not unrelated.exists()
 
 
 @pytest.mark.parametrize("removal", ["remove", "remove_paths"])

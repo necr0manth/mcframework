@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from mcframework.errors import MetadataError, ResolutionError, UnsafePathError
+from mcframework.mcpack import McpackParser
 from mcframework.operations import operation_from_json
 from mcframework.package_inspect import ProviderMatch, file_hashes
 from mcframework.project import ProjectService
@@ -330,6 +331,8 @@ def test_provider_categories_route_real_imports_to_layer_or_instance_override(
                 kind="mod",
                 categories=("magic",),
                 tags=("magic",),
+                project_slug="magic",
+                filename="magic.jar",
             )
 
     service = ProjectService(tmp_path, provider_matcher=Matcher())
@@ -373,7 +376,7 @@ def test_provider_categories_route_real_imports_to_layer_or_instance_override(
         )
     record = json.loads((root / filename).read_text())["operations"][0]
     assert record["type"] == "package"
-    assert record["source"]["provider"] == "direct_url"
+    assert record["source"]["provider"] == "modrinth"
     assert not {"categories", "tags", "origin"}.intersection(record)
     assert service.instance_context("dev").files["mods/magic.jar"] == content
 
@@ -634,11 +637,27 @@ def test_new_overlay_uses_main_branch_schema_and_upgrade_survives_feature_edits(
     assert service.routing_options("dev")["schema"] == schema
     service.add_ignore("dev", "a.txt", "exact")
     overlay = service.state.feature_root("dev")
-    marker = overlay / ".pack/layer.json"
-    assert json.loads(marker.read_text())["schema"] == schema
+    marker = overlay / ".pack" / ("layer.json" if schema == 1 else "layer.mcpack")
+    if schema == 1:
+        assert json.loads(marker.read_text())["schema"] == 1
+    else:
+        document = McpackParser().parse(marker.read_bytes(), marker)
+        assert any(
+            line.record is not None
+            and line.record.get("type") == "layer"
+            and line.record.get("id") == "local-dev"
+            for line in document.lines
+        )
     service.upgrade_layer_schema("dev")
     service.add_feature("dev", "feature")
-    assert json.loads(marker.read_text())["schema"] == 2
+    if schema == 1:
+        assert json.loads(marker.read_text())["schema"] == 2
+    else:
+        document = McpackParser().parse(marker.read_bytes(), marker)
+        assert any(
+            line.record is not None and line.record.get("type") == "layer"
+            for line in document.lines
+        )
     assert service.instance_context("dev").resolution.state.ignore[0].value == "a.txt"
 
 

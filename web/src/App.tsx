@@ -5,7 +5,7 @@ import { RoutingRuleEditor, WriteDestination } from './RoutingControls.js';
 import type { MetadataWrite } from './RoutingControls.js';
 import { captureCreatesMetadata, captureRoutingOperation, packageOwnedBy } from './routing-model.js';
 import { candidateKey, defaultProviderKey, orderedProviderCandidates, providerLookupPending, semanticCaptureAction, semanticItemReady } from './semantic-import.js';
-import { allMembersActive, buildMetadataTree, canImportDelta, deltaPresentation, featureSidebarSummary, packageActivationTarget, paginateDelta } from './view-model.js';
+import { allMembersActive, buildMetadataTree, canImportDelta, deltaPresentation, featureSidebarSummary, metadataDeclarationCount, packageActivationTarget, paginateDelta } from './view-model.js';
 
 type View = 'pack' | 'delta' | 'files';
 type Activation = 'available' | 'enabled' | 'disabled' | 'transitive' | string;
@@ -19,6 +19,8 @@ type PackageItem = {
   kind: string;
   version: string;
   activation: Activation;
+  activation_reason?: string;
+  unsatisfied_dependencies?: string[];
   destination: string;
   source: { provider: string; location: string; sha256: string };
   source_file: string;
@@ -602,7 +604,7 @@ export default function App() {
         {readOnly && <div className="banner warning"><span>i</span><p><strong>Read-only session.</strong> This server did not grant editing capabilities.</p></div>}
 
         {view === 'pack' ? <>
-          <div className="page-heading"><div><p className="eyebrow">Resolved composition</p><h1>Pack structure</h1><p>Metadata files, semantic sections and declarations in resolver order.</p></div><div className="summary"><strong>{activePackages}</strong><span>active</span><i /><strong>{data.declarations.length}</strong><span>declarations</span></div></div>
+          <div className="page-heading"><div><p className="eyebrow">Resolved composition</p><h1>Pack structure</h1><p>Metadata files, semantic sections and declarations in resolver order.</p></div><div className="summary"><strong>{activePackages}</strong><span>active</span><i /><strong>{metadataDeclarationCount(data)}</strong><span>declarations</span></div></div>
 
           <div className="routing-toolbar"><TargetSelect layers={data.writable_layers} value={targetLayer} onChange={setTargetLayer} /><button className="secondary" disabled={!!busy} onClick={() => setRoutingDialog(true)}>Write routing rules</button></div>
           {data.groups.length > 0 && <section className="groups" aria-label="Package groups">{data.groups.map((group) => <article key={group.id}><span className="group-icon">G</span><div><small>Package group</small><strong>{group.name}</strong><p>{group.description || group.id}</p></div><Badge state={group.activation} /><Toggle checked={active(group.activation)} disabled={!!busy || !data.capabilities.activation} label={`Toggle ${group.name} group`} onChange={() => toggleGroup(group)} /></article>)}</section>}
@@ -687,7 +689,7 @@ function DeclarationRow({ declaration, packageItem, selected, busy, activationAv
   const isSelected = packageItem
     ? selected?.type === 'package' && selected.value.id === packageItem.id
     : selected?.type === 'declaration' && selected.value.id === declaration.id;
-  return <article className={isSelected ? 'package-row selected' : 'package-row'}><span className="declaration-order">{String(declaration.operation_index + 1).padStart(2, '0')}</span><button className="package-main" onClick={() => onSelect(packageItem ? { type: 'package', value: packageItem } : { type: 'declaration', value: declaration })}><span className="package-icon">{(packageItem?.id || declaration.kind).slice(0, 1).toUpperCase()}</span><span><strong>{packageItem?.id || declarationTarget(declaration) || declaration.kind}</strong><small>{declaration.kind} · {declaration.producer}{packageItem?.destination ? ` · ${packageItem.destination}` : ''}</small></span></button>{packageItem ? <><div className="package-meta"><small>Provider</small><strong>{packageItem.source.provider}</strong></div><div className="package-meta"><small>Version</small><strong>{packageItem.version}</strong></div><Badge state={packageItem.activation} /><Toggle checked={active(packageItem.activation)} disabled={!!busy || !activationAvailable || !packageItem.editable || packageItem.activation === 'transitive'} label={`Toggle ${packageItem.id}`} onChange={() => onToggle(packageItem)} /></> : <><div className="package-meta declaration-source"><small>Source</small><strong>{declaration.source}</strong></div><Badge state={declaration.editable ? 'editable' : 'read-only'} /></>}</article>;
+  return <article className={isSelected ? 'package-row selected' : 'package-row'}><span className="declaration-order">{String(declaration.operation_index + 1).padStart(2, '0')}</span><button className="package-main" onClick={() => onSelect(packageItem ? { type: 'package', value: packageItem } : { type: 'declaration', value: declaration })}><span className="package-icon">{(packageItem?.id || declaration.kind).slice(0, 1).toUpperCase()}</span><span><strong>{packageItem?.id || declarationTarget(declaration) || declaration.kind}</strong><small>{declaration.kind} · {declaration.producer}{packageItem?.destination ? ` · ${packageItem.destination}` : ''}</small></span></button>{packageItem ? <><div className="package-meta"><small>Provider</small><strong>{packageItem.source.provider}</strong></div><div className="package-meta"><small>Version</small><strong>{packageItem.version}</strong></div><Badge state={packageItem.activation} /><Toggle checked={active(packageItem.activation)} disabled={!!busy || !activationAvailable || !packageItem.editable} label={`Toggle ${packageItem.id}`} onChange={() => onToggle(packageItem)} /></> : <><div className="package-meta declaration-source"><small>Source</small><strong>{declaration.source}</strong></div><Badge state={declaration.editable ? 'editable' : 'read-only'} /></>}</article>;
 }
 
 function TargetSelect({ layers, value, onChange }: { layers: Layer[]; value: string; onChange: (value: string) => void }) {
@@ -705,7 +707,7 @@ function ImportChoices({ draft, selectedCandidate, onChange }: {
 }
 
 function PackageDetails({ item }: { item: PackageItem }) {
-  return <><span className="details-icon">{item.id.slice(0, 1).toUpperCase()}</span><p className="eyebrow">Package details</p><h2>{item.id}</h2><Badge state={item.activation} />{!item.editable && <div className="callout"><strong>Read-only declaration</strong><p>The producing source cannot be edited safely from this interface.</p></div>}<dl><div><dt>Logical identity</dt><dd>{item.logical_id}</dd></div><div><dt>Kind</dt><dd>{item.kind}</dd></div><div><dt>Provider</dt><dd>{item.source.provider}</dd></div><div><dt>Version</dt><dd>{item.version}</dd></div><div><dt>Destination</dt><dd>{item.destination || 'Not specified'}</dd></div><div><dt>Source metadata</dt><dd>{item.source_file || 'Generated'}</dd></div><div><dt>Artifact location</dt><dd>{item.source.location || 'Not specified'}</dd></div><div><dt>SHA-256</dt><dd className="hash">{item.source.sha256 || 'Not available'}</dd></div></dl></>;
+  return <><span className="details-icon">{item.id.slice(0, 1).toUpperCase()}</span><p className="eyebrow">Package details</p><h2>{item.id}</h2><Badge state={item.activation} />{item.activation_reason === 'dependency' && <p className="muted-copy">Enabled through a package dependency.</p>}{item.unsatisfied_dependencies?.length ? <div className="callout"><strong>Unmet dependencies</strong><p>{item.unsatisfied_dependencies.join(', ')} are explicitly disabled.</p></div> : null}{!item.editable && <div className="callout"><strong>Read-only declaration</strong><p>The producing source cannot be edited safely from this interface.</p></div>}<dl><div><dt>Logical identity</dt><dd>{item.logical_id}</dd></div><div><dt>Kind</dt><dd>{item.kind}</dd></div><div><dt>Provider</dt><dd>{item.source.provider}</dd></div><div><dt>Version</dt><dd>{item.version}</dd></div><div><dt>Destination</dt><dd>{item.destination || 'Not specified'}</dd></div><div><dt>Source metadata</dt><dd>{item.source_file || 'Generated'}</dd></div><div><dt>Artifact location</dt><dd>{item.source.location || 'Not specified'}</dd></div><div><dt>SHA-256</dt><dd className="hash">{item.source.sha256 || 'Not available'}</dd></div></dl></>;
 }
 
 function DeclarationDetails({ item }: { item: Declaration }) {

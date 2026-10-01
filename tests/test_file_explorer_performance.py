@@ -707,7 +707,12 @@ def test_warm_delta_detail_is_path_specific_and_stale_or_ignored_falls_back(
         patch.setattr(Path, "stat", count_stat)
         patch.setattr(LocalFilesystemInstance, "list_files", fail_list)
         patch.setattr(project_module, "scan_instance", fail_scan)
-        patch.setattr(service, "_provider_enrichment", lambda *args, **kwargs: ("ready", []))
+        patch.setattr(
+            service, "_provider_enrichment",
+            lambda content, version, **kwargs: (
+                "ready", [service._local_provider_candidate(content, version)]
+            ),
+        )
         warm_started = time.perf_counter()
         detail = service.delta_detail("dev", delta_id)
         warm_elapsed = time.perf_counter() - warm_started
@@ -728,7 +733,12 @@ def test_warm_delta_detail_is_path_specific_and_stale_or_ignored_falls_back(
 
     with monkeypatch.context() as patch:
         patch.setattr(LocalFilesystemInstance, "list_files", stale_list)
-        patch.setattr(service, "_provider_enrichment", lambda *args, **kwargs: ("ready", []))
+        patch.setattr(
+            service, "_provider_enrichment",
+            lambda content, version, **kwargs: (
+                "ready", [service._local_provider_candidate(content, version)]
+            ),
+        )
         refreshed = service.delta_detail("dev", delta_id)
     assert stale_lists == 1
     assert refreshed["actual_sha256"] == hashlib.sha256(selected.read_bytes()).hexdigest()

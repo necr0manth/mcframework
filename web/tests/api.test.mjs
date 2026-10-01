@@ -28,6 +28,7 @@ import {
   buildMetadataTree,
   canImportDelta,
   deltaPresentation,
+  metadataDeclarationCount,
   packageActivationTarget,
   paginateDelta,
   providerMatchFor,
@@ -305,19 +306,24 @@ test('delta detail and mutations carry revision and selected file hash', async (
   });
 });
 
-test('metadata tree preserves file, section and declaration order', () => {
+test('metadata tree shows section headers once without repeating them as declarations', () => {
   const normalized = normalizeBootstrap(completeBootstrap);
+  normalized.metadata_files[0].sections = ['performance', 'performance'];
   const tree = buildMetadataTree(normalized);
 
   assert.equal(tree[0].path, 'client/packages.json');
+  assert.equal(tree[0].sections.length, 1);
+  assert.equal(
+    metadataDeclarationCount(normalized),
+    tree.reduce(
+      (total, file) => total + file.sections.reduce((count, section) => count + section.declarations.length, 0),
+      0,
+    ),
+  );
   assert.equal(tree[0].sections[0].title, 'Performance');
   assert.deepEqual(
     tree[0].sections[0].declarations.map((item) => item.id),
     ['decl-package'],
-  );
-  assert.deepEqual(
-    tree[0].sections[1].declarations.map((item) => item.id),
-    ['decl-section'],
   );
 });
 

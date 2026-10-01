@@ -1,0 +1,10 @@
+{
+  "fixture": "C:\\Users\\Tamerlan\\AppData\\Local\\Temp\\mcpack-import-browser-eha9f5pe",
+  "source": "modrinth(\"villagers-regeneration\", \"1.0.0+1.21.3+mod\")\n",
+  "exact_single_line": true,
+  "original_bytes": 32091,
+  "sha256": "9e18c37d06a973ce5b0a28f6f14a615038eeedc2230e163322219a8340d4b0cd",
+  "installed_equal_original": true,
+  "second_build_equal_original": true,
+  "build_command_successes": 2
+}

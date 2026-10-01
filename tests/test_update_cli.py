@@ -132,6 +132,53 @@ def test_cli_resolve_build_and_local_sync(layer_factory, tmp_path: Path, capsys)
     assert metadata_path.read_bytes() == metadata_before
 
 
+def test_legacy_cli_sync_preserves_inactive_package_aliases(
+    layer_factory, tmp_path: Path
+) -> None:
+    artifact = tmp_path / "artifact.jar"
+    artifact.write_bytes(b"jar")
+    digest = hashlib.sha256(b"jar").hexdigest()
+
+    def package(identity: str, activation: str) -> dict:
+        return {
+            "type": "package",
+            "id": identity,
+            "kind": "mod",
+            "activation": activation,
+            "destination": f"mods/{identity}.jar",
+            "source": {
+                "provider": "local",
+                "location": "artifact.jar",
+                "sha256": digest,
+            },
+        }
+
+    layer_factory(
+        "pack",
+        operations=[
+            package("kept", "disabled"),
+            package("available", "available"),
+            {"type": "prune", "glob": "mods/**"},
+        ],
+    )
+    instance = tmp_path / "instance-disabled"
+    (instance / "mods").mkdir(parents=True)
+    kept = instance / "mods/kept.jar.disabled"
+    available = instance / "mods/available.jar.disabled"
+    unrelated = instance / "mods/unrelated.jar.disabled"
+    kept.write_bytes(b"kept-local")
+    available.write_bytes(b"available-local")
+    unrelated.write_bytes(b"unrelated")
+
+    assert main(["sync", str(tmp_path), "pack", "--local", str(instance)]) == 0
+
+    assert kept.read_bytes() == b"kept-local"
+    assert not (instance / "mods/kept.jar").exists()
+    assert not (instance / "mods/available.jar").exists()
+    assert available.read_bytes() == b"available-local"
+    assert not unrelated.exists()
+
+
 def test_cli_reports_domain_errors(layer_factory, tmp_path: Path, capsys) -> None:
     layer_factory("pack", operations=[])
     assert main(["update", str(tmp_path), "pack", "missing"]) == 2

@@ -85,6 +85,12 @@ def test_metadata_destination_shorthand_preserves_explicit_paths(value: str, exp
     assert normalize_metadata_destination(value) == expected
 
 
+def test_metadata_destination_supports_mcpack_default_extension():
+    assert normalize_metadata_destination(
+        "mods/.pack/mods", default_extension=".mcpack"
+    ) == "mods/.pack/mods.mcpack"
+
+
 @pytest.mark.parametrize(
     "value",
     [

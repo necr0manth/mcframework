@@ -208,7 +208,8 @@ class LocalState:
                     break
                 except OSError:
                     if time.monotonic() >= deadline:
-                        raise MetadataError("timed out waiting for .mcpack/state.lock") from None
+                        lock_name = path.relative_to(self.project).as_posix()
+                        raise MetadataError(f"timed out waiting for {lock_name}") from None
                     time.sleep(0.05)
             yield
         finally:

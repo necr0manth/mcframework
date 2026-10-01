@@ -17,7 +17,10 @@ import {
   packagePlanItems,
   packageProviderLookupPending,
   preferredFolderChoices,
-  preferredProviderSelectable,
+  preferredProviderReady,
+  packageLookupProgress,
+  packageLookupIssues,
+  packageLookupMessage,
   previousFolderWizardState,
   reconcileFolderChoices,
   singleFileImportItem,
@@ -43,6 +46,7 @@ type PlanItem = {
   expected_kind?: string; expected_status?: string;
   proposed_package_id?: string; proposed_package_kind?: string;
   provider_lookup?: 'pending' | 'ready' | 'failed';
+  provider_errors?: Array<{ provider: string; code: string; message: string; retryable: boolean }>;
   provider_candidates?: Array<{
     provider: string; project_id: string; version_id: string; version?: string | null;
     confidence: string; reason?: string; download_url?: string;
@@ -106,6 +110,9 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   const [wizardItemIds, setWizardItemIds] = useState<string[]>([]);
   const [wizardIndex, setWizardIndex] = useState(0);
   const [planPollError, setPlanPollError] = useState('');
+  const [planSubmitError, setPlanSubmitError] = useState('');
+  const [retryingLookup, setRetryingLookup] = useState(false);
+  const retryLookupRef = useRef(false);
   const [ignoreDraft, setIgnoreDraft] = useState<{ item: Entry; write?: MetadataWrite } | null>(null);
   const childrenRef = useRef(children);
   const expandedRef = useRef(expanded);
@@ -223,6 +230,7 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
     setWizardItemIds([]);
     setWizardIndex(0);
     setPlanPollError('');
+    setPlanSubmitError('');
   }
 
   function planIsPending(value: ExplorerPlan) {
@@ -260,17 +268,22 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
 
   async function retryPlanPolling() {
     const current = plan;
-    if (!current) return;
+    if (!current || retryLookupRef.current) return;
+    retryLookupRef.current = true;
+    setRetryingLookup(true);
     setPlanPollError('');
     const generation = ++planGenerationRef.current;
     try {
       await client.retryProviderLookups();
       if (planGenerationRef.current !== generation) return;
-      void pollPlan(current.path, current.revision, generation);
+      await pollPlan(current.path, current.revision, generation);
     } catch (reason) {
       if (planGenerationRef.current === generation) {
         setPlanPollError(reason instanceof Error ? reason.message : 'Could not retry package sources');
       }
+    } finally {
+      retryLookupRef.current = false;
+      setRetryingLookup(false);
     }
   }
 
@@ -302,12 +315,12 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   }
 
   function choosePreferredProvider(provider: string) {
-    if (!plan || !preferredProviderSelectable(plan, provider)) return;
+    if (!plan) return;
     setPreferredProvider(provider);
   }
 
   function continuePreferredProvider() {
-    if (!plan || !preferredProvider || !preferredProviderSelectable(plan, preferredProvider)) return;
+    if (!plan || !preferredProvider || !preferredProviderReady(plan, preferredProvider)) return;
     const preferred = preferredFolderChoices(plan.items, preferredProvider);
     const explicitChoices = Object.fromEntries(Object.entries(preferred.choices).map(
       ([id, choice]) => [id, { ...choice, userSelected: true }],
@@ -400,6 +413,7 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
     setWizardItemIds([]);
     setWizardIndex(0);
     setPlanPollError('');
+    setPlanSubmitError('');
     setPlan(value);
     if (planIsPending(value)) void pollPlan(value.path, value.revision, generation);
   }
@@ -456,17 +470,30 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   async function submitPlan() {
     if (!plan) return;
     const label = `capture:${plan.path}`;
+    setPlanSubmitError('');
     try {
       const decisions = decisionsForPlan(plan.items, choices);
       setBusy(label);
       const applied = await onMutate(
         label,
-        () => client.capturePath(plan.path, targetLayer, plan.revision, decisions),
+        async () => {
+          try {
+            return await client.capturePath(plan.path, targetLayer, plan.revision, decisions);
+          } catch (reason) {
+            // onMutate handles errors globally, behind this modal. Keep the actual
+            // capture failure visible here as well, without losing the choices.
+            setPlanSubmitError(reason instanceof Error ? reason.message : 'Could not capture files');
+            throw reason;
+          }
+        },
         `${plan.path} and all changed descendants were sent atomically.`,
       );
       if (applied) closePlan();
+      else setPlanSubmitError((current) => current || 'The folder was not sent. Review the choices and try again.');
     } catch (reason) {
-      onError(reason instanceof Error ? reason.message : 'Could not capture files');
+      const message = reason instanceof Error ? reason.message : 'Could not capture files';
+      setPlanSubmitError(message);
+      onError(message);
     } finally { setBusy((value) => value === label ? '' : value); }
   }
 
@@ -484,6 +511,8 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
     } finally { setBusy((value) => value === label ? '' : value); }
   }
 
+  const lookupProgress = packageLookupProgress(plan);
+  const lookupIssues = packageLookupIssues(plan);
   const wizardItem = plan?.items.find((item) => item.id === wizardItemIds[wizardIndex]);
   const wizardChoice = wizardItem ? choices[wizardItem.id] : undefined;
   const wizardChoiceNeedsConfirmation = wizardChoice?.provider_match?.confidence === 'fuzzy'
@@ -506,6 +535,6 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
         <WriteDestination client={client} target={targetLayer} operation={{ type: 'ignore', selector: { kind: ignoreDraft.item.type === 'directory' ? 'subtree' : 'exact', path: ignoreDraft.item.path } }} value={ignoreDraft.write} onChange={(write) => setIgnoreDraft({ ...ignoreDraft, write })} />
       </div><footer><button className="secondary" onClick={() => setIgnoreDraft(null)}>Cancel</button><button className="primary" disabled={!!busy} onClick={() => void ignore(ignoreDraft.item, ignoreDraft.write)}>Add ignore</button></footer>
     </section></div>}
-    {plan && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closePlan()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="folder-capture-title"><header><div><p className="eyebrow">Atomic folder capture</p><h2 id="folder-capture-title">{wizardStep === 'strategy' ? 'Choose package handling' : wizardStep === 'preferred' ? 'Choose a preferred source' : wizardStep === 'items' ? `Choose source ${wizardIndex + 1} of ${wizardItemIds.length}` : 'Review folder capture'}</h2></div><button aria-label="Close" onClick={closePlan}>×</button></header><div className="modal-body"><p>No files are written until you approve the final review.</p>{planIsPending(plan) && !planPollError && <div className="inline-error" role="status">Checking remote package sources… Local choices remain available.</div>}{plan.items.some((item) => item.provider_lookup === 'failed') && !planPollError && <div className="inline-error" role="status"><span>Remote package sources are unavailable. Local choices remain available.</span><button className="secondary" onClick={() => void retryPlanPolling()}>Retry source lookup</button></div>}{planPollError && <div className="inline-error" role="alert"><span>{planPollError}</span><button className="secondary" onClick={() => void retryPlanPolling()}>Retry source lookup</button></div>}{wizardStep === 'strategy' && <fieldset><legend>Selection strategy</legend><label className="choice"><input type="radio" name="folder-strategy" checked={wizardStrategy === 'preferred'} onChange={() => chooseStrategy('preferred')} /><span><strong>Preferred source for all</strong><small>Use one source where an exact match exists, then review exceptions one at a time.</small></span></label><label className="choice"><input type="radio" name="folder-strategy" checked={wizardStrategy === 'individual'} onChange={() => chooseStrategy('individual')} /><span><strong>Choose each package</strong><small>Review one package at a time before the final atomic capture.</small></span></label></fieldset>}{wizardStep === 'preferred' && <fieldset><legend>Preferred artifact source</legend>{['modrinth', 'curseforge', 'local'].map((provider) => <label className="choice" key={provider}><input type="radio" name="preferred-provider" checked={preferredProvider === provider} disabled={!preferredProviderSelectable(plan, provider)} onChange={() => choosePreferredProvider(provider)} /><span><strong>{provider === 'modrinth' ? 'Modrinth' : provider === 'curseforge' ? 'CurseForge' : 'Local artifact'}</strong><small>{provider === 'local' ? 'Use verified local artifacts for every package.' : `Automatically use exact ${provider === 'modrinth' ? 'Modrinth' : 'CurseForge'} matches.`}</small></span></label>)}</fieldset>}{wizardStep === 'items' && wizardItem && <fieldset><legend>{wizardItem.path}</legend>{orderedProviderCandidates(wizardItem).map((candidate) => <label className="provider-choice" key={candidateKey(candidate)}><input type="radio" name={`folder-provider-${wizardItem.id}`} checked={candidateKey(wizardChoice?.provider_match || {}) === candidateKey(candidate)} onChange={() => setChoices({ ...choices, [wizardItem.id]: { mode: 'package', provider_match: candidate, userSelected: true } })} /><span><strong>{candidate.provider} · {candidate.version || candidate.version_id}</strong><small>{candidate.project_id}{candidate.reason ? ` · ${candidate.reason}` : ''}</small></span><span className={`badge activation-${candidate.confidence}`}>{candidate.confidence}</span></label>)}<label className="provider-choice"><input type="radio" name={`folder-provider-${wizardItem.id}`} checked={wizardChoice?.mode === 'package' && !wizardChoice.provider_match} onChange={() => setChoices({ ...choices, [wizardItem.id]: { mode: 'package', userSelected: true } })} /><span><strong>Local artifact</strong><small>Use the verified local file.</small></span><span className="badge activation-exact">exact</span></label>{wizardItem.capture_modes.includes('payload') && <label className="provider-choice"><input type="radio" name={`folder-provider-${wizardItem.id}`} checked={wizardChoice?.mode === 'payload'} onChange={() => setChoices({ ...choices, [wizardItem.id]: { mode: 'payload', userSelected: true } })} /><span><strong>Raw file</strong><small>Capture this package file as ordinary payload.</small></span></label>}{wizardChoice?.provider_match?.confidence === 'fuzzy' && <label className="fuzzy-confirm"><input type="checkbox" checked={wizardChoice.fuzzyConfirmed === true} onChange={(event) => setChoices({ ...choices, [wizardItem.id]: { ...wizardChoice, fuzzyConfirmed: event.target.checked } })} /><span><strong>Use this fuzzy match</strong><small>I reviewed the project and version identity.</small></span></label>}</fieldset>}{wizardStep === 'review' && <div><p>Review {packagePlanItems(plan.items).length} package choices. The folder is sent with one atomic request.</p>{packagePlanItems(plan.items).map((item: PlanItem) => { const choice = choices[item.id]; const provider = String(choice?.provider_match?.provider || (choice?.mode === 'payload' ? 'raw file' : 'local')); return <fieldset key={item.id}><legend>{item.path}</legend><p>{provider}</p></fieldset>; })}</div>}</div><footer><button className="secondary" onClick={closePlan}>Cancel</button>{wizardStep !== 'strategy' && <button className="secondary" disabled={!!busy} onClick={previousWizardStep}>Back</button>}{wizardStep === 'strategy' && <button className="primary" disabled={!!busy || !wizardStrategy} onClick={continueStrategy}>Continue</button>}{wizardStep === 'preferred' && <button className="primary" disabled={!!busy || !preferredProvider || !preferredProviderSelectable(plan, preferredProvider)} onClick={continuePreferredProvider}>Continue</button>}{wizardStep === 'items' && <button className="primary" disabled={!!busy || !wizardChoice || wizardChoiceNeedsConfirmation} onClick={nextWizardItem}>{wizardIndex + 1 < wizardItemIds.length ? 'Next package' : 'Review choices'}</button>}{wizardStep === 'review' && <button className="primary" disabled={!!busy} onClick={() => void submitPlan()}>Send all atomically</button>}</footer></section></div>}
+    {plan && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && closePlan()}><section className="modal" role="dialog" aria-modal="true" aria-labelledby="folder-capture-title"><header><div><p className="eyebrow">Atomic folder capture</p><h2 id="folder-capture-title">{wizardStep === 'strategy' ? 'Choose package handling' : wizardStep === 'preferred' ? 'Choose a preferred source' : wizardStep === 'items' ? `${wizardStrategy === 'preferred' ? 'Review exception' : 'Choose source'} ${wizardIndex + 1} of ${wizardItemIds.length}` : 'Review folder capture'}</h2></div><button aria-label="Close" onClick={closePlan}>×</button></header><div className="modal-body"><p>No files are written until you approve the final review.</p>{planIsPending(plan) && !planPollError && <div className="inline-error" role="status">Checking remote package sources… {lookupProgress.completed} of {lookupProgress.total} checked. Local choices remain available.</div>}{lookupIssues.count > 0 && !planPollError && <div className="inline-error" role="status"><div><span>Remote source lookup is incomplete for {lookupIssues.count} of {lookupProgress.total} packages. Available matches remain usable.</span>{lookupIssues.errors.map((error) => <p className="lookup-detail" key={`${error.provider}:${error.code}:${error.message}`}>{error.provider === 'curseforge' ? 'CurseForge' : error.provider === 'modrinth' ? 'Modrinth' : error.provider}: {error.message}</p>)}</div>{lookupIssues.retryable && <button className="secondary" disabled={retryingLookup || planIsPending(plan)} onClick={() => void retryPlanPolling()}>{retryingLookup ? 'Retrying sources…' : 'Retry source lookup'}</button>}</div>}{planPollError && <div className="inline-error" role="alert"><span>{planPollError}</span><button className="secondary" disabled={retryingLookup} onClick={() => void retryPlanPolling()}>{retryingLookup ? 'Retrying sources…' : 'Retry source lookup'}</button></div>}{wizardStep === 'strategy' && <fieldset><legend>Selection strategy</legend><label className="choice"><input type="radio" name="folder-strategy" checked={wizardStrategy === 'preferred'} onChange={() => chooseStrategy('preferred')} /><span><strong>Preferred source for all</strong><small>Use one source where an exact match exists, then review exceptions one at a time.</small></span></label><label className="choice"><input type="radio" name="folder-strategy" checked={wizardStrategy === 'individual'} onChange={() => chooseStrategy('individual')} /><span><strong>Choose each package</strong><small>Review one package at a time before the final atomic capture.</small></span></label></fieldset>}{wizardStep === 'preferred' && <fieldset><legend>Preferred artifact source</legend>{['modrinth', 'curseforge', 'local'].map((provider) => <label className="choice" key={provider}><input type="radio" name="preferred-provider" checked={preferredProvider === provider} onChange={() => choosePreferredProvider(provider)} /><span><strong>{provider === 'modrinth' ? 'Modrinth' : provider === 'curseforge' ? 'CurseForge' : 'Local artifact'}</strong><small>{provider === 'local' ? 'Use verified local artifacts for every package.' : `Automatically use exact ${provider === 'modrinth' ? 'Modrinth' : 'CurseForge'} matches.`}</small></span></label>)}</fieldset>}{wizardStep === 'items' && wizardStrategy === 'preferred' && <p className="lookup-detail">Reviewing {wizardItemIds.length} exceptions out of {lookupProgress.total} packages without an exact match from {preferredProvider === 'modrinth' ? 'Modrinth' : 'CurseForge'}. Other sources may still have matches.</p>}{wizardStep === 'items' && wizardItem && <fieldset><legend>{wizardItem.path}</legend>{packageLookupMessage(wizardItem) && <p className="package-lookup-status" role="status">{packageLookupMessage(wizardItem)}</p>}{orderedProviderCandidates(wizardItem).map((candidate) => <label className="provider-choice" key={candidateKey(candidate)}><input type="radio" name={`folder-provider-${wizardItem.id}`} checked={candidateKey(wizardChoice?.provider_match || {}) === candidateKey(candidate)} onChange={() => setChoices({ ...choices, [wizardItem.id]: { mode: 'package', provider_match: candidate, userSelected: true } })} /><span><strong>{candidate.provider} · {candidate.version || candidate.version_id}</strong><small>{candidate.project_id}{candidate.reason ? ` · ${candidate.reason}` : ''}</small></span><span className={`badge activation-${candidate.confidence}`}>{candidate.confidence}</span></label>)}<label className="provider-choice"><input type="radio" name={`folder-provider-${wizardItem.id}`} checked={wizardChoice?.mode === 'package' && !wizardChoice.provider_match} onChange={() => setChoices({ ...choices, [wizardItem.id]: { mode: 'package', userSelected: true } })} /><span><strong>Local artifact</strong><small>Use the verified local file.</small></span><span className="badge activation-exact">exact</span></label>{wizardItem.capture_modes.includes('payload') && <label className="provider-choice"><input type="radio" name={`folder-provider-${wizardItem.id}`} checked={wizardChoice?.mode === 'payload'} onChange={() => setChoices({ ...choices, [wizardItem.id]: { mode: 'payload', userSelected: true } })} /><span><strong>Raw file</strong><small>Capture this package file as ordinary payload.</small></span></label>}{wizardChoice?.provider_match?.confidence === 'fuzzy' && <label className="fuzzy-confirm"><input type="checkbox" checked={wizardChoice.fuzzyConfirmed === true} onChange={(event) => setChoices({ ...choices, [wizardItem.id]: { ...wizardChoice, fuzzyConfirmed: event.target.checked } })} /><span><strong>Use this fuzzy match</strong><small>I reviewed the project and version identity.</small></span></label>}</fieldset>}{wizardStep === 'review' && <div><p>Review {packagePlanItems(plan.items).length} package choices. The folder is sent with one atomic request.</p>{packagePlanItems(plan.items).map((item: PlanItem) => { const choice = choices[item.id]; const provider = String(choice?.provider_match?.provider || (choice?.mode === 'payload' ? 'raw file' : 'local')); return <fieldset key={item.id}><legend>{item.path}</legend><p>{provider}</p></fieldset>; })}</div>}</div>{planSubmitError && <div className="inline-error" role="alert">{planSubmitError}</div>}<footer><button className="secondary" onClick={closePlan}>Cancel</button>{wizardStep !== 'strategy' && <button className="secondary" disabled={!!busy} onClick={previousWizardStep}>Back</button>}{wizardStep === 'strategy' && <button className="primary" disabled={!!busy || !wizardStrategy} onClick={continueStrategy}>Continue</button>}{wizardStep === 'preferred' && <button className="primary" disabled={!!busy || !preferredProvider || !preferredProviderReady(plan, preferredProvider)} onClick={continuePreferredProvider}>{preferredProvider && !preferredProviderReady(plan, preferredProvider) ? 'Checking sources...' : 'Continue'}</button>}{wizardStep === 'items' && <button className="primary" disabled={!!busy || !wizardChoice || wizardChoiceNeedsConfirmation} onClick={nextWizardItem}>{wizardIndex + 1 < wizardItemIds.length ? 'Next package' : 'Review choices'}</button>}{wizardStep === 'review' && <button className="primary" disabled={!!busy} onClick={() => void submitPlan()}>Send all atomically</button>}</footer></section></div>}
   </>;
 }

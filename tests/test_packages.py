@@ -50,7 +50,9 @@ def test_explicit_dependency_activates_transitively(layer_factory, tmp_path: Pat
     assert result.state.packages["library"].activation is Activation.TRANSITIVE
 
 
-def test_disabled_or_missing_explicit_dependency_fails(layer_factory, tmp_path: Path) -> None:
+def test_later_disable_overrides_explicit_dependency_and_missing_dependency_fails(
+    layer_factory, tmp_path: Path
+) -> None:
     layer_factory(
         "disabled",
         operations=[
@@ -59,8 +61,8 @@ def test_disabled_or_missing_explicit_dependency_fails(layer_factory, tmp_path: 
             {"type": "dependency", "source": "root", "target": "library"},
         ],
     )
-    with pytest.raises(ResolutionError, match="disabled"):
-        resolve(tmp_path, "disabled")
+    result = resolve(tmp_path, "disabled")
+    assert [item.identity for item in result.active_packages] == ["root"]
     layer_factory(
         "missing",
         operations=[
@@ -124,7 +126,7 @@ def test_automatic_dependency_can_be_disabled(layer_factory, tmp_path: Path) -> 
     ] == ["root"]
 
 
-def test_automatic_dependency_ambiguity_and_all_disabled_fail(
+def test_automatic_dependency_ambiguity_fails_and_disabled_dependency_is_skipped(
     layer_factory, tmp_path: Path
 ) -> None:
     layer_factory(
@@ -144,8 +146,8 @@ def test_automatic_dependency_ambiguity_and_all_disabled_fail(
             package("a", logical_id="lib", activation="disabled"),
         ],
     )
-    with pytest.raises(ResolutionError, match="only disabled"):
-        resolve(tmp_path, "disabled")
+    result = resolve(tmp_path, "disabled")
+    assert [item.identity for item in result.active_packages] == ["root"]
 
 
 def test_two_active_same_destination_fails_but_same_logical_id_does_not(

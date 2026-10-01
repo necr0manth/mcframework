@@ -43,7 +43,7 @@ export function WriteDestination({ client, target, operation, value, onChange, o
     <p>Leave blank to use rules. Existing declarations stay in their source file. This choice does not save a rule.</p>
     <label><span>Metadata file (from layer root)</span><input list={`${id}-files`} value={value?.file || ''} placeholder="Automatic or mods/mods"
       onChange={(event) => onChange(metadataWrite(event.target.value, sectionSupported ? value?.section || '' : ''))} />
-      <small>Shorthand such as <code>mods/mods</code> resolves to <code>mods/.pack/mods.json</code>; explicit paths remain valid.</small></label>
+      <small>Shorthand such as <code>mods/mods</code> resolves to <code>mods/.pack/mods.mcpack</code>; explicit paths remain valid.</small></label>
     <datalist id={`${id}-files`}>{options?.files.map((file) => <option key={file} value={file} />)}</datalist>
     {sectionSupported ? <><label><span>Section</span><input list={`${id}-sections`} value={value?.section || ''} placeholder="Automatic"
       onChange={(event) => onChange(metadataWrite(value?.file || '', event.target.value))} /></label>
@@ -64,9 +64,9 @@ export function RoutingRuleEditor({ client, target, busy, onSave, onUpgrade, onD
   onDelete: (id: string, scope: string) => Promise<boolean>;
 }) {
   const [form, setForm] = useState({ id: '', priority: '0', types: 'package', packageKind: 'mod',
-    origin: '', categories: '', file: '../mods/.pack/mods.json', section: '', pathMode: 'local' });
+    origin: '', categories: '', file: '../mods/.pack/mods.mcpack', section: '', pathMode: 'local' });
   const [scope, setScope] = useState('layer');
-  const [source, setSource] = useState('.pack/routing.json');
+  const [source, setSource] = useState('.pack/routing.mcpack');
   const [advanced, setAdvanced] = useState(false);
   const [raw, setRaw] = useState('');
   const [error, setError] = useState('');
@@ -147,7 +147,7 @@ export function RoutingRuleEditor({ client, target, busy, onSave, onUpgrade, onD
       <label><span>Package categories (all, comma-separated)</span><input value={form.categories} onChange={(event) => edit('categories', event.target.value)} placeholder="magic, library" /></label>
       <label><span>Destination path base</span><select value={form.pathMode} onChange={(event) => edit('pathMode', event.target.value)}><option value="local">Relative to nearest .pack directory</option><option value="layer">From layer root</option></select></label>
       <label><span>Destination metadata file</span><input value={form.file} onChange={(event) => edit('file', event.target.value)} />
-        <small>Shorthand may omit the <code>.pack</code> segment and <code>.json</code> extension; explicit paths remain valid.</small></label>
+        <small>Shorthand may omit the <code>.pack</code> segment and <code>.mcpack</code> extension; explicit paths remain valid.</small></label>
       {form.types.split(',').map((type) => type.trim()).every((type) => supportsRoutingSection({ type, id: 'preview' })) &&
         <label><span>Destination section (optional)</span><input value={form.section} onChange={(event) => edit('section', event.target.value)} /></label>}
     </>}

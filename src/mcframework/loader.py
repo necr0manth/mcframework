@@ -1,4 +1,4 @@
-"""JSON metadata frontend and direct-payload loader."""
+"""Mcpack and legacy JSON metadata frontends with direct-payload loading."""
 
 from __future__ import annotations
 
@@ -11,13 +11,15 @@ from typing import Any
 
 from .errors import MetadataError, UnsafePathError
 from .generations import Generation, generation
+from .mcpack import McpackParser
 from .metadata import JsonMetadataParser, MetadataParser, decode_record_paths
 from .model import LayerDefinition, ParentReference, frozen_map
 from .operations import DeclarePackage, PutFile, operation_from_json, producer_for_operations
 from .paths import normalize_relative_path
 
 METADATA_DIR = ".pack"
-MARKER_FILE = "layer.json"
+MARKER_FILE = "layer.mcpack"
+LEGACY_MARKER_FILE = "layer.json"
 
 
 class WorkspaceLoader:
@@ -34,6 +36,7 @@ class WorkspaceLoader:
         self._cache: dict[Path, LayerDefinition] = {}
         self._refresh = refresh
         self.parser = parser or JsonMetadataParser()
+        self.mcpack_parser = McpackParser()
         self._generations: dict[Path, dict[Path, Generation]] = {}
         self._visited: set[Path] = set()
         self._in_pass = False
@@ -63,7 +66,7 @@ class WorkspaceLoader:
         schema: int,
         *,
         watch: bool = False,
-        metadata_extensions: tuple[str, ...] = (".json",),
+        metadata_extensions: tuple[str, ...] = (".json", ".mcpack"),
     ) -> tuple[list[Path], list[Path], dict[Path, Generation]]:
         # Record directory membership generations before enumerating. A concurrent
         # addition may enter the loaded payload, but cannot become an unwatched hit.
@@ -89,7 +92,7 @@ class WorkspaceLoader:
                     elif (
                         metadata.suffix in metadata_extensions
                         and metadata.is_file()
-                        and metadata.name != MARKER_FILE
+                        and metadata.name not in {MARKER_FILE, LEGACY_MARKER_FILE}
                     ):
                         if watch:
                             sources[metadata] = generation(metadata)
@@ -121,7 +124,7 @@ class WorkspaceLoader:
                                     sources[metadata] = generation(metadata)
                                     target = metadata.resolve()
                                     sources.setdefault(target, generation(target))
-                                if metadata.name != MARKER_FILE:
+                                if metadata.name not in {MARKER_FILE, LEGACY_MARKER_FILE}:
                                     metadata_files.append(metadata)
                     else:
                         payload_paths.append(path)
@@ -137,10 +140,15 @@ class WorkspaceLoader:
         metadata symlinks; callers that write must separately enforce confinement.
         """
         root = self._resolve_layer_path(layer)
-        marker = root / METADATA_DIR / MARKER_FILE
-        schema = self._schema(marker, self._read_object(marker))
+        marker = self._find_marker(root)
+        marker_data = self._read_marker(marker)
+        schema = self._schema(marker, marker_data) if marker.suffix == ".json" else 2
         documents, _, _ = self._scan(
-            root, schema, metadata_extensions=self.parser.extensions
+            root,
+            schema,
+            metadata_extensions=tuple(
+                dict.fromkeys((*self.parser.extensions, ".mcpack"))
+            ),
         )
         return tuple(documents)
 
@@ -163,20 +171,18 @@ class WorkspaceLoader:
             or all(generation(path) == expected for path, expected in previous.items())
         ):
             return cached
-        marker = root / METADATA_DIR / MARKER_FILE
-        if not marker.is_file():
-            raise MetadataError(f"layer marker does not exist: {marker}")
+        marker = self._find_marker(root)
         marker_sources = (
             {path: generation(path) for path in (marker, marker.resolve())}
             if self._refresh else {}
         )
-        marker_data = self._read_object(marker)
-        schema = self._schema(marker, marker_data)
+        marker_data = self._read_marker(marker)
+        schema = self._schema(marker, marker_data) if marker.suffix == ".json" else 2
         metadata_files, payload_paths, sources = self._scan(
             root,
             schema,
             watch=self._refresh,
-            metadata_extensions=self.parser.extensions,
+            metadata_extensions=tuple(dict.fromkeys((*self.parser.extensions, ".mcpack"))),
         )
         sources.update(marker_sources)
         marker_unchanged = all(
@@ -212,7 +218,10 @@ class WorkspaceLoader:
             ):
                 producers.append(previous_producer)
                 continue
-            document = self._read_object(metadata_file)
+            if metadata_file.suffix == ".mcpack":
+                document = self._read_mcpack_operations(metadata_file, source)
+            else:
+                document = self._read_object(metadata_file)
             unknown = set(document) - {"operations"}
             if unknown:
                 raise MetadataError(f"{metadata_file}: unsupported keys: {sorted(unknown)}")
@@ -224,8 +233,10 @@ class WorkspaceLoader:
                 if not isinstance(raw, dict):
                     raise MetadataError(f"{metadata_file}: operation {index} must be an object")
                 try:
+                    source_index = raw.get("_line_number", index)
+                    raw = {key: value for key, value in raw.items() if not key.startswith("_")}
                     operation = operation_from_json(
-                        decode_record_paths(raw, source, schema), source=source, index=index
+                        decode_record_paths(raw, source, schema), source=source, index=source_index
                     )
                     if (
                         isinstance(operation, PutFile)
@@ -271,12 +282,104 @@ class WorkspaceLoader:
                 else:
                     payload[relative] = file.read_bytes()
         definition = LayerDefinition(
-            identity, str(root), tuple(parents), tuple(producers), frozen_map(payload)
+            identity,
+            str(root),
+            tuple(parents),
+            tuple(producers),
+            frozen_map(payload),
+            minecraft=marker_data.get("minecraft"),
+            loader=marker_data.get("loader"),
         )
         self._cache[root] = definition
         if self._refresh:
             self._generations[root] = sources
         return definition
+
+    @staticmethod
+    def _find_marker(root: Path) -> Path:
+        modern = root / METADATA_DIR / MARKER_FILE
+        legacy = root / METADATA_DIR / LEGACY_MARKER_FILE
+        if modern.is_file():
+            return modern
+        if legacy.is_file():
+            return legacy
+        raise MetadataError(f"layer marker does not exist: {modern}")
+
+    def _read_marker(self, path: Path) -> Mapping[str, Any]:
+        if path.suffix == ".json":
+            return self._read_object(path)
+        document = self.mcpack_parser.parse(path.read_bytes(), path)
+        identity: str | None = None
+        minecraft = loader = None
+        saw_layer = False
+        parents: list[Any] = []
+        for line in document.lines:
+            record = line.record
+            if not record:
+                continue
+            if record.get("type") == "layer":
+                if saw_layer:
+                    raise MetadataError(f"{path}:{line.line_number}: duplicate layer() declaration")
+                saw_layer = True
+                identity = record.get("id")
+                minecraft, loader = record.get("minecraft"), record.get("loader")
+            elif record.get("type") == "parent":
+                parent_path = record.get("path")
+                if not isinstance(parent_path, str) or not parent_path:
+                    raise MetadataError(f"{path}:{line.line_number}: parent() requires a path")
+                parents.append({"path": parent_path, "parameters": record.get("parameters", {})})
+            else:
+                raise MetadataError(
+                    f"{path}:{line.line_number}: only layer() and parent() "
+                    "are valid in the layer marker"
+                )
+        if identity is None:
+            identity = path.parent.parent.name
+        for name, value in (("minecraft", minecraft), ("loader", loader)):
+            if value is not None and not isinstance(value, str):
+                raise MetadataError(f"{path}: {name} must be a string")
+        result: dict[str, Any] = {"id": identity, "parents": parents, "schema": 2}
+        if minecraft is not None:
+            result["minecraft"] = minecraft
+        if loader is not None:
+            result["loader"] = loader
+        return result
+
+    def _read_mcpack_operations(self, path: Path, source: str) -> Mapping[str, Any]:
+        document = self.mcpack_parser.parse(path.read_bytes(), path)
+        operations: list[dict[str, Any]] = []
+        section_records: dict[str, dict[str, Any]] = {}
+        current_section: str | None = None
+        for line in document.lines:
+            record = line.record
+            if record is None:
+                continue
+            if record.get("type") in {"layer", "parent"}:
+                raise MetadataError(
+                    f"{path}:{line.line_number}: {record['type']}() is only valid "
+                    "in layer.mcpack"
+                )
+            if record.get("type") == "section":
+                current_section = record["id"]
+                section_records[current_section] = dict(record)
+            elif record.get("type") == "package" and current_section is not None:
+                section_records[current_section].setdefault("members", []).append(record["id"])
+            # Source spans are retained in the document API; strip parser-only keys
+            # before passing normalized operation data to the domain adapter.
+            normalized = {key: value for key, value in record.items() if key != "section"}
+            if normalized.get("type") in {
+                "put",
+                "remove",
+                "remove_paths",
+                "patch_properties",
+                "package",
+                "prune",
+                "ignore",
+            }:
+                normalized["path_mode"] = "layer"
+            operations.append(normalized)
+        operations.extend(section_records.values())
+        return {"operations": operations}
 
     def resolve_parent(self, owner: LayerDefinition, reference: ParentReference) -> LayerDefinition:
         path = Path(reference.path)

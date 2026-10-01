@@ -1,0 +1,13 @@
+{
+  "fixture": "C:\\Users\\Tamerlan\\AppData\\Local\\Temp\\mcpack-disabled-folder-browser-qj6pag6p",
+  "source": "*modrinth(\"continents\", \"1.1.13\")\ndisable(\"modrinth:continents\")\n",
+  "compact_source_exact": true,
+  "instance_disabled_preserved": true,
+  "source_sha256": "a9fccccfd3516181538290f1e8df4e47e794ed69c4f0b26aa7d72b46cf85eb7e",
+  "instance_sha256": "a9fccccfd3516181538290f1e8df4e47e794ed69c4f0b26aa7d72b46cf85eb7e",
+  "instance_active_jar_absent": true,
+  "build_jar_files": [],
+  "browser_delta_after_capture": 0,
+  "browser_state": "disabled",
+  "browser_folder_capture": "success; no reconciliation error"
+}

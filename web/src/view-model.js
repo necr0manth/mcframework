@@ -26,6 +26,10 @@ export function allMembersActive(packages, members) {
   });
 }
 
+export function metadataDeclarationCount(data) {
+  return data.declarations.filter((declaration) => declaration.kind !== 'section').length;
+}
+
 export function buildMetadataTree(data) {
   const declarationsById = new Map(data.declarations.map((item) => [item.id, item]));
   const sectionsById = new Map(data.sections.map((item) => [item.id, item]));
@@ -52,9 +56,10 @@ export function buildMetadataTree(data) {
       : data.declarations.filter(
           (item) => item.source === file.path && (!file.layer || item.layer === file.layer),
         )
-    ).sort((a, b) => a.operation_index - b.operation_index);
+    ).filter((declaration) => declaration.kind !== 'section')
+      .sort((a, b) => a.operation_index - b.operation_index);
     const relevantSections = (file.sections.length
-      ? file.sections.map((id) => sectionsById.get(id)).filter(Boolean)
+      ? [...new Set(file.sections)].map((id) => sectionsById.get(id)).filter(Boolean)
       : data.sections.filter((section) =>
           fileDeclarations.some((declaration) => section.members.includes(declarationTarget(declaration))),
         )

@@ -1,0 +1,17 @@
+{
+  "capture_source_exact": true,
+  "source": "// preserve this heading\r\n  put(\"config/qa.txt\", \"unchanged\")   // preserve spacing\r\n\r\n*modrinth(\"continents\", \"1.1.13\")\r\n",
+  "inactive_build_jars": [],
+  "instance_disabled_sha256": "a9fccccfd3516181538290f1e8df4e47e794ed69c4f0b26aa7d72b46cf85eb7e",
+  "delta": 0,
+  "state": "available",
+  "fixture": "C:\\Users\\Tamerlan\\AppData\\Local\\Temp\\mcpack-star-section-browser-2xew84nj",
+  "enabled_removes_only_star": true,
+  "enabled_build_jar_identical": true,
+  "section_header_exact": true,
+  "section_no_title_order": true,
+  "section_preserves_prior_bytes": true,
+  "source_unchanged_sha256": "a9fccccfd3516181538290f1e8df4e47e794ed69c4f0b26aa7d72b46cf85eb7e",
+  "instance_disabled_still_identical": true,
+  "final_source": "// preserve this heading\r\n  put(\"config/qa.txt\", \"unchanged\")   // preserve spacing\r\n\r\nmodrinth(\"continents\", \"1.1.13\")\r\n#create\r\nlocal(\".pack/artifacts/ba2ae3604430ed19c2fe674fa4941f78202a23730b5f021d5a07ad01034ec617.jar\", destination=\"mods/section-probe.jar\")\r\n"
+}

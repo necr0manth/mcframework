@@ -104,6 +104,7 @@ def cf_response(content: bytes, *, download_url: object) -> dict[str, object]:
                     "file": {
                         "id": 34,
                         "modId": 12,
+                        "fileName": "package.jar",
                         "displayName": "1.0",
                         "fileFingerprint": curseforge_fingerprint(content),
                         "downloadUrl": download_url,
@@ -161,20 +162,40 @@ def test_curseforge_fingerprint_runner_bounds_outstanding_jobs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     submitted: list[tuple[object, bytes, object]] = []
-    lock = threading.Lock()
+    condition = threading.Condition()
     shutdowns = 0
+    attempts = 0
+    cleanup = False
+    semaphore_type = threading.BoundedSemaphore
+
+    class ObservedSemaphore:
+        def __init__(self, value: int):
+            self.semaphore = semaphore_type(value)
+
+        def acquire(self) -> None:
+            nonlocal attempts
+            with condition:
+                attempts += 1
+                condition.notify_all()
+            self.semaphore.acquire()
+
+        def release(self) -> None:
+            self.semaphore.release()
 
     class FakePool:
         def __init__(self, *, max_workers: int, mp_context: object):
-            assert max_workers == 1
+            assert max_workers == 4
             assert mp_context.get_start_method() == "spawn"  # type: ignore[attr-defined]
 
         def submit(self, function, content: bytes):
             from concurrent.futures import Future
 
             future: Future[int] = Future()
-            with lock:
+            with condition:
                 submitted.append((function, content, future))
+                if cleanup:
+                    future.set_result(curseforge_fingerprint(content))
+                condition.notify_all()
             return future
 
         def shutdown(self, *, wait: bool, cancel_futures: bool) -> None:
@@ -183,28 +204,32 @@ def test_curseforge_fingerprint_runner_bounds_outstanding_jobs(
             shutdowns += 1
 
     monkeypatch.setattr(package_inspect_module, "ProcessPoolExecutor", FakePool)
+    monkeypatch.setattr(package_inspect_module.threading, "BoundedSemaphore", ObservedSemaphore)
     runner = CurseForgeFingerprintRunner()
-    contents = [bytes([index]) * 100 for index in range(4)]
-    with package_inspect_module.ThreadPoolExecutor(max_workers=4) as pool:
+    contents = [bytes([index]) * 100 for index in range(8)]
+    with package_inspect_module.ThreadPoolExecutor(max_workers=8) as pool:
         results = [pool.submit(runner, content) for content in contents]
-        deadline = time.monotonic() + 2
-        while len(submitted) < 2 and time.monotonic() < deadline:
-            time.sleep(0.001)
-        assert len(submitted) == 2
-        time.sleep(0.05)
-        assert len(submitted) == 2
-        completed = 0
-        while completed < len(contents):
-            deadline = time.monotonic() + 2
-            while len(submitted) <= completed and time.monotonic() < deadline:
-                time.sleep(0.001)
-            function, content, future = submitted[completed]
-            assert function is curseforge_fingerprint
-            future.set_result(curseforge_fingerprint(content))
-            completed += 1
-        assert [future.result() for future in results] == [
-            curseforge_fingerprint(content) for content in contents
-        ]
+        try:
+            with condition:
+                assert condition.wait_for(lambda: attempts == 8 and len(submitted) >= 4, timeout=2)
+                assert len(submitted) == 4
+            for completed in range(len(contents)):
+                with condition:
+                    assert condition.wait_for(
+                        lambda index=completed: len(submitted) > index, timeout=2
+                    )
+                    function, content, future = submitted[completed]
+                assert function is curseforge_fingerprint
+                future.set_result(curseforge_fingerprint(content))
+            assert [future.result() for future in results] == [
+                curseforge_fingerprint(content) for content in contents
+            ]
+        finally:
+            with condition:
+                cleanup = True
+                for _, content, future in submitted:
+                    if not future.done():
+                        future.set_result(curseforge_fingerprint(content))
     runner.close()
     runner.close()
     assert shutdowns == 1
@@ -251,6 +276,8 @@ def test_curseforge_matcher_requires_key_and_exact_hash(monkeypatch: pytest.Monk
     match = CurseForgeFingerprintMatcher("secret", timeout=1.5).match(content)
     assert match is not None and match.provider == "curseforge"
     assert match.project_id == "12" and match.version_id == "34"
+    assert match.version == "1.0"
+    assert match.filename == "package.jar"
     assert calls[0].get_header("X-api-key") == "secret"
 
     bad = cf_response(content, download_url="https://cdn/x.jar")
@@ -914,7 +941,7 @@ def test_folder_remote_candidate_uses_hash_guard_and_rolls_back(
     operation = json.loads(
         (service.state.feature_root("dev") / ".pack/local-edits.json").read_text()
     )["operations"][-1]
-    assert operation["source"]["provider"] == "direct_url"
+    assert operation["source"]["provider"] == "curseforge"
 
 
 def test_cached_empty_page_skips_global_scan_and_changed_directory_falls_back(

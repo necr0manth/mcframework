@@ -219,16 +219,131 @@ def test_trace_redacts_secrets(layer_factory, tmp_path: Path) -> None:
         },
     ],
 )
-def test_same_layer_package_and_activation_are_rejected_independent_of_order(
+def test_same_layer_package_and_activation_are_accepted_independent_of_order(
     layer_factory, tmp_path: Path, metadata_files
 ) -> None:
     layer_factory("pack", metadata_files=metadata_files)
-    with pytest.raises(ResolutionError) as error:
-        resolve(tmp_path, "pack")
-    assert str(error.value) == (
-        "same-layer activation cannot target package absent from immutable parent state: "
-        "'mod'; set activation on the declaration"
+    result = resolve(tmp_path, "pack")
+    assert result.state.packages["mod"].activation == "enabled"
+
+
+def test_activation_rejects_package_not_declared_in_any_layer(
+    layer_factory, tmp_path: Path
+) -> None:
+    layer_factory(
+        "pack",
+        operations=[{"type": "activation", "id": "missing", "state": "disabled"}],
     )
+    with pytest.raises(ResolutionError, match="disable must target a package inherited"):
+        resolve(tmp_path, "pack")
+
+
+def test_same_layer_add_and_disable_conflict_for_inherited_package(
+    layer_factory, tmp_path: Path
+) -> None:
+    layer_factory(
+        "base",
+        operations=[
+            {
+                "type": "package",
+                "id": "mod",
+                "source": {"provider": "local", "location": "mod.jar", "sha256": "0" * 64},
+                "destination": "mods/mod.jar",
+            }
+        ],
+    )
+    layer_factory(
+        "top",
+        parents=["../base"],
+        operations=[
+            {"type": "activation", "id": "mod", "state": "enabled"},
+            {"type": "activation", "id": "mod", "state": "disabled"},
+        ],
+    )
+
+    with pytest.raises(MergeConflict, match="incompatible same-layer writes to activation"):
+        resolve(tmp_path, "top")
+
+
+def test_same_layer_disable_alone_keeps_new_available_package_disabled(
+    layer_factory, tmp_path: Path
+) -> None:
+    layer_factory(
+        "pack",
+        operations=[
+            {
+                "type": "package",
+                "id": "mod",
+                "source": {"provider": "local", "location": "mod.jar", "sha256": "0" * 64},
+                "destination": "mods/mod.jar",
+            },
+            {"type": "activation", "id": "mod", "state": "disabled"},
+        ],
+    )
+
+    result = resolve(tmp_path, "pack")
+    assert result.state.packages["mod"].activation.value == "disabled"
+
+
+def test_same_layer_add_and_disable_conflict_for_new_package(
+    layer_factory, tmp_path: Path
+) -> None:
+    layer_factory(
+        "pack",
+        operations=[
+            {
+                "type": "package",
+                "id": "mod",
+                "source": {"provider": "local", "location": "mod.jar", "sha256": "0" * 64},
+                "destination": "mods/mod.jar",
+            },
+            {"type": "activation", "id": "mod", "state": "enabled"},
+            {"type": "activation", "id": "mod", "state": "disabled"},
+        ],
+    )
+
+    with pytest.raises(MergeConflict, match="incompatible same-layer writes to activation"):
+        resolve(tmp_path, "pack")
+
+
+def test_same_layer_disable_conflicts_with_dependency_target(
+    layer_factory, tmp_path: Path
+) -> None:
+    layer_factory(
+        "base",
+        operations=[
+            {
+                "type": "package",
+                "id": "library",
+                "source": {
+                    "provider": "local",
+                    "location": "library.jar",
+                    "sha256": "0" * 64,
+                },
+                "destination": "mods/library.jar",
+            }
+        ],
+    )
+    layer_factory(
+        "top",
+        parents=["../base"],
+        operations=[
+            {
+                "type": "package",
+                "id": "owner",
+                "activation": "enabled",
+                "source": {"provider": "local", "location": "owner.jar", "sha256": "0" * 64},
+                "destination": "mods/owner.jar",
+            },
+            {"type": "dependency", "source": "owner", "target": "library"},
+            {"type": "activation", "id": "library", "state": "disabled"},
+        ],
+    )
+
+    with pytest.raises(
+        MergeConflict, match="same-layer disable conflicts with dependency target"
+    ):
+        resolve(tmp_path, "top")
 
 
 def test_package_declaration_carries_composite_activation(layer_factory, tmp_path: Path) -> None:

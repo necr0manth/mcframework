@@ -73,6 +73,9 @@ test('preview descriptors retain available package metadata and file operation p
   assert.deepEqual(captureRoutingOperation({ mode: 'import', item: { path: 'mods/a.jar', proposed_package_id: 'a' } }), {
     type: 'package', id: 'a', kind: 'mod', activation: 'enabled', destination: 'mods/a.jar',
   });
+  assert.deepEqual(captureRoutingOperation({ mode: 'import', item: { path: 'mods/A.JAR.DISABLED', proposed_package_id: 'a' } }), {
+    type: 'package', id: 'a', kind: 'mod', activation: 'disabled', destination: 'mods/A.JAR',
+  });
   assert.deepEqual(captureRoutingOperation({ mode: 'capture', item: { path: 'config/a.cfg', status: 'remove' } }), {
     type: 'remove', path: 'config/a.cfg',
   });
@@ -105,6 +108,7 @@ test('capture preview carries its ephemeral origin and payload capture ignores m
 
 test('verified provider category metadata survives user confirmation and routing preview', () => {
   const candidate = { provider: 'modrinth', project_id: 'magic', version_id: 'v1',
+    version: '1.0', project_slug: 'magic', filename: 'magic.jar',
     confidence: 'exact', kind: 'mod', categories: ['magic'], tags: ['library'] };
   const confirmed = providerMatchFor(candidate, false);
   assert.deepEqual(confirmed.categories, ['magic']);
@@ -112,6 +116,9 @@ test('verified provider category metadata survives user confirmation and routing
   const preview = captureRoutingOperation({ mode: 'import', providerKey: 'modrinth\0magic\0v1',
     item: { path: 'mods/magic.jar', logical_id: 'magic', provider_candidates: [candidate] } });
   assert.equal(preview.source.provider, 'modrinth');
+  assert.equal(preview.source.location, 'magic');
+  assert.equal(preview.version, '1.0');
+  assert.equal('destination' in preview, false);
   assert.deepEqual(preview.categories, ['magic']);
   assert.deepEqual(preview.tags, ['library']);
   assert.equal(preview.activation, 'enabled');

@@ -1,0 +1,2 @@
+*modrinth("continents", "1.1.13")
+disable("modrinth:continents")

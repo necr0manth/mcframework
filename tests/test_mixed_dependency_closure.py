@@ -81,14 +81,13 @@ def test_alternating_chain_reaches_fixed_point(
 
 
 @pytest.mark.parametrize("disabled_kind", ["package", "group", "automatic"])
-def test_disabled_target_after_automatic_activation_fails(
+def test_disabled_target_after_automatic_activation(
     layer_factory, tmp_path: Path, disabled_kind: str
 ) -> None:
     operations = [package("a", activation="enabled", requires=("b",)), package("b")]
     if disabled_kind == "automatic":
         operations += [package("c", requires=("d",)), dependency("b", "c")]
         operations.append(package("d", activation="disabled"))
-        message = "automatic dependency 'd' has only disabled candidates"
     else:
         target = (
             package("c", activation="disabled")
@@ -96,10 +95,17 @@ def test_disabled_target_after_automatic_activation_fails(
             else {"type": "group", "id": "c", "activation": "disabled"}
         )
         operations += [target, dependency("b", "c")]
-        message = "explicit dependency target is disabled: 'c'"
     layer_factory("pack", operations=operations)
-    with pytest.raises(ResolutionError, match=message):
-        resolve(tmp_path)
+    result = resolve(tmp_path)
+    assert {item.identity for item in result.active_packages} == (
+        {"a", "b", "c"} if disabled_kind == "automatic" else {"a", "b"}
+    )
+    if disabled_kind == "package":
+        assert result.state.packages["c"].activation is Activation.DISABLED
+    elif disabled_kind == "group":
+        assert result.state.groups["c"].activation is Activation.DISABLED
+    else:
+        assert result.state.packages["d"].activation is Activation.DISABLED
 
 
 def test_mixed_cycle_through_group_activates_outgoing_dependencies(

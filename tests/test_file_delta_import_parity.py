@@ -31,6 +31,8 @@ class Matcher:
             "https://cdn.example.invalid/selected.jar",
             file_hashes(content),
             confidence=self.confidence,
+            project_slug="selected-slug",
+            filename="selected.jar",
         )
 
 
@@ -129,16 +131,16 @@ def test_files_and_delta_share_detail_and_import_results(
         operation = next(item for item in operations if item["type"] == "package")
         if changed:
             assert {"type": "remove", "path": "mods/selected.jar"} in operations
-        assert operation["destination"] == "mods/selected.jar"
-        assert operation["source"]["sha256"] == digest
-        assert operation["source"]["provider"] == ("direct_url" if mode == "exact" else "local")
-        assert operation["update_policy"] == ("latest_compatible" if mode == "exact" else "fixed")
+        assert operation.get("destination") == ("mods/selected.jar" if mode == "local" else None)
+        assert operation["source"]["provider"] == ("modrinth" if mode == "exact" else "local")
+        assert operation["update_policy"] == "fixed"
         assert operation["version"] == "2.0"
         artifact = target / ".pack/artifacts" / f"{digest}.jar"
         if mode == "local":
+            assert operation["source"]["sha256"] == digest
             assert artifact.read_bytes() == content
         else:
-            assert operation["source"]["location"] == "https://cdn.example.invalid/selected.jar"
+            assert operation["source"]["location"] == "selected-slug"
             assert not artifact.exists()
     assert matcher.calls == 1
     context = service.instance_context("dev")
@@ -178,8 +180,9 @@ def test_explicit_fuzzy_selection_requires_matching_hash_for_both_entries(
     )
     operations = json.loads((target / ".pack/local-edits.json").read_text())["operations"]
     operation = next(item for item in operations if item["type"] == "package")
-    assert operation["source"]["provider"] == "direct_url"
-    assert operation["source"]["sha256"] == hashlib.sha256(content).hexdigest()
+    assert operation["source"]["provider"] == "modrinth"
+    assert operation["source"]["location"] == "selected-slug"
+    assert operation["version"] == "2.0"
     assert service.instance_context("dev").files["mods/selected.jar"] == content
 
 
@@ -379,51 +382,56 @@ def test_import_updates_owning_package_declaration_and_rolls_back(
             expected_sha256=detail["actual_sha256"],
         )
 
-    if fail_reconciliation:
-        calls = 0
+        if fail_reconciliation:
+            calls = 0
+            instance_context_before = service.instance_context
 
-        def fail_after_mutation(instance: str):
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                raise MetadataError("simulated reconciliation failure")
-            return context_before
+            def fail_after_mutation(instance: str, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == (3 if provider == "exact" else 2):
+                    raise MetadataError("simulated reconciliation failure")
+                if provider == "exact":
+                    return instance_context_before(instance, **kwargs)
+                return context_before
 
-        with monkeypatch.context() as patch:
-            patch.setattr(service, "instance_context", fail_after_mutation)
-            with pytest.raises(MetadataError, match="simulated"):
-                import_selected()
-        assert owner.read_bytes() == owner_before
-        assert artifact.exists() is artifact_preexisting
-        if artifact_preexisting:
-            assert artifact.read_bytes() == content
-        assert service.instance_context("dev").files["mods/selected.jar"] == original
-    else:
-        import_selected()
-        changed = json.loads(owner.read_text())
-        updated = changed["operations"][1]
-        expected_source = {
-            "provider": "direct_url" if provider == "exact" else "local",
-            "location": "https://cdn.example.invalid/selected.jar"
-            if provider == "exact"
-            else artifact.relative_to(tmp_path).as_posix(),
-            "sha256": hashlib.sha256(content).hexdigest(),
-        }
-        assert updated == {
-            **declaration,
-            "source": expected_source,
-            "version": "2.0",
-            "update_policy": "latest_compatible" if provider == "exact" else "fixed",
-        }
-        assert changed == {**document, "operations": [before_op, updated, after_op]}
-        context = service.instance_context("dev")
-        assert list(context.resolution.state.packages) == ["declared-id"]
-        package = context.resolution.state.packages["declared-id"]
-        assert Path(package.source_file) == owner
-        assert package.source_index == 1
-        assert context.files["mods/selected.jar"] == content
-        if provider == "local":
-            assert artifact.read_bytes() == content
+            with monkeypatch.context() as patch:
+                patch.setattr(service, "instance_context", fail_after_mutation)
+                with pytest.raises(MetadataError, match="simulated"):
+                    import_selected()
+            assert owner.read_bytes() == owner_before
+            assert artifact.exists() is artifact_preexisting
+            if artifact_preexisting:
+                assert artifact.read_bytes() == content
+            assert service.instance_context("dev").files["mods/selected.jar"] == original
+        else:
+            import_selected()
+            changed = json.loads(owner.read_text())
+            updated = changed["operations"][1]
+            expected_source = (
+                {"provider": "modrinth", "location": "selected-slug"}
+                if provider == "exact"
+                else {
+                    "provider": "local",
+                    "location": artifact.relative_to(tmp_path).as_posix(),
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+            )
+            assert updated == {
+                **declaration,
+                "source": expected_source,
+                "version": "2.0",
+                "update_policy": "fixed",
+            }
+            assert changed == {**document, "operations": [before_op, updated, after_op]}
+            context = service.instance_context("dev")
+            assert list(context.resolution.state.packages) == ["declared-id"]
+            package = context.resolution.state.packages["declared-id"]
+            assert Path(package.source_file) == owner
+            assert package.source_index == 1
+            assert context.files["mods/selected.jar"] == content
+            if provider == "local":
+                assert artifact.read_bytes() == content
     if filename != "local-edits.json":
         assert not (target / ".pack/local-edits.json").exists()
     assert (target / "unrelated.txt").read_text() == "preserve"

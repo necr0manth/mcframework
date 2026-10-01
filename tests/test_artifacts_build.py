@@ -12,13 +12,16 @@ from mcframework.artifacts import (
     ArtifactResolver,
     DirectUrlArtifactProvider,
     LocalArtifactProvider,
+    PackageSelection,
 )
 from mcframework.build import Builder
 from mcframework.errors import ArtifactError, MergeConflict
 from mcframework.loader import WorkspaceLoader
 from mcframework.manifest import manifest_bytes, materialized_files
-from mcframework.model import ArtifactSource, PackageDeclaration
+from mcframework.model import Activation, ArtifactSource, PackageDeclaration, PackState, Resolution
 from mcframework.resolver import Resolver
+from mcframework.sync import Synchronizer, disabled_package_aliases
+from mcframework.transport import LocalFilesystemInstance
 
 
 def package_operation(location: str, digest: str, *, destination: str = "mods/a.jar") -> dict:
@@ -32,12 +35,14 @@ def package_operation(location: str, digest: str, *, destination: str = "mods/a.
 
 
 def setup(tmp_path: Path, layer_factory, content: bytes = b"artifact"):
-    artifact = tmp_path / "artifact.jar"
-    artifact.write_bytes(content)
     digest = hashlib.sha256(content).hexdigest()
     layer_factory(
-        "pack", operations=[package_operation("artifact.jar", digest)], payload={"config/a": "x"}
+        "pack",
+        operations=[package_operation(".pack/artifact.jar", digest)],
+        payload={"config/a": "x"},
     )
+    artifact = tmp_path / "pack" / ".pack" / "artifact.jar"
+    artifact.write_bytes(content)
     resolution = Resolver(WorkspaceLoader(tmp_path)).resolve("pack")
     registry = ArtifactRegistry()
     registry.register("local", LocalArtifactProvider(tmp_path))
@@ -50,15 +55,15 @@ def test_local_artifact_cached_by_hash(layer_factory, tmp_path: Path) -> None:
     first = artifacts.resolve(resolution)
     cache_path = Path(first.artifacts[0].cache_path)
     assert cache_path.name == digest
-    (tmp_path / "artifact.jar").unlink()
+    (tmp_path / "pack" / ".pack" / "artifact.jar").unlink()
     second = artifacts.resolve(resolution)
     assert second.artifacts[0].sha256 == digest
 
 
 def test_hash_mismatch_and_missing_artifact_fail(layer_factory, tmp_path: Path) -> None:
-    artifact = tmp_path / "bad.jar"
+    layer_factory("bad", operations=[package_operation(".pack/bad.jar", "0" * 64)])
+    artifact = tmp_path / "bad" / ".pack" / "bad.jar"
     artifact.write_bytes(b"wrong")
-    layer_factory("bad", operations=[package_operation("bad.jar", "0" * 64)])
     resolution = Resolver(WorkspaceLoader(tmp_path)).resolve("bad")
     registry = ArtifactRegistry()
     registry.register("local", LocalArtifactProvider(tmp_path))
@@ -154,9 +159,10 @@ def test_package_destination_conflicts_with_payload(layer_factory, tmp_path: Pat
     digest = hashlib.sha256(content).hexdigest()
     layer_factory(
         "collision",
-        operations=[package_operation("artifact.jar", digest, destination="config/a")],
+        operations=[package_operation(".pack/artifact.jar", digest, destination="config/a")],
         payload={"config/a": "x"},
     )
+    (tmp_path / "collision" / ".pack" / "artifact.jar").write_bytes(content)
     collision = artifacts.resolve(Resolver(WorkspaceLoader(tmp_path)).resolve("collision"))
     with pytest.raises(MergeConflict, match="conflicts"):
         materialized_files(collision)
@@ -168,6 +174,54 @@ def test_manifest_redacts_parameter_values(layer_factory, tmp_path: Path) -> Non
     prepared, _ = Builder(artifacts).prepare(resolution)
     assert b"hidden" not in manifest_bytes(prepared)
     assert b"<redacted>" in manifest_bytes(prepared)
+
+
+def test_available_package_hydrates_alias_without_becoming_build_payload(tmp_path: Path) -> None:
+    content = b"available package bytes"
+    digest = hashlib.sha256(content).hexdigest()
+    package = PackageDeclaration(
+        identity="optional-mod",
+        logical_identity="optional-mod",
+        kind="mod",
+        source=ArtifactSource("modrinth", "optional-mod", ""),
+        destination="",
+        activation=Activation.AVAILABLE,
+        version="1.2.3",
+    )
+    selection = PackageSelection(
+        "1.2.3",
+        "https://cdn.example.invalid/optional-mod.jar",
+        "optional-mod.jar",
+        digest,
+    )
+    cache = ArtifactCache(tmp_path / "cache")
+    cache.seed_exact_match(package, selection, content)
+    builder = Builder(ArtifactResolver(ArtifactRegistry(), cache))
+    initial = Resolution(PackState(packages={package.identity: package}), (), ())
+
+    resolved, files = builder.prepare(initial)
+
+    hydrated = resolved.state.packages[package.identity]
+    alias = "mods/optional-mod.jar.disabled"
+    assert hydrated.activation is Activation.AVAILABLE
+    assert hydrated.destination == "mods/optional-mod.jar"
+    assert files == {}
+    assert resolved.active_packages == ()
+    assert disabled_package_aliases(resolved.state.packages) == (alias,)
+
+    instance = tmp_path / "instance"
+    disabled = instance / alias
+    disabled.parent.mkdir(parents=True)
+    disabled.write_bytes(content)
+    report = Synchronizer().sync(
+        files,
+        LocalFilesystemInstance(instance),
+        prune=("mods/**",),
+        preserve=disabled_package_aliases(resolved.state.packages),
+    )
+
+    assert report.deleted == ()
+    assert disabled.read_bytes() == content
 
 
 def test_manifest_is_checkout_root_independent(tmp_path: Path) -> None:

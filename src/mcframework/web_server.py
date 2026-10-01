@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from .errors import FrameworkError, MetadataError
 from .local_state import LocalState, WebServerLockContended
 from .project import ProjectService
-from .sync import Synchronizer
+from .sync import Synchronizer, disabled_package_aliases
 from .transport import LocalFilesystemInstance
 
 
@@ -207,13 +207,18 @@ class Handler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 path = query.get("path", [""])[0]
                 with self.server.state.mutation_lock(self.server.instance):
-                    plan = self.server.service.explorer_plan(
-                        self.server.instance,
-                        path,
-                        query.get("target_layer", [None])[0],
-                    )
-                    plan["revision"] = self.server.revision
-                    self._json(plan)
+                    revision = self.server.revision
+                plan = self.server.service.explorer_plan(
+                    self.server.instance,
+                    path,
+                    query.get("target_layer", [None])[0],
+                )
+                with self.server.state.mutation_lock(self.server.instance):
+                    if revision != self.server.revision:
+                        self.server.service.invalidate_explorer(self.server.instance)
+                        raise RevisionConflict(revision, self.server.revision)
+                plan["revision"] = revision
+                self._json(plan)
                 return
             self._static(parsed.path)
         except RevisionConflict as exc:
@@ -370,6 +375,7 @@ class Handler(BaseHTTPRequestHandler):
                 package_id,
                 self._string(body, "state"),
                 self._optional_string(body, "target_layer"),
+                move_disabled_mod=True,
             )
         elif method == "PATCH" and route.startswith("groups/") and route.endswith("/activation"):
             group_id = unquote(route[len("groups/") : -len("/activation")])
@@ -429,6 +435,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.instance, unquote(route.removeprefix("packages/")),
                 mode=self._string(body, "mode"),
                 target_layer=self._optional_string(body, "target_layer"),
+                move_disabled_mod=True,
             )
         elif method == "POST" and route == "routing/rules":
             rule = body.get("rule")
@@ -454,6 +461,7 @@ class Handler(BaseHTTPRequestHandler):
                 context.files,
                 LocalFilesystemInstance(context.instance.path),
                 context.resolution.state.content.prune,
+                disabled_package_aliases(context.resolution.state.packages),
             )
         elif method == "POST" and route == "shutdown":
             return True

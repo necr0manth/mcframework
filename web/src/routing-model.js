@@ -35,6 +35,14 @@ export function makeRoutingRule({ id, priority, types, packageKind, origin, cate
   return { type: 'routing_rule', id: id.trim(), priority: value, when, write };
 }
 
+function packageImportPath(path) {
+  const disabled = path.toLowerCase().endsWith('.jar.disabled');
+  return {
+    activation: disabled ? 'disabled' : 'enabled',
+    destination: disabled ? path.slice(0, -'.disabled'.length) : path,
+  };
+}
+
 export function captureRoutingOperation(draft) {
   const { item } = draft;
   if (draft.mode === 'import') {
@@ -42,9 +50,32 @@ export function captureRoutingOperation(draft) {
       `${candidate.provider}\0${candidate.project_id}\0${candidate.version_id}` === draft.providerKey);
     const kind = selected?.kind || item.proposed_package_kind || (item.path.startsWith('resourcepacks/') ? 'resourcepack'
       : item.path.startsWith('datapacks/') ? 'datapack' : 'mod');
+    const importedPath = packageImportPath(item.path);
+    let source;
+    let version;
+    if (selected?.provider === 'modrinth' || selected?.provider === 'curseforge') {
+      const location = selected.provider === 'modrinth'
+        ? (selected.project_slug || selected.project_id)
+        : (selected.project_id || selected.project_slug);
+      if (location) source = { provider: selected.provider, location };
+      version = selected.provider === 'modrinth'
+        ? (selected.version || selected.version_id) : selected.version_id;
+    } else if (selected?.provider === 'local' || (draft.providerKey && !selected)) {
+      const extension = kind === 'mod' ? 'jar' : 'zip';
+      if (item.actual_sha256) {
+        source = { provider: 'local', location: `.pack/artifacts/${item.actual_sha256}.${extension}`,
+          sha256: item.actual_sha256 };
+      }
+    }
+    const folder = kind === 'mod' ? 'mods' : kind === 'resourcepack' ? 'resourcepacks'
+      : kind === 'shaderpack' ? 'shaderpacks' : 'datapacks';
+    const providerDefaultDestination = selected?.filename
+      ? `${folder}/${selected.filename.replaceAll('\\', '/').split('/').at(-1)}` : undefined;
     return { type: 'package', id: item.proposed_package_id || item.package_id || item.logical_id,
-      kind, activation: 'enabled', destination: item.path,
-      ...(draft.providerKey ? { source: { provider: selected?.provider || 'local' } } : {}),
+      kind, activation: importedPath.activation,
+      ...(providerDefaultDestination === importedPath.destination ? {} : { destination: importedPath.destination }),
+      ...(source ? { source } : {}),
+      ...(version ? { version, update_policy: 'fixed' } : {}),
       ...(selected?.categories ? { categories: selected.categories } : {}),
       ...(selected?.tags ? { tags: selected.tags } : {}) };
   }

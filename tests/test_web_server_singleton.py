@@ -277,7 +277,7 @@ def test_timed_path_lock_does_not_unlock_after_failed_acquire(
     path = state.root / "timed.lock"
     path.parent.mkdir(parents=True)
     with (
-        pytest.raises(MetadataError, match="timed out waiting"),
+        pytest.raises(MetadataError, match=r"timed out waiting for \.mcpack/timed\.lock"),
         state._path_lock(path, timeout=0),
     ):
         pass

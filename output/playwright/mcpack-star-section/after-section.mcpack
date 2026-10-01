@@ -1,0 +1,6 @@
+// preserve this heading
+  put("config/qa.txt", "unchanged")   // preserve spacing
+
+modrinth("continents", "1.1.13")
+#create
+local(".pack/artifacts/ba2ae3604430ed19c2fe674fa4941f78202a23730b5f021d5a07ad01034ec617.jar", destination="mods/section-probe.jar")

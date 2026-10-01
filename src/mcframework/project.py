@@ -11,15 +11,16 @@ import re
 import stat
 import tempfile
 import threading
+import urllib.parse
 import zipfile
 from collections.abc import Iterable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from functools import partial, wraps
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .artifacts import (
@@ -28,8 +29,10 @@ from .artifacts import (
     ArtifactResolver,
     DirectUrlArtifactProvider,
     LocalArtifactProvider,
+    PackageSelection,
 )
 from .build import Builder
+from .curseforge_provider import CurseForgePackageProvider
 from .errors import MetadataError, ResolutionError
 from .explorer import (
     ExplorerSnapshot,
@@ -39,8 +42,15 @@ from .explorer import (
     scan_instance,
 )
 from .generations import Generation, generation
-from .loader import MARKER_FILE, METADATA_DIR, WorkspaceLoader
+from .loader import LEGACY_MARKER_FILE, MARKER_FILE, METADATA_DIR, WorkspaceLoader
 from .local_state import InstanceRecord, LinkRecord, LocalState, validate_name
+from .mcpack import (
+    McpackDocument,
+    McpackParser,
+    format_operation,
+    format_section,
+    pin_provider_selector,
+)
 from .metadata import (
     JsonMetadataParser,
     MetadataParser,
@@ -50,6 +60,7 @@ from .metadata import (
 )
 from .metadata_write import MetadataWrite, MetadataWritePlan
 from .model import Activation, IgnoreSelector, PackState, Resolution, SelectorKind, frozen_map
+from .modrinth_provider import ModrinthPackageProvider
 from .operations import (
     AddIgnoreSelector,
     RoutingEngine,
@@ -60,6 +71,7 @@ from .operations import (
 )
 from .package_inspect import (
     CurseForgeFingerprintRunner,
+    ProviderLookupResult,
     ProviderMatch,
     ProviderMatcher,
     confirmed_provider_match,
@@ -67,10 +79,12 @@ from .package_inspect import (
     file_hashes,
     inspect_jar,
     normalize_package_kind,
+    provider_lookup_error,
 )
 from .paths import atomic_write, confined_path, matches, normalize_relative_path
 from .preparation import ContentDigests, IncrementalPreparer, content_digest
 from .resolver import LayerComposer
+from .sync import disabled_package_aliases
 from .transport import LocalFilesystemInstance
 
 
@@ -97,7 +111,8 @@ class _ContextCache:
 class _ProviderLookup:
     status: str = "pending"
     matches: tuple[ProviderMatch, ...] = ()
-    future: Future[tuple[ProviderMatch, ...]] | None = None
+    errors: tuple[dict[str, Any], ...] = ()
+    future: Future[ProviderLookupResult] | None = None
 
 
 @dataclass(frozen=True)
@@ -165,7 +180,7 @@ class ProjectService:
         self._provider_prefetches: set[_PackagePrefetch] = set()
         self._provider_lock = threading.RLock()
         self._provider_executor = ThreadPoolExecutor(
-            max_workers=4, thread_name_prefix="mcpack-provider"
+            max_workers=16, thread_name_prefix="mcpack-provider"
         )
         self._provider_prefetch_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="mcpack-package-prefetch"
@@ -199,17 +214,13 @@ class ProjectService:
             if any(root.iterdir()):
                 raise MetadataError(f"layer directory is not empty: {layer!r}")
         marker = root / METADATA_DIR / MARKER_FILE
-        document = {"schema": 2, "id": layer, "parents": []}
-        atomic_write(
-            marker,
-            (json.dumps(document, indent=2, sort_keys=True) + "\n").encode("utf-8"),
-        )
+        atomic_write(marker, f'layer({json.dumps(layer, ensure_ascii=False)})\n'.encode())
         return root
 
     def branch_root(self, branch: str) -> Path:
         validate_name(branch, "branch name")
         root = (self.project / branch).resolve()
-        if root.parent != self.project or not (root / METADATA_DIR / MARKER_FILE).is_file():
+        if root.parent != self.project or self._layer_marker_path(root) is None:
             raise MetadataError(f"branch does not exist at project root: {branch!r}")
         return root
 
@@ -219,13 +230,15 @@ class ProjectService:
             for child in sorted(self.project.iterdir(), key=lambda item: item.name)
             if child.is_dir()
             and child.name not in {"build", ".mcpack"}
-            and (child / METADATA_DIR / MARKER_FILE).is_file()
+            and self._layer_marker_path(child) is not None
         )
 
     def artifact_components(self) -> tuple[ArtifactRegistry, ArtifactCache, Builder]:
         registry = ArtifactRegistry()
         registry.register("local", LocalArtifactProvider(self.project))
         registry.register("direct_url", DirectUrlArtifactProvider())
+        registry.register("modrinth", ModrinthPackageProvider())
+        registry.register("curseforge", CurseForgePackageProvider())
         cache = ArtifactCache(self.state.root / "cache")
         return registry, cache, Builder(ArtifactResolver(registry, cache))
 
@@ -236,9 +249,153 @@ class ProjectService:
         *,
         automatic_dependencies: bool = True,
     ) -> Resolution:
-        return LayerComposer(
-            self._loader(), automatic_dependencies=automatic_dependencies
-        ).resolve(self.branch_root(branch), parameters)
+        layer = self.branch_root(branch)
+        registry, _, _ = self.artifact_components()
+        loader = self._loader(refresh=True)
+        for _attempt in range(2):
+            resolution = LayerComposer(
+                loader, automatic_dependencies=automatic_dependencies
+            ).resolve(layer, parameters)
+            if not self._pin_provider_selectors(resolution, registry):
+                return resolution
+            loader = self._loader(refresh=True)
+        raise MetadataError("package selectors changed repeatedly during resolution")
+
+    def prepare_branch(
+        self,
+        branch: str,
+        parameters: dict[str, Any] | None = None,
+        *,
+        automatic_dependencies: bool = True,
+    ) -> Resolution:
+        """Prepare a branch and pin every provider selector in its active closure."""
+        layer = self.branch_root(branch)
+        registry, _, builder = self.artifact_components()
+        loader = self._loader(refresh=True)
+        attempt = 0
+        limit: int | None = None
+        while True:
+            resolution = LayerComposer(
+                loader, automatic_dependencies=automatic_dependencies
+            ).resolve(layer, parameters)
+            if limit is None:
+                limit = len(resolution.state.packages) + 1
+                if limit == 1:
+                    limit = 2
+            prepared, _files = builder.prepare(resolution)
+            if not self._pin_provider_selectors(
+                prepared, registry, source_resolution=resolution
+            ):
+                return prepared
+            attempt += 1
+            if attempt >= limit:
+                raise MetadataError("package selector pinning did not converge")
+            loader = self._loader(refresh=True)
+
+    def _pin_provider_selectors(
+        self,
+        resolution: Resolution,
+        registry: ArtifactRegistry,
+        *,
+        source_resolution: Resolution | None = None,
+        include_unselected: bool = False,
+    ) -> bool:
+        candidates = []
+        packages = (
+            resolution.state.packages.values()
+            if include_unselected
+            else resolution.active_packages
+        )
+        for package in packages:
+            source_package = (
+                source_resolution.state.packages.get(package.identity, package)
+                if source_resolution is not None
+                else package
+            )
+            if (
+                package.source.provider not in {"modrinth", "curseforge"}
+                or source_package.version
+                or source_package.source_file is None
+                or not source_package.source_file.casefold().endswith(".mcpack")
+            ):
+                continue
+            if source_resolution is None:
+                provider = registry.provider(source_package.source.provider)
+                select = getattr(provider, "select", None)
+                if not callable(select):
+                    raise MetadataError(
+                        "provider "
+                        f"{source_package.source.provider!r} cannot select a package version"
+                    )
+                selector = select(source_package).selector
+            else:
+                selector = package.version
+            if not isinstance(selector, str) or not selector:
+                raise MetadataError(
+                    f"provider {package.source.provider!r} returned an empty selector "
+                    f"for {package.identity!r}"
+                )
+            candidates.append((source_package, selector))
+        if not candidates:
+            return False
+
+        parser = McpackParser()
+        originals: dict[Path, bytes] = {}
+        edited: dict[Path, bytes] = {}
+        layers: set[Path] = set()
+        trace_roots = tuple(Path(trace.root).resolve() for trace in resolution.trace)
+        for package, selector in candidates:
+            if package.source_file is None:
+                raise MetadataError(f"package {package.identity!r} has no source file")
+            path = Path(package.source_file).resolve()
+            if path not in originals:
+                originals[path] = path.read_bytes()
+                edited[path] = originals[path]
+            document = parser.parse(edited[path], path)
+            if package.source_index is None:
+                raise MetadataError(f"package {package.identity!r} has no source line")
+            line = next(
+                (item for item in document.lines if item.line_number == package.source_index),
+                None,
+            )
+            record = line.record if line is not None else None
+            source = record.get("source") if isinstance(record, dict) else None
+            if (
+                line is None
+                or not isinstance(record, dict)
+                or record.get("type") != "package"
+                or record.get("id") != package.identity
+                or not isinstance(source, dict)
+                or source.get("provider") != package.source.provider
+                or source.get("location") != package.source.location
+                or record.get("version") != package.version
+            ):
+                raise MetadataError(
+                    f"package declaration moved or changed before pinning {package.identity!r}"
+                )
+            replacement = pin_provider_selector(line.expression, selector)
+            edited[path] = document.replace_expression(
+                line.line_id, line.expression, replacement
+            )
+            owner = next(
+                (root for root in trace_roots if path.is_relative_to(root)),
+                path.parent,
+            )
+            layers.add(owner)
+
+        with ExitStack() as locks:
+            for layer in sorted(layers, key=lambda item: str(item)):
+                locks.enter_context(self._target_layer_edit_lock(layer))
+            paths = list(originals)
+            with _BeforeImageJournal(self, self.project, paths):
+                for path in paths:
+                    if path.read_bytes() != originals[path]:
+                        raise MetadataError(
+                            f"package source changed while pinning selectors: {path}"
+                        )
+                for path in paths:
+                    atomic_write(path, edited[path])
+        return True
 
     def create_instance(self, name: str, path: Path | str) -> InstanceRecord:
         validate_name(name, "instance name")
@@ -323,7 +480,10 @@ class ProjectService:
                 if old_overlay.exists():
                     metadata_updates = self._renamed_overlay_sources(old_overlay, new_overlay)
                     before_paths.extend(metadata_updates)
-                    before_paths.append(old_overlay / METADATA_DIR / MARKER_FILE)
+                    before_paths.append(
+                        self._layer_marker_path(old_overlay)
+                        or old_overlay / METADATA_DIR / LEGACY_MARKER_FILE
+                    )
                     moves.append((old_overlay, new_overlay))
                     effective = self._layer_reference(new_overlay)
                 links[new] = LinkRecord(new, old_link.branch, effective)
@@ -477,8 +637,27 @@ class ProjectService:
         digests: ContentDigests = {}
         if prepare:
             _, _, builder = self.artifact_components()
-            prepared = cached.preparer.prepare(resolution, builder)
-            resolution = prepared.resolution
+            attempt = 0
+            limit = len(resolution.state.packages) + 1
+            while True:
+                prepared = cached.preparer.prepare(resolution, builder)
+                if not self._pin_provider_selectors(
+                    prepared.resolution,
+                    builder.artifacts.registry,
+                    source_resolution=resolution,
+                ):
+                    resolution = prepared.resolution
+                    break
+                attempt += 1
+                if attempt >= max(limit, 2):
+                    raise MetadataError("package selector pinning did not converge")
+                cached.preparer.current = None
+                cached.loader = self._loader(refresh=True)
+                cached.loader.begin()
+                try:
+                    resolution = LayerComposer(cached.loader).resolve(layer, parameters)
+                finally:
+                    cached.loader.finish()
             files = (
                 current.files
                 if current is not None
@@ -507,6 +686,7 @@ class ProjectService:
     ) -> dict[str, Any]:
         transport = LocalFilesystemInstance(context.instance.path)
         existing = set(transport.list_files()) if existing_files is None else set(existing_files)
+        existing -= set(disabled_package_aliases(context.resolution.state.packages))
         desired = set(context.files)
         items: list[dict[str, Any]] = []
         summary = {
@@ -650,7 +830,16 @@ class ProjectService:
             )
             item["desired_sha256"] = hashlib.sha256(desired_content).hexdigest()
             item["actual_sha256"] = hashlib.sha256(current_content).hexdigest()
-            item["capture_modes"] = ["package"] if package else ["payload"]
+            package_kind = self._package_kind_for_path(path)
+            item["capture_modes"] = (
+                ["package"]
+                if package
+                else ["package", "payload"]
+                if package_kind is not None
+                else ["payload"]
+            )
+            if package is None and package_kind is not None:
+                item["kind"] = "package"
             item["enriched"] = enrich_actual or package is None
             if package is not None:
                 item["desired_version"] = package.version
@@ -666,6 +855,8 @@ class ProjectService:
             if metadata is not None and package is not None and package.kind == "mod":
                 item["jar_metadata"] = metadata.document()
                 item["actual_version"] = metadata.version
+            elif enrich_actual and package_kind is not None:
+                self._enrich_package_item(context, item, current_content)
             items.append(item)
             summary[status] += 1
         items.sort(key=lambda item: (str(item.get("path", "")), str(item["status"])))
@@ -940,6 +1131,8 @@ class ProjectService:
         for item in snapshot.delta_items:
             item_path = normalize_relative_path(str(item["path"]))
             destination = str(item.get("to_path", ""))
+            if self._delta_ignored(item, snapshot.selectors):
+                continue
             in_scope = item_path == normalized or item_path.startswith(prefix)
             if destination:
                 destination_path = normalize_relative_path(destination)
@@ -980,6 +1173,7 @@ class ProjectService:
             for entry in snapshot.entries.values()
             if (entry["path"] == normalized or entry["path"].startswith(prefix))
             and entry["changed"]
+            and not any(selector.contains(entry["path"]) for selector in snapshot.selectors)
             and not entry["actionable"]
         ]
         return {"path": normalized, "items": items, "unsupported": conflicts}
@@ -1090,9 +1284,19 @@ class ProjectService:
             path = confined_path(target, source)
             with _BeforeImageJournal(self, target, [path]):
                 try:
-                    document = dict(self.metadata.read_object(path))
-                    operations = document["operations"]
-                    raw = operations[index]
+                    if path.suffix == ".mcpack":
+                        document = McpackParser().parse(path.read_bytes(), path)
+                        operation_lines = [
+                            line for line in document.lines
+                            if isinstance(line.record, dict)
+                            and line.record.get("type") != "section"
+                        ]
+                        line = operation_lines[index]
+                        raw = line.record
+                    else:
+                        object_document = dict(self.metadata.read_object(path))
+                        operations = object_document["operations"]
+                        raw = operations[index]
                 except (
                     MetadataError,
                     KeyError,
@@ -1102,11 +1306,14 @@ class ProjectService:
                     raise MetadataError("ignore rule moved or no longer exists") from exc
                 if not isinstance(raw, dict):
                     raise MetadataError("ignore rule moved or no longer exists")
-                marker = JsonMetadataParser().read_object(target / METADATA_DIR / MARKER_FILE)
+                marker_path = self._layer_marker_path(target)
+                schema = (
+                    2 if marker_path is not None and marker_path.suffix != ".json"
+                    else int(JsonMetadataParser().read_object(marker_path).get("schema", 1))
+                    if marker_path is not None else 1
+                )
                 parsed = operation_from_json(
-                    decode_record_paths(
-                        raw, source, int(marker.get("schema", 1)),
-                    ),
+                    raw if path.suffix == ".mcpack" else decode_record_paths(raw, source, schema),
                     source=source,
                     index=index,
                 )
@@ -1114,11 +1321,16 @@ class ProjectService:
                     parsed, AddIgnoreSelector
                 ) or parsed.selector.document() != identity.get("selector"):
                     raise MetadataError("ignore rule moved or no longer matches its identity")
-                del operations[index]
-                atomic_write(
-                    path,
-                    self.metadata.encode_object(document, destination=path),
-                )
+                if path.suffix == ".mcpack":
+                    physical = document.text.splitlines(keepends=True)
+                    del physical[line.line_number - 1]
+                    atomic_write(path, "".join(physical).encode("utf-8"))
+                else:
+                    del operations[index]
+                    atomic_write(
+                        path,
+                        self.metadata.encode_object(object_document, destination=path),
+                    )
                 refreshed = self.instance_context(instance)
         if cached is not None:
             self._explorer_snapshots[instance] = cached.reproject(
@@ -1149,7 +1361,11 @@ class ProjectService:
         prefix = normalized + "/"
         scoped_entries = self._entries_in_scope(snapshot.entries.values(), normalized)
         unsupported = next(
-            (item for item in scoped_entries if item["changed"] and not item["actionable"]),
+            (
+                item for item in scoped_entries
+                if item["changed"] and not item["actionable"]
+                and not any(selector.contains(item["path"]) for selector in snapshot.selectors)
+            ),
             None,
         )
         if unsupported is not None:
@@ -1159,6 +1375,7 @@ class ProjectService:
             str(item["id"]): dict(item)
             for item in snapshot.delta_items
             if self._delta_in_scope(item, normalized)
+            and not self._delta_ignored(item, snapshot.selectors)
         }
         if not delta_by_id:
             raise MetadataError(f"explorer path has no changed descendants: {normalized!r}")
@@ -1191,9 +1408,6 @@ class ProjectService:
                 raise MetadataError("selected physical target changed before capture")
             if snapshot.context_fingerprint != self._context_fingerprint(context):
                 raise MetadataError("file plan changed before capture; refresh it")
-            if not scan_generation_matches(snapshot.scan, ()):
-                raise MetadataError("instance directory changed before capture; refresh it")
-
             expected_inventory = {
                 path: entry["type"]
                 for path, entry in snapshot.scan.entries.items()
@@ -1301,6 +1515,10 @@ class ProjectService:
             artifact_writes: dict[Path, bytes] = {}
             additions: list[dict[str, Any]] = []
             operation_contexts: dict[str, dict[str, Any]] = {}
+            package_selections: dict[
+                str, tuple[PackageSelection, bytes, str, dict[str, str]]
+            ] = {}
+            exact_match_seeds = []
             reserved_ids = set(context.resolution.state.packages)
             reconciliations: dict[str, bytes | None] = {}
             for item, mode, content in captured:
@@ -1312,7 +1530,11 @@ class ProjectService:
                         context, target, str(package_id), item_path, content
                     )
                     artifact_writes[artifact] = content
-                    additions.append(operation)
+                    additions.extend(
+                        self._package_import_operations(
+                            context, operation, source_path=item_path
+                        )
+                    )
                 elif package_id is not None:
                     additions.append({"type": "activation", "id": package_id, "state": "disabled"})
                 elif content is None:
@@ -1322,7 +1544,11 @@ class ProjectService:
                         target, item_path, content, reserved_ids
                     )
                     artifact_writes[artifact] = content
-                    additions.append(operation)
+                    additions.extend(
+                        self._package_import_operations(
+                            context, operation, source_path=item_path
+                        )
+                    )
                 else:
                     payload_writes[self._bounded_target_path(target, item_path)] = content
                 if content is not None and (package_id is not None or mode == "package"):
@@ -1332,22 +1558,30 @@ class ProjectService:
                     if match is not None:
                         operation = additions[-1]
                         self._validate_provider_kind(match, str(operation["kind"]))
-                        # The exact instance bytes are already available. Seed the
-                        # normal artifact cache so validating this import stays offline.
                         digest = hashlib.sha256(content).hexdigest()
+                        source, selection, default_destination = self._native_provider_match(
+                            match, str(operation["kind"]), str(operation["destination"]), digest
+                        )
                         artifact_writes.pop(artifact, None)
                         cache_path = self.state.root / "cache" / "sha256" / digest[:2] / digest
                         artifact_writes[cache_path] = content
-                        operation["source"] = {
-                            "provider": "direct_url", "location": match.download_url,
-                            "sha256": digest,
-                        }
-                        operation["update_policy"] = "latest_compatible"
-                        if match.version is not None:
-                            operation["version"] = match.version
-                        operation_contexts[str(operation["id"])] = self._provider_routing_context(
-                            match
+                        operation["source"] = source
+                        operation["update_policy"] = "fixed"
+                        operation["version"] = selection.selector
+                        if operation.get("destination") == default_destination:
+                            operation.pop("destination", None)
+                        existing = context.resolution.state.packages.get(str(operation["id"]))
+                        if existing is not None and not existing.automatic_requires_explicit:
+                            operation.pop("automatic_requires", None)
+                        package_selections[str(operation["id"])] = (
+                            selection,
+                            content,
+                            str(operation.get("destination", default_destination or "")),
+                            source,
                         )
+                        routing_context = self._provider_routing_context(match)
+                        routing_context["package"]["default_destination"] = default_destination
+                        operation_contexts[str(operation["id"])] = routing_context
 
             operations_path = target / METADATA_DIR / "local-edits.json"
             pure_payload_fast_path = (
@@ -1379,22 +1613,50 @@ class ProjectService:
                         target, additions, instance=instance,
                         operation_contexts=operation_contexts, origin="instance_capture",
                     )
-                if pure_payload_fast_path:
-                    expected_writes = {
-                        self._bounded_target_path(target, item_path): actual_content
-                        for item_path, actual_content in reconciliations.items()
-                        if actual_content is not None
-                    }
-                    if expected_writes != payload_writes:
-                        raise MetadataError("pure payload batch write set did not reconcile")
-                    pure_payload_committed = True
-                else:
-                    final_context = self.instance_context(instance)
-                    for item_path, actual_content in reconciliations.items():
-                        if final_context.files.get(item_path) != actual_content:
-                            raise MetadataError(
-                                f"captured folder did not reconcile changed path {item_path!r}"
+                try:
+                    if package_selections:
+                        logical_context = self.instance_context(instance, prepare=False)
+                        cache = ArtifactCache(self.state.root / "cache")
+                        for (
+                            package_id,
+                            (selection, content, destination, source),
+                        ) in package_selections.items():
+                            package = self._resolved_import_package(
+                                logical_context, package_id, source, selection, destination
                             )
+                            if package is None:
+                                raise MetadataError(
+                                    f"captured provider package did not resolve: {package_id!r}"
+                                )
+                            exact_match_seeds.append(
+                                cache.seed_exact_match(package, selection, content)
+                            )
+                    if pure_payload_fast_path:
+                        expected_writes = {
+                            self._bounded_target_path(target, item_path): actual_content
+                            for item_path, actual_content in reconciliations.items()
+                            if actual_content is not None
+                        }
+                        if expected_writes != payload_writes:
+                            raise MetadataError("pure payload batch write set did not reconcile")
+                        pure_payload_committed = True
+                    else:
+                        final_context = self.instance_context(instance)
+                        preserved = set(
+                            disabled_package_aliases(final_context.resolution.state.packages)
+                        )
+                        for item_path, actual_content in reconciliations.items():
+                            if item_path in preserved:
+                                continue
+                            if final_context.files.get(item_path) != actual_content:
+                                raise MetadataError(
+                                    f"captured folder did not reconcile changed path {item_path!r}"
+                                )
+                except Exception:
+                    cache = ArtifactCache(self.state.root / "cache")
+                    for seed in reversed(exact_match_seeds):
+                        cache.restore_exact_match_seed(seed)
+                    raise
 
         if pure_payload_committed:
             # Creating an overlay changes the resolution trace. The payload write itself is
@@ -1542,7 +1804,7 @@ class ProjectService:
                 items.append(item)
 
             target_reason: str | None = None
-            if not target.is_dir() or not (target / METADATA_DIR / MARKER_FILE).is_file():
+            if not target.is_dir() or self._layer_marker_path(target) is None:
                 target_reason = "auto payload capture requires an existing writable layer"
             elif not self._payload_target_has_final_precedence(instance, context, target):
                 target_reason = "auto payload capture requires the final-precedence layer"
@@ -1682,6 +1944,13 @@ class ProjectService:
             for item in entries
             if item["path"] == normalized or item["path"].startswith(prefix)
         ]
+
+    @staticmethod
+    def _delta_ignored(item: dict[str, Any], selectors: tuple[IgnoreSelector, ...]) -> bool:
+        paths = [normalize_relative_path(str(item["path"]))]
+        if item.get("to_path"):
+            paths.append(normalize_relative_path(str(item["to_path"])))
+        return any(selector.contains(path) for selector in selectors for path in paths)
 
     @staticmethod
     def _delta_in_scope(item: dict[str, Any], normalized: str) -> bool:
@@ -1841,7 +2110,7 @@ class ProjectService:
             "destination": destination,
             "source": {
                 "provider": "local",
-                "location": artifact.relative_to(self.project).as_posix(),
+                "location": self._import_artifact_location(target, artifact),
                 "sha256": digest,
             },
             "update_policy": package.update_policy.value,
@@ -1861,19 +2130,20 @@ class ProjectService:
         reserved_ids: set[str],
     ) -> tuple[Path, dict[str, Any]]:
         digest = hashlib.sha256(content).hexdigest()
-        kind = self._infer_package_kind(destination)
+        canonical_destination = self._canonical_package_destination(destination)
+        kind = self._infer_package_kind(canonical_destination)
         artifact = target / METADATA_DIR / "artifacts" / f"{digest}{self._artifact_suffix(kind)}"
-        package_id = self._allocate_package_id(destination, digest, reserved_ids)
+        package_id = self._allocate_package_id(canonical_destination, digest, reserved_ids)
         reserved_ids.add(package_id)
         return artifact, {
             "type": "package",
             "id": package_id,
             "kind": kind,
-            "activation": "enabled",
-            "destination": destination,
+            "activation": "disabled" if canonical_destination != destination else "enabled",
+            "destination": canonical_destination,
             "source": {
                 "provider": "local",
-                "location": artifact.relative_to(self.project).as_posix(),
+                "location": self._import_artifact_location(target, artifact),
                 "sha256": digest,
             },
             "update_policy": "fixed",
@@ -1881,16 +2151,20 @@ class ProjectService:
 
     def _same_layer_capture_reason(self, target: Path, item: dict[str, Any]) -> str | None:
         """Reject raw writes that conflict with a structured producer in the target."""
-        marker_path = target / METADATA_DIR / MARKER_FILE
-        if not marker_path.is_file():
+        marker_path = self._layer_marker_path(target)
+        if marker_path is None:
             return None
-        marker = JsonMetadataParser().read_object(marker_path)
-        schema = int(marker.get("schema", 1))
+        schema = (
+            2 if marker_path.suffix != ".json"
+            else int(JsonMetadataParser().read_object(marker_path).get("schema", 1))
+        )
         metadata_paths = self._loader().metadata_files(target)
         package_id = item.get("package_id")
         if package_id is not None:
             for metadata_path in metadata_paths:
-                document = self.metadata.read_object(metadata_path)
+                document = self._decode_metadata_document(
+                    metadata_path.read_bytes(), metadata_path
+                )
                 operations = document.get("operations") if isinstance(document, dict) else None
                 if not isinstance(operations, list):
                     continue
@@ -1909,14 +2183,19 @@ class ProjectService:
             affected.add(normalize_relative_path(str(item["to_path"])))
         for metadata_path in metadata_paths:
             source = metadata_path.relative_to(target).as_posix()
-            document = self.metadata.read_object(metadata_path)
+            document = self._decode_metadata_document(
+                metadata_path.read_bytes(), metadata_path
+            )
             operations = document.get("operations") if isinstance(document, dict) else None
             if not isinstance(operations, list):
                 continue
             for raw in operations:
                 if not isinstance(raw, dict):
                     continue
-                canonical = decode_record_paths(raw, source, schema)
+                canonical = (
+                    raw if metadata_path.suffix == ".mcpack"
+                    else decode_record_paths(raw, source, schema)
+                )
                 operation_type = canonical.get("type")
                 operation_path = canonical.get("path")
                 if (
@@ -1955,7 +2234,15 @@ class ProjectService:
             "reason": "local exact-SHA256 fallback",
         }
 
-    def _run_provider_lookup(self, content: bytes) -> tuple[ProviderMatch, ...]:
+    def _run_provider_lookup(self, content: bytes) -> ProviderLookupResult:
+        lookup_all = getattr(self.provider_matcher, "lookup_all", None)
+        if callable(lookup_all):
+            result = lookup_all(content)
+            order = {"modrinth": 0, "curseforge": 1}
+            return ProviderLookupResult(
+                tuple(sorted(result.matches, key=lambda match: order.get(match.provider, 2))),
+                result.errors,
+            )
         match_all = getattr(self.provider_matcher, "match_all", None)
         if callable(match_all):
             matches = tuple(match_all(content))
@@ -1963,7 +2250,9 @@ class ProjectService:
             match = self.provider_matcher.match(content)
             matches = () if match is None else (match,)
         order = {"modrinth": 0, "curseforge": 1}
-        return tuple(sorted(matches, key=lambda match: order.get(match.provider, 2)))
+        return ProviderLookupResult(
+            tuple(sorted(matches, key=lambda match: order.get(match.provider, 2)))
+        )
 
     def _schedule_package_prefetch(
         self, instance: str, hints: tuple[_PackagePrefetch, ...]
@@ -2029,20 +2318,21 @@ class ProjectService:
         self._provider_enrichment(content, version, allow_remote=metadata is not None)
 
     def _finish_provider_lookup(
-        self, digest: str, future: Future[tuple[ProviderMatch, ...]]
+        self, digest: str, future: Future[ProviderLookupResult]
     ) -> None:
         try:
-            matches = future.result()
-        except Exception:
+            result = future.result()
+        except Exception as error:
             status = "failed"
-            matches = ()
+            result = ProviderLookupResult(errors=(provider_lookup_error("remote", error),))
         else:
-            status = "ready"
+            status = "failed" if any(error["retryable"] for error in result.errors) else "ready"
         with self._provider_lock:
             lookup = self._provider_matches.get(digest)
             if lookup is not None and lookup.future is future:
                 lookup.status = status
-                lookup.matches = matches
+                lookup.matches = result.matches
+                lookup.errors = result.errors
 
     def retry_failed_provider_lookups(self) -> int:
         """Forget completed provider failures so the next read starts a fresh lookup."""
@@ -2090,6 +2380,12 @@ class ProjectService:
         )
         item["provider_lookup"] = status
         item["provider_candidates"] = candidates
+        local_hashes = candidates[0]["hashes"]
+        assert isinstance(local_hashes, dict)
+        digest = str(local_hashes["sha512"])
+        with self._provider_lock:
+            lookup = self._provider_matches.get(digest) if allow_remote else None
+            item["provider_errors"] = list(lookup.errors) if lookup is not None else []
 
     def _provider_candidates(
         self, content: bytes, version: str | None, *, allow_remote: bool = True
@@ -2122,7 +2418,9 @@ class ProjectService:
             package_kind = self._infer_package_kind(path)
         digest = hashlib.sha256(content).hexdigest()
         item["kind"] = "package"
-        item["proposed_package_id"] = self._proposed_package_id(context, path, digest)
+        item["proposed_package_id"] = self._proposed_package_id(
+            context, self._canonical_package_destination(path), digest
+        )
         item["proposed_package_kind"] = package_kind
         item["capture_modes"] = ["package"] if package is not None else ["package", "payload"]
         version = metadata.version if package_kind == "mod" and metadata is not None else None
@@ -2183,7 +2481,7 @@ class ProjectService:
     def _package_kind_for_path(cls, path: str) -> str | None:
         normalized = path.casefold()
         kind = cls._infer_package_kind(normalized)
-        if normalized.endswith(".jar"):
+        if normalized.endswith((".jar", ".jar.disabled")):
             return "mod"
         if kind == "mod":
             return None
@@ -2215,16 +2513,29 @@ class ProjectService:
 
     @staticmethod
     def _package_import_operations(
-        context: InstanceContext, operation: dict[str, Any]
+        context: InstanceContext,
+        operation: dict[str, Any],
+        *,
+        source_path: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return the metadata conversion used by both import preview and commit."""
         destination = operation.get("destination")
-        if (
-            isinstance(destination, str)
-            and destination in context.resolution.state.content.files
-        ):
-            return [{"type": "remove", "path": destination}, operation]
-        return [operation]
+        removals = []
+        for path in (source_path, destination):
+            if (
+                isinstance(path, str)
+                and path in context.resolution.state.content.files
+                and path not in removals
+            ):
+                removals.append(path)
+        return [{"type": "remove", "path": path} for path in removals] + [operation]
+
+    @staticmethod
+    def _canonical_package_destination(path: str) -> str:
+        normalized = normalize_relative_path(path)
+        if normalized.casefold().endswith(".jar.disabled"):
+            return normalized[: -len(".disabled")]
+        return normalized
 
     @staticmethod
     def _delta_item(
@@ -2262,7 +2573,12 @@ class ProjectService:
         transport = LocalFilesystemInstance(context.instance.path)
         existing = set(transport.list_files())
         desired = set(context.files)
-        matches_id = [path for path in existing | desired if self._delta_id(path) == delta_id]
+        preserved = set(disabled_package_aliases(context.resolution.state.packages))
+        matches_id = [
+            path
+            for path in existing | desired
+            if path not in preserved and self._delta_id(path) == delta_id
+        ]
         if len(matches_id) != 1:
             raise MetadataError(f"instance delta item does not exist: {delta_id!r}")
         path = matches_id[0]
@@ -2435,6 +2751,11 @@ class ProjectService:
 
     def bootstrap(self, name: str, *, include_delta: bool = True) -> dict[str, Any]:
         context = self.instance_context(name)
+        registry, _, _ = self.artifact_components()
+        if self._pin_provider_selectors(
+            context.resolution, registry, include_unselected=True
+        ):
+            context = self.instance_context(name)
         delta = (
             self.instance_diff(context)
             if include_delta
@@ -2505,7 +2826,16 @@ class ProjectService:
                 "logical_id": package.logical_identity,
                 "kind": package.kind,
                 "version": package.version,
-                "activation": package.activation.value,
+                "activation": (
+                    "enabled"
+                    if package.activation is Activation.TRANSITIVE
+                    else package.activation.value
+                ),
+                **(
+                    {"activation_reason": "dependency"}
+                    if package.activation is Activation.TRANSITIVE
+                    else {}
+                ),
                 "destination": package.destination,
                 "source": {
                     "provider": package.source.provider,
@@ -2514,6 +2844,23 @@ class ProjectService:
                 },
                 "source_file": package.source_file,
                 "editable": package.source_file is not None,
+                "unsatisfied_dependencies": sorted(
+                    dependency.target
+                    for dependency in context.resolution.state.dependencies
+                    if dependency.source == package.identity
+                    and (
+                        (
+                            dependency.target in context.resolution.state.packages
+                            and context.resolution.state.packages[dependency.target].activation
+                            is Activation.DISABLED
+                        )
+                        or (
+                            dependency.target in context.resolution.state.groups
+                            and context.resolution.state.groups[dependency.target].activation
+                            is Activation.DISABLED
+                        )
+                    )
+                ),
             }
             for package in sorted(
                 context.resolution.state.packages.values(), key=lambda item: item.identity
@@ -2667,7 +3014,8 @@ class ProjectService:
 
     @_metadata_edit
     def set_activation(
-        self, instance: str, package_id: str, state: str, target_layer: str | None = None
+        self, instance: str, package_id: str, state: str, target_layer: str | None = None,
+        *, move_disabled_mod: bool = False,
     ) -> None:
         try:
             activation = Activation(state)
@@ -2679,15 +3027,28 @@ class ProjectService:
         if package_id not in context.resolution.state.packages:
             raise MetadataError(f"package is not declared: {package_id!r}")
         package = context.resolution.state.packages[package_id]
+        disabled_mod = (
+            self._disabled_mod_move(context.instance.path, package)
+            if move_disabled_mod and activation is Activation.DISABLED
+            else None
+        )
         target = self._editable_target(instance, context, target_layer)
         before: bytes | None
-        if package.source_file is not None and Path(package.source_file).resolve().is_relative_to(
-            target
+        if (
+            package.source_file is not None
+            and Path(package.source_file).resolve().is_relative_to(target)
         ):
             path = confined_path(target, Path(package.source_file).relative_to(target).as_posix())
             before = path.read_bytes()
             self._record_edit_paths(path)
-            self._edit_declaration_activation(path, package_id, package.source_index, activation)
+            if path.suffix == ".mcpack":
+                self._edit_mcpack_declaration_activation(
+                    path, package_id, package.source_index, activation
+                )
+            else:
+                self._edit_declaration_activation(
+                    path, package_id, package.source_index, activation
+                )
         else:
             path = target / METADATA_DIR / "local-edits.json"
             before = path.read_bytes() if path.exists() else None
@@ -2698,7 +3059,9 @@ class ProjectService:
             )
         try:
             self.instance_context(instance)
+            self._apply_disabled_mod_move(disabled_mod)
         except Exception:
+            self._undo_disabled_mod_move(disabled_mod)
             self._restore_file(path, before)
             raise
 
@@ -2710,6 +3073,7 @@ class ProjectService:
         *,
         mode: str = "disable",
         target_layer: str | None = None,
+        move_disabled_mod: bool = False,
     ) -> None:
         """Disable a package or remove its declaration when owned by the target layer."""
         if mode not in {"disable", "remove"}:
@@ -2718,14 +3082,50 @@ class ProjectService:
         package = context.resolution.state.packages.get(package_id)
         if package is None:
             raise MetadataError(f"package is not declared: {package_id!r}")
+        disabled_mod = (
+            self._disabled_mod_move(context.instance.path, package)
+            if move_disabled_mod and mode == "disable"
+            else None
+        )
         target = self._editable_target(instance, context, target_layer)
         source = Path(package.source_file) if package.source_file else None
         owns = source is not None and source.resolve().is_relative_to(target.resolve())
         before: bytes | None
+        if (
+            mode == "disable"
+            and owns
+            and source is not None
+            and source.suffix == ".mcpack"
+            and package.source_index is not None
+        ):
+            source = confined_path(target, source.relative_to(target).as_posix())
+            before = source.read_bytes()
+            self._record_edit_paths(source)
+            try:
+                self._edit_mcpack_declaration_activation(
+                    source, package_id, package.source_index, Activation.DISABLED
+                )
+                self.instance_context(instance)
+                self._apply_disabled_mod_move(disabled_mod)
+            except Exception:
+                self._undo_disabled_mod_move(disabled_mod)
+                self._restore_file(source, before)
+                raise
+            return
         if mode == "remove" and owns and package.source_index is not None:
             assert source is not None
             source = confined_path(target, source.relative_to(target).as_posix())
             before = source.read_bytes()
+            if source.suffix == ".mcpack":
+                try:
+                    self._remove_mcpack_declaration(
+                        source, package_id, package.source_index
+                    )
+                    self.instance_context(instance)
+                except Exception:
+                    self._restore_file(source, before)
+                    raise
+                return
             try:
                 document = dict(self.metadata.decode_object(before, source))
                 operations = document.get("operations")
@@ -2757,7 +3157,9 @@ class ProjectService:
             )
             try:
                 self.instance_context(instance)
+                self._apply_disabled_mod_move(disabled_mod)
             except Exception:
+                self._undo_disabled_mod_move(disabled_mod)
                 self._restore_file(path, before)
                 raise
 
@@ -2953,7 +3355,8 @@ class ProjectService:
             delta_id,
             expected_sha256=expected_sha256,
         )
-        item_path = str(item["path"])
+        item_path = normalize_relative_path(str(item["path"]))
+        destination = self._canonical_package_destination(item_path)
         inferred_kind = self._package_kind_for_path(item_path)
         existing_package = self._package_for_path(context, item_path)
         if item["status"] == "remove" or (inferred_kind is None and existing_package is None):
@@ -2985,7 +3388,8 @@ class ProjectService:
             self._validate_provider_kind(match, package_kind)
         artifact: Path | None = None
         artifact_existed = False
-        cached: Path | None = None
+        selection: PackageSelection | None = None
+        provider_default_destination: str | None = None
         if match is None:
             artifact = (
                 target
@@ -2996,19 +3400,16 @@ class ProjectService:
             artifact_existed = artifact.exists()
             source = {
                 "provider": "local",
-                "location": artifact.relative_to(self.project).as_posix(),
+                "location": self._import_artifact_location(target, artifact),
                 "sha256": digest,
             }
         else:
-            source = {
-                "provider": "direct_url",
-                "location": match.download_url,
-                "sha256": digest,
-            }
-            cached = self.state.root / "cache" / "sha256" / digest[:2] / digest
-        package_id = self._proposed_package_id(context, str(item["path"]), digest)
+            source, selection, provider_default_destination = self._native_provider_match(
+                match, package_kind, destination, digest
+            )
+        package_id = self._proposed_package_id(context, destination, digest)
         version = (
-            (match.version if match is not None else None)
+            (selection.selector if selection is not None else None)
             or (metadata.version if package_kind == "mod" and metadata is not None else None)
             or (existing_package.version if existing_package is not None else None)
         )
@@ -3025,29 +3426,66 @@ class ProjectService:
             )
         operations_before = operations_path.read_bytes() if operations_path.exists() else None
         declaration_document = None
+        declaration_mcpack: tuple[McpackDocument, Any] | None = None
         if owns_declaration:
             assert existing_package is not None
             if existing_package.source_index is None or existing_package.source_index < 0:
                 raise MetadataError(f"package declaration has no source index: {package_id!r}")
             if operations_before is None:
                 raise MetadataError(f"cannot locate package declaration {package_id!r}")
-            try:
-                declaration_document = dict(
-                    self.metadata.decode_object(operations_before, operations_path)
+            if operations_path.suffix == ".mcpack":
+                document = McpackParser().parse(operations_before, operations_path)
+                line = next(
+                    (
+                        line for line in document.lines
+                        if line.line_number == existing_package.source_index
+                    ),
+                    None,
                 )
-                declaration = declaration_document["operations"][existing_package.source_index]
-            except (UnicodeError, ValueError, KeyError, IndexError, TypeError) as exc:
-                raise MetadataError(f"cannot locate package declaration {package_id!r}") from exc
+                declaration = line.record if line is not None else None
+                if line is None or not isinstance(declaration, dict):
+                    raise MetadataError(f"cannot locate package declaration {package_id!r}")
+                declaration_mcpack = (document, line)
+            else:
+                try:
+                    declaration_document = dict(
+                        self.metadata.decode_object(operations_before, operations_path)
+                    )
+                    declaration = declaration_document["operations"][existing_package.source_index]
+                except (UnicodeError, ValueError, KeyError, IndexError, TypeError) as exc:
+                    raise MetadataError(
+                        f"cannot locate package declaration {package_id!r}"
+                    ) from exc
             if (
                 not isinstance(declaration, dict)
                 or declaration.get("type") != "package"
                 or declaration.get("id") != package_id
             ):
                 raise MetadataError(f"package declaration moved for {package_id!r}")
-            declaration["source"] = source
-            declaration["update_policy"] = "latest_compatible" if match is not None else "fixed"
-            if version:
-                declaration["version"] = version
+            if declaration_mcpack is not None:
+                existing_record = {
+                    key: value for key, value in declaration.items() if not key.startswith("_")
+                }
+                existing_record["source"] = source
+                existing_record["update_policy"] = "fixed"
+                if version:
+                    existing_record["version"] = version
+                if (
+                    provider_default_destination is not None
+                    and existing_record.get("destination") == provider_default_destination
+                ):
+                    existing_record.pop("destination", None)
+                document, line = declaration_mcpack
+                declaration_mcpack = (
+                    document,
+                    replace(line, record=existing_record),
+                )
+            else:
+                assert declaration_document is not None
+                declaration["source"] = source
+                declaration["update_policy"] = "fixed"
+                if version:
+                    declaration["version"] = version
         payload_path = target.joinpath(*str(item["path"]).split("/"))
         payload_before: bytes | None = None
         if (
@@ -3068,21 +3506,49 @@ class ProjectService:
                 if existing_package is not None
                 else {}
             ),
-            "activation": "enabled",
-            "destination": item["path"],
+            "activation": "disabled" if destination != item_path else "enabled",
             "source": source,
-            "update_policy": "latest_compatible" if match is not None else "fixed",
+            "update_policy": "fixed",
             **({"version": version} if version else {}),
         }
-        operations = self._package_import_operations(context, package_operation)
+        if (
+            provider_default_destination is None
+            or provider_default_destination != destination
+        ):
+            package_operation["destination"] = destination
+        operations = self._package_import_operations(
+            context, package_operation, source_path=item_path
+        )
+        exact_match_seed = None
         try:
             if artifact is not None:
                 atomic_write(artifact, content)
-            if cached is not None:
-                atomic_write(cached, content)
             if payload_before is not None:
                 payload_path.unlink()
-            if declaration_document is not None:
+            if declaration_mcpack is not None:
+                document, line = declaration_mcpack
+                updated_record = {
+                    key: value for key, value in (line.record or {}).items()
+                    if not key.startswith("_")
+                }
+                updated_record.update(
+                    {
+                        "source": source,
+                        "update_policy": "fixed",
+                        **({"version": version} if version else {}),
+                    }
+                )
+                if (
+                    provider_default_destination is not None
+                    and updated_record.get("destination") == provider_default_destination
+                ):
+                    updated_record.pop("destination", None)
+                expression = format_operation(updated_record)
+                atomic_write(
+                    operations_path,
+                    document.replace_expression(line.line_id, line.expression, expression),
+                )
+            elif declaration_document is not None:
                 atomic_write(
                     operations_path,
                     self.metadata.encode_object(
@@ -3096,6 +3562,22 @@ class ProjectService:
                     if match is not None else None,
                     origin="instance_capture",
                 )
+            if selection is not None:
+                logical_context = self.instance_context(instance, prepare=False)
+                package = self._resolved_import_package(
+                    logical_context,
+                    existing_package.identity if existing_package is not None else package_id,
+                    source,
+                    selection,
+                    destination,
+                )
+                if package is None:
+                    raise MetadataError(
+                        f"imported provider package did not resolve: {package_id!r}"
+                    )
+                exact_match_seed = ArtifactCache(self.state.root / "cache").seed_exact_match(
+                    package, selection, content
+                )
             refreshed = self.instance_context(instance)
             if any(
                 entry["path"] == item["path"]
@@ -3108,6 +3590,10 @@ class ProjectService:
                 self._restore_file(payload_path, payload_before)
             if artifact is not None and not artifact_existed and artifact.exists():
                 artifact.unlink()
+            if exact_match_seed is not None:
+                ArtifactCache(self.state.root / "cache").restore_exact_match_seed(
+                    exact_match_seed
+                )
             raise
 
     def _selected_provider_match(self, value: object, content: bytes) -> ProviderMatch | None:
@@ -3126,6 +3612,87 @@ class ProjectService:
                 candidate = None
             return candidate if candidate is not None and candidate.confidence == "exact" else None
         return confirmed_provider_match(value, content)
+
+    @staticmethod
+    def _native_provider_match(
+        match: ProviderMatch,
+        package_kind: str,
+        destination: str,
+        digest: str,
+    ) -> tuple[dict[str, str], PackageSelection, str | None]:
+        location: str | None
+        selector: str | None
+        if match.provider == "modrinth":
+            location = match.project_slug or match.project_id
+            selector = match.version
+        elif match.provider == "curseforge":
+            location = match.project_id or match.project_slug
+            selector = match.version_id
+        else:
+            raise MetadataError(f"unsupported exact package provider: {match.provider!r}")
+        if (
+            not isinstance(location, str)
+            or not location
+            or not isinstance(selector, str)
+            or not selector
+        ):
+            raise MetadataError(f"exact {match.provider} match is missing its project or version")
+        filename = match.filename
+        if filename:
+            filename = PurePosixPath(filename.replace("\\", "/")).name
+        else:
+            url_path = urllib.parse.urlsplit(match.download_url).path
+            filename = PurePosixPath(urllib.parse.unquote(url_path)).name
+        can_omit_destination = bool(filename)
+        filename = filename or PurePosixPath(destination).name
+        if not filename or filename in {".", ".."}:
+            raise MetadataError(f"exact {match.provider} match is missing its filename")
+        directories = {
+            "mod": "mods",
+            "resourcepack": "resourcepacks",
+            "shaderpack": "shaderpacks",
+            "datapack": "datapacks",
+        }
+        default_destination = (
+            f"{directories[package_kind]}/{filename}" if can_omit_destination else None
+        )
+        selection = PackageSelection(
+            selector,
+            match.download_url,
+            filename,
+            digest,
+            logical_identity=match.project_id,
+        )
+        return {"provider": match.provider, "location": location}, selection, default_destination
+
+    @staticmethod
+    def _resolved_import_package(
+        context: InstanceContext,
+        proposed_id: str,
+        source: dict[str, str],
+        selection: PackageSelection,
+        destination: str,
+    ) -> Any | None:
+        packages = context.resolution.state.packages
+        direct = packages.get(proposed_id)
+        if direct is not None:
+            return direct
+        return next(
+            (
+                package for package in packages.values()
+                if package.source.provider == source["provider"]
+                and package.source.location == source["location"]
+                and package.version == selection.selector
+                and (not package.destination or package.destination == destination)
+            ),
+            None,
+        )
+
+    def _import_artifact_location(self, target: Path, artifact: Path) -> str:
+        marker = self._layer_marker_path(target)
+        if marker is not None and marker.suffix != ".json":
+            return artifact.relative_to(target).as_posix()
+        return artifact.relative_to(self.project).as_posix()
 
     @staticmethod
     def _validate_provider_kind(match: ProviderMatch, expected_kind: str) -> None:
@@ -3167,16 +3734,32 @@ class ProjectService:
     def _write_overlay(self, instance: str, branch: str, features: list[str]) -> LinkRecord:
         overlay = self.state.feature_root(instance)
         overlay_metadata = overlay / METADATA_DIR
-        self._record_edit_paths(overlay_metadata / MARKER_FILE, self.state.links_path)
+        modern = self._new_overlay_schema(branch) == 2
+        marker_path = overlay_metadata / (MARKER_FILE if modern else LEGACY_MARKER_FILE)
+        self._record_edit_paths(marker_path, self.state.links_path)
         overlay_metadata.mkdir(parents=True, exist_ok=True)
         parents = [
             str(self.branch_root(branch)),
             *(str(self.branch_root(item)) for item in features),
         ]
+        if modern:
+            text = f'layer({json.dumps(f"local-{instance}", ensure_ascii=False)})\n'
+            text += "".join(
+                f"parent({json.dumps(parent, ensure_ascii=False)})\n" for parent in parents
+            )
+            atomic_write(marker_path, text.encode("utf-8"))
+            with self.state.lock():
+                links = self.state.links()
+                current = links.get(instance)
+                if current is None or current.branch != branch:
+                    raise MetadataError("instance link changed while editing features")
+                links[instance] = LinkRecord(instance, branch, self._layer_reference(overlay))
+                self.state.write_links(links)
+            return links[instance]
         marker = {
             "schema": (
                 self._overlay_marker(overlay).get("schema", 1)
-                if (overlay_metadata / MARKER_FILE).is_file() else self._new_overlay_schema(branch)
+                if marker_path.is_file() else self._new_overlay_schema(branch)
             ),
             "id": f"local-{instance}",
             "parents": parents,
@@ -3184,7 +3767,7 @@ class ProjectService:
         }
         # ``features`` is local bookkeeping and is stripped before the ordinary loader sees it.
         atomic_write(
-            overlay_metadata / MARKER_FILE,
+            marker_path,
             (json.dumps(marker, indent=2, sort_keys=True) + "\n").encode(),
         )
         with self.state.lock():
@@ -3197,13 +3780,23 @@ class ProjectService:
         return links[instance]
 
     def _new_overlay_schema(self, branch: str) -> int:
-        marker = self.branch_root(branch) / METADATA_DIR / MARKER_FILE
+        marker = self._layer_marker_path(self.branch_root(branch))
+        if marker is None or marker.suffix != ".json":
+            return 2
         return int(JsonMetadataParser().read_object(marker).get("schema", 1))
 
     def _change_features(
         self, instance: str, context: InstanceContext, features: list[str]
     ) -> LinkRecord:
-        marker_path = self.state.feature_root(instance) / METADATA_DIR / MARKER_FILE
+        overlay = self.state.feature_root(instance)
+        marker_path = self._layer_marker_path(overlay)
+        if marker_path is None:
+            marker_name = (
+                MARKER_FILE
+                if self._new_overlay_schema(context.link.branch) == 2
+                else LEGACY_MARKER_FILE
+            )
+            marker_path = overlay / METADATA_DIR / marker_name
         marker_before = marker_path.read_bytes() if marker_path.exists() else None
         previous_link = context.link
         changed = self._write_overlay(instance, context.link.branch, features)
@@ -3220,7 +3813,7 @@ class ProjectService:
 
     def _ensure_overlay(self, instance: str, context: InstanceContext) -> Path:
         overlay = self.state.feature_root(instance)
-        if not (overlay / METADATA_DIR / MARKER_FILE).is_file():
+        if self._layer_marker_path(overlay) is None:
             self._write_overlay(instance, context.link.branch, list(context.features))
         return overlay
 
@@ -3259,7 +3852,27 @@ class ProjectService:
             raise MetadataError("virtual layer parents are not confined project branches")
 
     def _overlay_marker(self, overlay: Path) -> dict[str, Any]:
-        path = overlay / METADATA_DIR / MARKER_FILE
+        path = self._layer_marker_path(overlay) or overlay / METADATA_DIR / LEGACY_MARKER_FILE
+        if path.suffix != ".json":
+            document = McpackParser().parse(path.read_bytes(), path)
+            identity = None
+            parents = []
+            for line in document.lines:
+                record = line.record
+                if not isinstance(record, dict):
+                    continue
+                if record.get("type") == "layer":
+                    identity = record.get("id")
+                elif record.get("type") == "parent":
+                    value = record.get("path")
+                    if isinstance(value, str):
+                        parent = Path(value)
+                        if not parent.is_absolute():
+                            parent = (overlay / parent).resolve()
+                        parents.append(str(parent))
+            known = {str(self.branch_root(name)): name for name in self.branches()}
+            features = [known[parent] for parent in parents[1:] if parent in known]
+            return {"schema": 2, "id": identity, "parents": parents, "features": features}
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -3326,8 +3939,8 @@ class ProjectService:
         self, file: str | None = None, section: str | None = None
     ) -> Iterator[None]:
         """One request's explicit layer-root destination; never moves existing records."""
-        if file is not None:
-            file = normalize_metadata_destination(file)
+        if file is not None and (not isinstance(file, str) or not file):
+            raise MetadataError("metadata destination must be a non-empty path")
         if section is not None and (not isinstance(section, str) or not section):
             raise MetadataError("section must be a non-empty string")
         token = _edit_destinations.set((*_edit_destinations.get(), (self, file, section)))
@@ -3339,17 +3952,15 @@ class ProjectService:
     def routing_options(self, instance: str, target_layer: str | None = None) -> dict[str, Any]:
         context = self.instance_context(instance, prepare=False)
         target = self._target_path(instance, context, target_layer)
-        exists = (target / METADATA_DIR / MARKER_FILE).is_file()
+        marker = self._layer_marker_path(target)
+        exists = marker is not None
         source = target if exists else self._effective_root(instance, context.link)
         layer_rules = self._routing_rules_for_layer(source)
         instance_rules = self._routing_rules_for_instance(instance)
         schema = (
-            int(
-                JsonMetadataParser()
-                .read_object(target / METADATA_DIR / MARKER_FILE)
-                .get("schema", 1)
-            )
-            if exists
+            2 if marker is not None and marker.suffix != ".json"
+            else int(JsonMetadataParser().read_object(marker).get("schema", 1))
+            if marker is not None
             else self._new_overlay_schema(context.link.branch)
         )
         files = (
@@ -3409,7 +4020,7 @@ class ProjectService:
             "writes": [
                 {
                     "file": item.path.relative_to(target).as_posix(),
-                    "document": dict(self.metadata.decode_object(item.after, item.path)),
+                    "document": self._decode_metadata_document(item.after, item.path),
                 }
                 for item in plan.writes
             ],
@@ -3418,7 +4029,13 @@ class ProjectService:
     def _plan_schema_upgrade(self, target: Path) -> MetadataWritePlan:
         """Preserve schema-one meaning explicitly before enabling local-path defaults."""
         target = target.resolve()
-        marker = confined_path(target, f"{METADATA_DIR}/{MARKER_FILE}")
+        marker = self._layer_marker_path(target)
+        if marker is None:
+            raise MetadataError(
+                f"layer marker does not exist: {target / METADATA_DIR / MARKER_FILE}"
+            )
+        if marker.suffix != ".json":
+            return MetadataWritePlan((), target)
         marker_parser = JsonMetadataParser()
         document = dict(marker_parser.read_object(marker))
         schema = document.get("schema", 1)
@@ -3465,14 +4082,21 @@ class ProjectService:
     ) -> dict[str, Any]:
         context = self.instance_context(instance, prepare=False)
         target = self._target_path(instance, context, target_layer)
-        if (target / METADATA_DIR / MARKER_FILE).is_file():
+        if self._layer_marker_path(target) is not None:
             plan = self._plan_schema_upgrade(target)
             files = [write.path.relative_to(target).as_posix() for write in plan.writes]
             current = not plan.writes
         else:
             # Previewing a prospective local overlay must not create it.
             current = self._new_overlay_schema(context.link.branch) == 2
-            files = [] if current else [f"{METADATA_DIR}/{MARKER_FILE}"]
+            marker = self._layer_marker_path(target)
+            files = [] if current else [
+                (
+                    marker.relative_to(target).as_posix()
+                    if marker
+                    else f"{METADATA_DIR}/{LEGACY_MARKER_FILE}"
+                )
+            ]
         return {
             "target_layer": self._layer_reference(target),
             "from_schema": 2 if current else 1,
@@ -3559,7 +4183,7 @@ class ProjectService:
             self.state.write_routing_rules(instance, [*remaining])
         else:
             with self._target_layer_edit_lock(target):
-                if not (target / METADATA_DIR / MARKER_FILE).is_file():
+                if self._layer_marker_path(target) is None:
                     raise MetadataError("inherited routing rules cannot be removed")
                 definition = self._loader().load(target)
                 matches = [
@@ -3573,17 +4197,37 @@ class ProjectService:
                 source, index = matches[0]
                 path = confined_path(target, source)
                 before = path.read_bytes()
-                document = dict(self.metadata.read_object(path))
-                raw = document["operations"][index]
+                if path.suffix == ".mcpack":
+                    document = McpackParser().parse(before, path)
+                    line = next(
+                        (
+                            item for item in document.lines
+                            if isinstance(item.record, dict)
+                            and item.record.get("type") == "routing_rule"
+                            and item.record.get("id") == identity
+                        ),
+                        None,
+                    )
+                    if line is None:
+                        raise MetadataError("routing rule moved before removal")
+                    physical = document.text.splitlines(keepends=True)
+                    del physical[line.line_number - 1]
+                    after = "".join(physical).encode("utf-8")
+                    plan = MetadataWritePlan((MetadataWrite(path, before, after),), target)
+                    self._apply_metadata_plan(plan, target)
+                    self.instance_context(instance, prepare=False)
+                    return self.routing_options(instance, target_layer)
+                metadata_document = dict(self.metadata.read_object(path))
+                raw = metadata_document["operations"][index]
                 if raw.get("type") != "routing_rule" or raw.get("id") != identity:
                     raise MetadataError("routing rule moved before removal")
-                del document["operations"][index]
+                del metadata_document["operations"][index]
                 plan = MetadataWritePlan(
                     (
                         MetadataWrite(
                             path,
                             before,
-                            self.metadata.encode_object(document, destination=path),
+                            self.metadata.encode_object(metadata_document, destination=path),
                         ),
                     ),
                     target,
@@ -3609,12 +4253,13 @@ class ProjectService:
         path = confined_path(layer, relative)
         relative_parts = path.relative_to(layer).parts
         directory_parts = relative_parts[:-1]
+        extensions = set(self.metadata.extensions) | {".mcpack"}
         if (
-            path.suffix not in self.metadata.extensions
+            path.suffix not in extensions
             or directory_parts.count(METADATA_DIR) != 1
-            or path.name == MARKER_FILE
+            or path.name in {MARKER_FILE, LEGACY_MARKER_FILE}
         ):
-            supported = ", ".join(self.metadata.extensions)
+            supported = ", ".join(sorted(extensions))
             raise MetadataError(
                 "destination must be a non-control .pack metadata file "
                 f"with a supported extension ({supported})"
@@ -3622,6 +4267,365 @@ class ProjectService:
         if schema == 1 and path.parent != layer / METADATA_DIR:
             raise MetadataError("nested metadata destinations require layer schema 2")
         return path
+
+    def _plan_mcpack_metadata_writes(
+        self,
+        layer: Path,
+        additions: list[dict[str, Any]],
+        *,
+        resolved: Resolution,
+        loader: WorkspaceLoader,
+        rule_source: Path,
+        instance: str | None,
+        destination: str | None,
+        section: str | None,
+        operation_contexts: dict[str, dict[str, Any]] | None,
+        origin: str,
+    ) -> MetadataWritePlan:
+        parser = McpackParser()
+        originals: dict[Path, bytes | None] = {}
+        contents: dict[Path, bytes] = {}
+        lines_by_path: dict[Path, dict[tuple[str, str], Any]] = {}
+        section_lines: dict[Path, dict[str, Any]] = {}
+        for source in loader.metadata_files(layer):
+            if source.suffix != ".mcpack":
+                continue
+            path = confined_path(layer, source.relative_to(layer).as_posix())
+            content = path.read_bytes()
+            originals[path] = content
+            contents[path] = content
+            document = parser.parse(content, path)
+            records: dict[tuple[str, str], Any] = {}
+            sections: dict[str, Any] = {}
+            for line in document.lines:
+                record = line.record
+                if not isinstance(record, dict):
+                    continue
+                identity = record.get("id")
+                kind = record.get("type")
+                if kind == "section" and isinstance(identity, str):
+                    sections[identity] = line
+                elif isinstance(identity, str):
+                    records[(str(kind), identity)] = line
+            lines_by_path[path] = records
+            section_lines[path] = sections
+
+        rules = self._routing_rules_for_layer(rule_source, loader=loader)
+        if instance is not None:
+            rules = merge_routing_rules(rules, self._routing_rules_for_instance(instance))
+        engine = RoutingEngine(
+            tuple(replace(rule, section=section) for rule in rules)
+            if section is not None else rules
+        )
+        changed: set[Path] = set()
+
+        def document_for(path: Path) -> McpackDocument:
+            if path not in originals:
+                originals[path] = path.read_bytes() if path.exists() else None
+                contents[path] = originals[path] or b""
+                lines_by_path[path] = {}
+                section_lines[path] = {}
+            return parser.parse(contents[path], path)
+
+        def append_expression(path: Path, expression: str, section_id: str | None) -> None:
+            document = document_for(path)
+            physical = document.text.splitlines(keepends=True)
+            newline = "\r\n" if "\r\n" in document.text else "\n"
+            insertion = len(physical)
+            section_record = None
+            if section_id is not None:
+                section_record = resolved.state.sections.get(section_id)
+                section_line = section_lines[path].get(section_id)
+                if section_line is not None:
+                    next_section = next(
+                        (
+                            line for line in document.lines
+                            if line.line_number > section_line.line_number
+                            and line.section is not None
+                        ),
+                        None,
+                    )
+                    insertion = next_section.line_number - 1 if next_section else len(physical)
+                else:
+                    if section_record is not None:
+                        section_expr = format_section({
+                            "type": "section", "id": section_record.identity,
+                            "title": section_record.title, "members": list(section_record.members),
+                            "order": section_record.order,
+                        })
+                    else:
+                        section_expr = format_section({"type": "section", "id": section_id})
+                    if physical and not physical[-1].endswith(("\n", "\r")):
+                        physical[-1] += newline
+                    physical.extend((section_expr + newline, expression + newline))
+                    contents[path] = "".join(physical).encode("utf-8")
+                    changed.add(path)
+                    refreshed = parser.parse(contents[path], path)
+                    section_lines[path][section_id] = next(
+                        line for line in refreshed.lines
+                        if isinstance(line.record, dict)
+                        and line.record.get("type") == "section"
+                        and line.record.get("id") == section_id
+                    )
+                    return
+            if insertion == len(physical) and physical and not physical[-1].endswith(("\n", "\r")):
+                physical[-1] += newline
+            physical.insert(insertion, expression + newline)
+            contents[path] = "".join(physical).encode("utf-8")
+            changed.add(path)
+
+        for raw in additions:
+            operation = deepcopy(raw)
+            identity = operation.get("id")
+            state = operation.get("state")
+            if operation.get("type") == "group" and isinstance(identity, str):
+                group_line = next(
+                    (records["group", identity] for records in lines_by_path.values()
+                     if ("group", identity) in records),
+                    None,
+                )
+                if group_line is not None:
+                    path = next(
+                        path for path, records in lines_by_path.items()
+                        if records.get(("group", identity)) == group_line
+                    )
+                    document = document_for(path)
+                    contents[path] = document.replace_expression(
+                        group_line.line_id,
+                        group_line.expression,
+                        format_operation(operation),
+                    )
+                    changed.add(path)
+                    continue
+            if operation.get("type") == "activation" and isinstance(identity, str):
+                package_line = next(
+                    (records["package", identity] for records in lines_by_path.values()
+                     if ("package", identity) in records),
+                    None,
+                )
+                if package_line is not None and state in {"enabled", "available", "disabled"}:
+                    path = next(
+                        path for path, records in lines_by_path.items()
+                        if records.get(("package", identity)) == package_line
+                    )
+                    document = document_for(path)
+                    replacement = self._package_declaration_star(
+                        package_line.expression, enabled=state == "enabled"
+                    )
+                    contents[path] = document.replace_expression(
+                        package_line.line_id, package_line.expression, replacement
+                    )
+                    changed.add(path)
+                    for activation_path, records in lines_by_path.items():
+                        previous_activation = records.get(("activation", identity))
+                        if previous_activation is None:
+                            continue
+                        activation_document = document_for(activation_path)
+                        current_activation = next(
+                            (
+                                line for line in activation_document.lines
+                                if isinstance(line.record, dict)
+                                and line.record.get("type") == "activation"
+                                and line.record.get("id") == identity
+                            ),
+                            None,
+                        )
+                        if current_activation is not None:
+                            contents[activation_path] = activation_document.replace_expression(
+                                current_activation.line_id,
+                                current_activation.expression,
+                                "",
+                            )
+                            changed.add(activation_path)
+                    continue
+                activation_line = next(
+                    (records["activation", identity] for records in lines_by_path.values()
+                     if ("activation", identity) in records),
+                    None,
+                )
+                if activation_line is not None and state in {"enabled", "disabled"}:
+                    path = next(
+                        path for path, records in lines_by_path.items()
+                        if records.get(("activation", identity)) == activation_line
+                    )
+                    document = document_for(path)
+                    contents[path] = document.replace_expression(
+                        activation_line.line_id,
+                        activation_line.expression,
+                        format_operation(operation),
+                    )
+                    changed.add(path)
+                    continue
+                activation_line = next(
+                    (records["activation", identity] for records in lines_by_path.values()
+                     if ("activation", identity) in records),
+                    None,
+                )
+                if activation_line is not None:
+                    path = next(
+                        path for path, records in lines_by_path.items()
+                        if records.get(("activation", identity)) == activation_line
+                    )
+                    document = document_for(path)
+                    contents[path] = document.replace_expression(
+                        activation_line.line_id,
+                        activation_line.expression,
+                        format_operation(operation),
+                    )
+                    changed.add(path)
+                    continue
+
+            if operation.get("type") == "package" and isinstance(identity, str):
+                package_line = next(
+                    (records["package", identity] for records in lines_by_path.values()
+                     if ("package", identity) in records),
+                    None,
+                )
+                if package_line is not None:
+                    path = next(
+                        path for path, records in lines_by_path.items()
+                        if records.get(("package", identity)) == package_line
+                    )
+                    document = document_for(path)
+                    existing = {
+                        key: value for key, value in (package_line.record or {}).items()
+                        if not key.startswith("_")
+                    }
+                    updated_record = {**existing, **operation}
+                    updated_record["activation"] = existing.get("activation", "available")
+                    provider_default_destination = (
+                        (operation_contexts or {}).get(identity, {})
+                        .get("package", {})
+                        .get("default_destination")
+                    )
+                    if updated_record.get("destination") == provider_default_destination:
+                        updated_record.pop("destination", None)
+                    contents[path] = document.replace_expression(
+                        package_line.line_id,
+                        package_line.expression,
+                        format_operation(updated_record),
+                    )
+                    changed.add(path)
+                    continue
+
+            package = (
+                resolved.state.packages.get(str(identity))
+                if operation.get("type") in {"package", "activation"}
+                else None
+            )
+            package_context: dict[str, Any] = {}
+            if package is not None:
+                package_context = {
+                    "id": package.identity,
+                    "kind": package.kind,
+                    "provider": package.source.provider,
+                    "activation": package.activation.value,
+                    "destination": package.destination,
+                }
+            routing_context: dict[str, Any] = {"origin": origin, "package": package_context}
+            if operation.get("type") in {"package", "activation"}:
+                supplied = (operation_contexts or {}).get(str(identity), {})
+                package_context.update(supplied.get("package", {}))
+                routing_context["origin"] = supplied.get("origin", origin)
+                requested_activation = operation.get("activation", operation.get("state"))
+                if requested_activation is not None:
+                    package_context["activation"] = requested_activation
+            selected = None if destination is not None else engine.destination(
+                operation, context=routing_context
+            )
+            relative = destination or (selected[0] if selected else None)
+            if relative is None:
+                legacy_default = self._default_metadata_destination(
+                    operation, 2, origin=routing_context["origin"]
+                )
+                relative = str(Path(legacy_default).with_suffix(".mcpack")).replace("\\", "/")
+            relative = normalize_metadata_destination(relative, default_extension=".mcpack")
+            path = self._metadata_destination(layer, relative, 2)
+            section_id = section if section is not None else selected[1] if selected else None
+            if path.suffix == ".json":
+                metadata_document = (
+                    dict(self.metadata.read_object(path))
+                    if path.exists()
+                    else {"operations": []}
+                )
+                operations = metadata_document.setdefault("operations", [])
+                if not isinstance(operations, list):
+                    raise MetadataError(f"{path}: operations must be an array")
+                operations.append(
+                    encode_record_paths(operation, path.relative_to(layer).as_posix(), 2)
+                )
+                if section_id is not None and isinstance(identity, str):
+                    section_records = [
+                        record for record in operations
+                        if isinstance(record, dict) and record.get("type") == "section"
+                        and record.get("id") == section_id
+                    ]
+                    if len(section_records) > 1:
+                        raise MetadataError(f"{path}: duplicate section {section_id!r}")
+                    if section_records:
+                        section_record = section_records[0]
+                    else:
+                        inherited = resolved.state.sections.get(section_id)
+                        section_record = {
+                            "type": "section", "id": section_id,
+                            "title": inherited.title if inherited else section_id,
+                            "members": list(inherited.members) if inherited else [],
+                            "order": inherited.order if inherited else 0,
+                        }
+                        operations.append(section_record)
+                    members = section_record.setdefault("members", [])
+                    if identity not in members:
+                        members.append(identity)
+                originals.setdefault(path, path.read_bytes() if path.exists() else None)
+                contents[path] = self.metadata.encode_object(
+                    metadata_document, destination=path
+                )
+                changed.add(path)
+                continue
+            activation = operation.get("activation")
+            if operation.get("type") == "package" and activation == "disabled":
+                # New declarations are available stars; disable() only overrides inheritance.
+                declaration = {**operation, "activation": "available"}
+                append_expression(path, format_operation(declaration), section_id)
+            else:
+                append_expression(path, format_operation(operation), section_id)
+        return MetadataWritePlan(
+            tuple(
+                MetadataWrite(path, originals[path], contents[path])
+                for path in sorted(changed)
+            ),
+            layer,
+        )
+
+    def _decode_metadata_document(self, content: bytes, path: Path) -> dict[str, Any]:
+        if path.suffix != ".mcpack":
+            return dict(self.metadata.decode_object(content, path))
+        document = McpackParser().parse(content, path)
+        operations = [
+            {
+                key: value
+                for key, value in line.record.items()
+                if not key.startswith("_")
+            }
+            for line in document.lines
+            if isinstance(line.record, dict)
+        ]
+        return {"operations": operations, "text": document.text}
+
+    @staticmethod
+    def _package_declaration_star(expression: str, *, enabled: bool) -> str:
+        match = re.search(r"\b(?:modrinth|curseforge|local|direct_url)\s*\(", expression)
+        if match is None:
+            raise MetadataError("package declaration no longer contains a provider call")
+        prefix = expression[:match.start()]
+        star = prefix.rfind("*")
+        if enabled:
+            return expression[:star] + expression[star + 1:] if star >= 0 else expression
+        return (
+            expression
+            if star >= 0
+            else expression[: match.start()] + "*" + expression[match.start() :]
+        )
 
     @staticmethod
     def _default_metadata_destination(
@@ -3671,8 +4675,6 @@ class ProjectService:
                 destination = destination if destination is not None else chosen_file
                 section = section if section is not None else chosen_section
                 break
-        if destination is not None:
-            destination = normalize_metadata_destination(destination)
         if section is not None and not any(
             operation.get("type") in {"package", "activation", "group"}
             and isinstance(operation.get("id"), str)
@@ -3683,8 +4685,8 @@ class ProjectService:
             )
         cache = self._contexts.get(instance) if instance is not None else None
         loader = cache.loader if cache is not None else self._loader()
-        marker = layer / METADATA_DIR / MARKER_FILE
-        virtual = not marker.is_file()
+        marker = self._layer_marker_path(layer)
+        virtual = marker is None
         if virtual:
             if instance is None or layer != self.state.feature_root(instance).resolve():
                 raise MetadataError(f"layer marker does not exist: {marker}")
@@ -3694,11 +4696,42 @@ class ProjectService:
             metadata_files: tuple[Path, ...] = ()
             schema = self._new_overlay_schema(instance_context.link.branch)
         else:
+            assert marker is not None
             definition = loader.load(layer)
-            schema = int(JsonMetadataParser().read_object(marker).get("schema", 1))
+            schema = (
+                2 if marker.suffix != ".json"
+                else int(JsonMetadataParser().read_object(marker).get("schema", 1))
+            )
             metadata_files = loader.metadata_files(layer)
             rule_source = layer
             resolved = LayerComposer(loader).resolve(definition)
+        mcpack_layer = marker is not None and marker.suffix != ".json"
+        if (
+            not mcpack_layer
+            and instance is not None
+            and layer == self.state.feature_root(instance).resolve()
+            and self._new_overlay_schema(self.state.links()[instance].branch) == 2
+        ):
+            mcpack_layer = True
+        if mcpack_layer:
+            if destination is not None:
+                destination = normalize_metadata_destination(
+                    destination, default_extension=".mcpack"
+                )
+            return self._plan_mcpack_metadata_writes(
+                layer,
+                additions,
+                resolved=resolved,
+                loader=loader,
+                rule_source=rule_source,
+                instance=instance,
+                destination=destination,
+                section=section,
+                operation_contexts=operation_contexts,
+                origin=origin,
+            )
+        if destination is not None:
+            destination = normalize_metadata_destination(destination)
         documents: dict[Path, dict[str, Any]] = {}
         originals: dict[Path, bytes | None] = {}
         for source in metadata_files:
@@ -3959,6 +4992,51 @@ class ProjectService:
         operation["activation"] = activation.value
         atomic_write(path, self.metadata.encode_object(document, destination=path))
 
+    def _edit_mcpack_declaration_activation(
+        self,
+        path: Path,
+        package_id: str,
+        source_index: int | None,
+        activation: Activation,
+    ) -> None:
+        if source_index is None:
+            raise MetadataError(f"package {package_id!r} has no editable source line")
+        parser = McpackParser()
+        before = path.read_bytes()
+        document = parser.parse(before, path)
+        line = next((item for item in document.lines if item.line_number == source_index), None)
+        if (
+            line is None
+            or not isinstance(line.record, dict)
+            or line.record.get("type") != "package"
+            or line.record.get("id") != package_id
+        ):
+            raise MetadataError(f"package declaration moved for {package_id!r}")
+        replacement = self._package_declaration_star(
+            line.expression, enabled=activation is Activation.ENABLED
+        )
+        atomic_write(
+            path,
+            document.replace_expression(line.line_id, line.expression, replacement),
+        )
+
+    @staticmethod
+    def _remove_mcpack_declaration(
+        path: Path, package_id: str, source_index: int
+    ) -> None:
+        document = McpackParser().parse(path.read_bytes(), path)
+        line = next((item for item in document.lines if item.line_number == source_index), None)
+        if (
+            line is None
+            or not isinstance(line.record, dict)
+            or line.record.get("type") != "package"
+            or line.record.get("id") != package_id
+        ):
+            raise MetadataError(f"package declaration moved for {package_id!r}")
+        physical = document.text.splitlines(keepends=True)
+        del physical[line.line_number - 1]
+        atomic_write(path, "".join(physical).encode("utf-8"))
+
     @staticmethod
     def _restore_file(path: Path, content: bytes | None) -> None:
         if content is None:
@@ -3966,14 +5044,75 @@ class ProjectService:
         else:
             atomic_write(path, content)
 
+    @staticmethod
+    def _disabled_mod_move(
+        instance_path: Path, package: Any
+    ) -> tuple[Path, Path] | None:
+        if package.kind != "mod" or not package.destination.casefold().endswith(".jar"):
+            return None
+        source = confined_path(instance_path, package.destination)
+        destination = Path(f"{source}.disabled")
+        if source.exists() and destination.exists():
+            raise MetadataError(
+                f"cannot disable {package.identity!r}: both {package.destination!r} "
+                f"and {package.destination + '.disabled'!r} exist in the instance"
+            )
+        return (source, destination) if source.is_file() else None
+
+    @staticmethod
+    def _apply_disabled_mod_move(move: tuple[Path, Path] | None) -> None:
+        if move is None:
+            return
+        source, destination = move
+        if destination.exists():
+            raise MetadataError(f"cannot disable mod: destination already exists: {destination}")
+        if source.is_file():
+            source.rename(destination)
+
+    @staticmethod
+    def _undo_disabled_mod_move(move: tuple[Path, Path] | None) -> None:
+        if move is None:
+            return
+        source, destination = move
+        if destination.is_file() and not source.exists():
+            destination.rename(source)
+
     def _layer_reference(self, path: Path) -> str:
         return path.resolve().relative_to(self.project).as_posix()
 
+    @staticmethod
+    def _layer_marker_path(root: Path) -> Path | None:
+        modern = root / METADATA_DIR / MARKER_FILE
+        legacy = root / METADATA_DIR / LEGACY_MARKER_FILE
+        if modern.is_file():
+            return modern
+        if legacy.is_file():
+            return legacy
+        return None
+
     def _rewrite_overlay_identity(self, instance: str, overlay: Path) -> None:
+        path = self._layer_marker_path(overlay)
+        if path is not None and path.suffix != ".json":
+            document = McpackParser().parse(path.read_bytes(), path)
+            line = next(
+                (
+                    item for item in document.lines
+                    if isinstance(item.record, dict) and item.record.get("type") == "layer"
+                ),
+                None,
+            )
+            if line is None:
+                raise MetadataError(f"virtual layer marker has no layer() declaration: {path}")
+            expression = format_operation({"type": "layer", "id": f"local-{instance}"})
+            atomic_write(
+                path,
+                document.replace_expression(line.line_id, line.expression, expression),
+            )
+            return
         marker = self._overlay_marker(overlay)
         marker["id"] = f"local-{instance}"
         atomic_write(
-            overlay / METADATA_DIR / MARKER_FILE,
+            overlay / METADATA_DIR / LEGACY_MARKER_FILE,
             (json.dumps(marker, indent=2, sort_keys=True) + "\n").encode(),
         )
 

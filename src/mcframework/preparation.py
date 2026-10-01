@@ -11,8 +11,9 @@ from types import MappingProxyType
 from .build import Builder
 from .errors import ArtifactError, MergeConflict
 from .generations import Generation, generation
-from .model import ManifestEntry, Resolution, ResolvedArtifact
+from .model import ManifestEntry, PackageDeclaration, Resolution, ResolvedArtifact, frozen_map
 from .operations import PutFile
+from .resolver import resolve_package_dependencies
 
 ContentDigests = Mapping[int, tuple[bytes, str]]
 
@@ -42,8 +43,6 @@ class IncrementalPreparer:
     def prepare(self, resolution: Resolution, builder: Builder) -> PreparedState:
         previous = self.current
         content_state = resolution.state.content
-        previous_content = previous.resolution.state.content if previous is not None else None
-        files: Mapping[str, bytes]
         generations: dict[Path, Generation] = {}
         if previous is None:
             resolved, files = builder.prepare(resolution)
@@ -52,74 +51,90 @@ class IncrementalPreparer:
                 if content != files[artifact.declaration.destination]:
                     raise ArtifactError("artifact changed during preparation")
                 generations[Path(artifact.cache_path)] = stamp
-        elif (
-            previous_content is not None
-            and len(content_state.files) == len(previous_content.files)
-            and all(
-                previous_content.files.get(path) is content
-                for path, content in content_state.files.items()
-            )
-            and len(resolution.active_packages) == len(previous.resolution.artifacts)
-            and all(
-                package.identity == old.declaration.identity
-                and package.source == old.declaration.source
-                and package.destination == old.declaration.destination
-                for package, old in zip(
-                    resolution.active_packages, previous.resolution.artifacts, strict=True
-                )
-            )
-            and previous.fresh()
-        ):
-            # No materialized impact (e.g. ignore, section, or a still-required mod).
-            # Logical resolution has already validated closure and destination conflicts.
-            resolved = replace(
-                resolution,
-                artifacts=tuple(
-                    replace(old, declaration=package)
-                    for package, old in zip(
-                        resolution.active_packages, previous.resolution.artifacts, strict=True
-                    )
-                ),
-                manifest=previous.resolution.manifest,
-            )
-            files = previous.files
-            generations.update(previous.generations)
         else:
-            artifacts: list[ResolvedArtifact] = []
             old_artifacts = {
                 item.declaration.identity: item for item in previous.resolution.artifacts
             }
+            packages = dict(resolution.state.packages)
+            # Provider-derived automatic requirements and selected metadata remain
+            # useful while the source selector is still the same pinned selection.
+            for identity, package in tuple(packages.items()):
+                old = old_artifacts.get(identity)
+                if old is not None and _same_selection(package, old.declaration):
+                    packages[identity] = _merge_selection(old.declaration, package)
+            catalog, active = resolve_package_dependencies(
+                replace(resolution.state, packages=frozen_map(packages)).package_catalog,
+                resolution.automatic_dependencies,
+            )
+            artifacts: dict[str, ResolvedArtifact] = {}
+            package_contents: dict[str, bytes] = {}
+            for _attempt in range(len(packages) + 1):
+                pending = tuple(item for item in active if item.identity not in artifacts)
+                if not pending:
+                    break
+                for package in pending:
+                    old = old_artifacts.get(package.identity)
+                    old_stamp = (
+                        previous.generations.get(Path(old.cache_path)) if old is not None else None
+                    )
+                    if (
+                        old is not None
+                        and old_stamp is not None
+                        and generation(Path(old.cache_path)) == old_stamp
+                        and _same_selection(package, old.declaration)
+                    ):
+                        artifact = replace(
+                            old, declaration=_merge_selection(old.declaration, package)
+                        )
+                        content = previous.files[artifact.declaration.destination]
+                        generations[Path(old.cache_path)] = old_stamp
+                    else:
+                        artifact = builder.artifacts.resolve_packages((package,))[0]
+                        content, stamp = self._read_verified(artifact)
+                        generations[Path(artifact.cache_path)] = stamp
+                    artifacts[package.identity] = artifact
+                    package_contents[package.identity] = content
+                    packages[package.identity] = artifact.declaration
+                catalog = replace(catalog, packages=frozen_map(packages))
+                catalog, active = resolve_package_dependencies(
+                    catalog, resolution.automatic_dependencies
+                )
+                packages = dict(catalog.packages)
+            else:
+                raise ArtifactError("package dependency closure did not converge")
+
+            resolved_artifacts = tuple(
+                replace(artifacts[package.identity], declaration=package)
+                for package in active
+                if package.identity in artifacts
+            )
+            builder.artifacts.hydrate_cached_disabled_destinations(packages)
+            resolved_state = replace(
+                resolution.state,
+                packages=frozen_map(packages),
+                groups=catalog.groups,
+            )
+            resolved = replace(
+                resolution,
+                state=resolved_state,
+                active_packages=active,
+                artifacts=resolved_artifacts,
+            )
             contents = dict(content_state.files)
             entries: list[ManifestEntry] = []
             for path, content in content_state.files.items():
                 entries.append(
                     ManifestEntry(path, content_digest(content, previous.digests), len(content))
                 )
-            for package in resolution.active_packages:
+            for package in active:
                 path = package.destination
                 # This check is required even when every byte can be reused.
                 if path in contents:
                     raise MergeConflict(
                         f"package destination conflicts with generated file: {path!r}"
                     )
-                old = old_artifacts.get(package.identity)
-                if (
-                    old is not None
-                    and old.declaration.source == package.source
-                    and old.declaration.destination == path
-                    and generation(Path(old.cache_path))
-                    == previous.generations[Path(old.cache_path)]
-                ):
-                    artifact = replace(old, declaration=package)
-                    content = previous.files[path]
-                    generations[Path(old.cache_path)] = previous.generations[Path(old.cache_path)]
-                else:
-                    artifact = builder.artifacts.cache.obtain(
-                        package, builder.artifacts.registry.provider(package.source.provider)
-                    )
-                    content, stamp = self._read_verified(artifact)
-                    generations[Path(artifact.cache_path)] = stamp
-                artifacts.append(artifact)
+                artifact = artifacts[package.identity]
+                content = package_contents[package.identity]
                 contents[path] = content
                 entries.append(
                     ManifestEntry(path, artifact.sha256, artifact.size, package.identity)
@@ -127,7 +142,7 @@ class IncrementalPreparer:
             manifest = tuple(sorted(entries, key=lambda item: item.path))
             if manifest == previous.resolution.manifest:
                 manifest = previous.resolution.manifest
-            resolved = replace(resolution, artifacts=tuple(artifacts), manifest=manifest)
+            resolved = replace(resolved, manifest=manifest)
             files = contents
 
         reusable = (
@@ -176,3 +191,58 @@ class IncrementalPreparer:
         ):
             raise ArtifactError("artifact changed during preparation")
         return content, before
+
+
+def _same_selection(current: PackageDeclaration, old: PackageDeclaration) -> bool:
+    if (
+        current.identity != old.identity
+        or current.source.provider != old.source.provider
+        or current.source.location != old.source.location
+        or current.kind != old.kind
+        or current.version != old.version
+        or (current.destination and current.destination != old.destination)
+        or (current.source.sha256 and current.source.sha256 != old.source.sha256)
+        or current.minecraft != old.minecraft
+        or current.loader != old.loader
+    ):
+        return False
+    if current.logical_identity_explicit and current.logical_identity != old.logical_identity:
+        return False
+    if current.automatic_requires_explicit and current.automatic_requires != old.automatic_requires:
+        return False
+    if current.source.provider == "local":
+        return bool(current.source.sha256 and current.source.sha256 == old.source.sha256)
+    if current.source.provider == "direct_url":
+        return bool(current.source.sha256 and current.source.sha256 == old.source.sha256)
+    return bool(current.version)
+
+
+def _merge_selection(
+    selected: PackageDeclaration, current: PackageDeclaration
+) -> PackageDeclaration:
+    return replace(
+        selected,
+        identity=current.identity,
+        logical_identity=(
+            current.logical_identity
+            if current.logical_identity_explicit
+            else selected.logical_identity
+        ),
+        kind=current.kind,
+        destination=current.destination or selected.destination,
+        activation=current.activation,
+        alias=current.alias,
+        update_policy=current.update_policy,
+        automatic_requires=(
+            current.automatic_requires
+            if current.automatic_requires_explicit
+            else selected.automatic_requires
+        ),
+        layer_precedence=current.layer_precedence,
+        source_file=current.source_file,
+        source_index=current.source_index,
+        minecraft=current.minecraft or selected.minecraft,
+        loader=current.loader or selected.loader,
+        logical_identity_explicit=current.logical_identity_explicit,
+        automatic_requires_explicit=current.automatic_requires_explicit,
+    )

@@ -4,7 +4,7 @@ Python 3.13 implementation of the deterministic pack framework described in
 `Minecraft Pack Framework — Architectural and Functional Specification.md`.
 
 Commands run from the project root. A project contains branch directories such as `client/`
-and `server/`; each branch is an ordinary layer with a `.pack/layer.json` marker. Local state,
+and `server/`; each branch is an ordinary layer with a `.pack/layer.mcpack` marker. Local state,
 instance links, artifact cache, instance parameters, feature overlays, and web process records
 are split into purpose-specific files below the root `.mcpack/` directory.
 
@@ -23,58 +23,37 @@ python -m pip install -e ".[dev,sftp]"
 
 ## Layer format
 
-The initial JSON frontend reserves `.pack/`. A layer marker is `.pack/layer.json`; other
-`.pack/*.json` files contain operations. Files outside `.pack/` are direct payload and are
-never interpreted as metadata.
+Mcpack metadata reserves `.pack/`. The layer marker is `.pack/layer.mcpack`; other
+`.pack/*.mcpack` files contain operations. Files outside `.pack/` are direct payload and are
+never interpreted as metadata. Existing `.pack/layer.json` and JSON operation files remain
+readable for compatibility.
 
 ```text
 client/
 ├── .pack/
-│   ├── layer.json
-│   └── packages.json
+│   ├── layer.mcpack
+│   └── packages.mcpack
 ├── config/
 │   └── example.properties
 └── options.txt
 ```
 
-`.pack/layer.json`:
+`.pack/layer.mcpack`:
 
-```json
-{
-  "schema": 1,
-  "id": "client",
-  "parents": [
-    {"path": "../base", "parameters": {"side": "client"}}
-  ]
-}
+```python
+layer("client", minecraft="26.3", loader="neoforge")
+parent("../base", parameters={"side": "client"})
 ```
 
-`.pack/packages.json`:
+`.pack/packages.mcpack`:
 
-```json
-{
-  "operations": [
-    {"type": "patch_properties", "path": "config/example.properties", "set": {"enabled": true}},
-    {"type": "remove_paths", "glob": "server-only/**"},
-    {"type": "prune", "glob": "mods/*.jar"},
-    {"type": "ignore", "glob": "logs/**"},
-    {
-      "type": "package",
-      "id": "example-mod",
-      "logical_id": "example",
-      "kind": "mod",
-      "version": "1.2.3",
-      "activation": "enabled",
-      "update_policy": "fixed",
-      "destination": "mods/example-1.2.3.jar",
-      "source": {
-        "provider": "direct_url",
-        "location": "https://example.invalid/example-1.2.3.jar",
-        "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-      }
-    }
-  ]
-}
+```python
+#mods
+example = direct_url("https://example.invalid/example-1.2.3.jar", "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", destination="mods/example-1.2.3.jar")
+patch_properties("config/example.properties", set={"enabled": True})
+remove_paths("server-only/**")
+prune("mods/*.jar")
+ignore("logs/**")
 ```
 
 Supported operation types are `put`, `remove`, `remove_paths`, `patch_properties`,
@@ -117,7 +96,7 @@ mcpack link client dev
 mcpack sync dev
 ```
 
-`init <layer>` creates a minimal empty layer at `<layer>/.pack/layer.json`. It accepts an
+`init <layer>` creates a minimal empty layer at `<layer>/.pack/layer.mcpack`. It accepts an
 absent or empty target directory and refuses to overwrite an existing layer or non-empty
 directory.
 
@@ -228,7 +207,8 @@ The interface exposes resolved declarations, packages, groups, sections, desired
 semantic file/package delta, writable layers, feature controls, package/group/section activation
 edits, bounded delta capture, exact provider or local JAR import, synchronization, and shutdown.
 Every edit is fully re-resolved before success is reported. Only explicitly supported operation
-types are editable; unsupported JSON metadata is rejected by the loader.
+types are editable; unsupported metadata operations are rejected by the loader. Mcpack is the
+documented format; legacy JSON metadata remains available to existing projects.
 
 The core transport still supports SFTP programmatically. SFTP configuration should remain local:
 

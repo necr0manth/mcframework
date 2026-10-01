@@ -151,14 +151,20 @@ def encode_record_paths(
     return _convert_record_paths(canonical, source, schema, mode, encode=True)
 
 
-def normalize_metadata_destination(value: str) -> str:
+def normalize_metadata_destination(value: str, *, default_extension: str = ".json") -> str:
     """Expand a concise metadata filename without weakening path validation."""
     normalized = normalize_relative_path(value)
     parts = list(PurePosixPath(normalized).parts)
     if parts[-1] == METADATA_DIRECTORY:
         raise UnsafePathError("metadata destination must identify a file")
     if not PurePosixPath(parts[-1]).suffix:
-        parts[-1] += ".json"
+        if (
+            not default_extension.startswith(".")
+            or "/" in default_extension
+            or "\\" in default_extension
+        ):
+            raise UnsafePathError("metadata default extension must be a file extension")
+        parts[-1] += default_extension
     if METADATA_DIRECTORY not in parts:
         parts.insert(len(parts) - 1, METADATA_DIRECTORY)
     if parts.count(METADATA_DIRECTORY) != 1:

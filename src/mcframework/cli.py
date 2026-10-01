@@ -21,7 +21,7 @@ from .loader import WorkspaceLoader, validate_parameter_value
 from .manifest import manifest_document
 from .project import ProjectService
 from .resolver import LayerComposer
-from .sync import Synchronizer
+from .sync import Synchronizer, disabled_package_aliases
 from .transport import LocalFilesystemInstance, SftpInstance
 from .update import UpdateService
 from .web_process import start_web, stop_web
@@ -95,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"initialized layer {arguments.layer}: {root}")
         elif arguments.command in {"resolve", "build", "update"}:
             parameters = parse_parameters(arguments.parameters)
-            resolution = service.resolve_branch(
+            resolution = service.prepare_branch(
                 arguments.branch,
                 parameters,
                 automatic_dependencies=not arguments.no_auto_dependencies,
@@ -126,6 +126,7 @@ def main(argv: list[str] | None = None) -> int:
                 context.files,
                 LocalFilesystemInstance(context.instance.path),
                 context.resolution.state.content.prune,
+                disabled_package_aliases(context.resolution.state.packages),
             )
             print_report(report)
         elif arguments.command == "createinstance":
@@ -304,7 +305,14 @@ def _legacy_invocation(arguments: list[str]) -> int | None:
         _, files = builder.prepare(resolution)
         transport = make_transport(parsed)
         try:
-            print_report(Synchronizer().sync(files, transport, resolution.state.prune))
+            print_report(
+                Synchronizer().sync(
+                    files,
+                    transport,
+                    resolution.state.prune,
+                    disabled_package_aliases(resolution.state.packages),
+                )
+            )
         finally:
             close = getattr(transport, "close", None)
             if close is not None:

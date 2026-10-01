@@ -55,6 +55,8 @@ class ProviderMatch:
     kind: str | None = None
     categories: tuple[str, ...] = ()
     tags: tuple[str, ...] = ()
+    project_slug: str | None = None
+    filename: str | None = None
 
     def document(self) -> dict[str, object]:
         return {
@@ -69,11 +71,42 @@ class ProviderMatch:
             "kind": self.kind,
             "categories": list(self.categories),
             "tags": list(self.tags),
+            "project_slug": self.project_slug,
+            "filename": self.filename,
         }
 
 
 class ProviderMatcher(Protocol):
     def match(self, content: bytes) -> ProviderMatch | None: ...
+
+
+@dataclass(frozen=True)
+class ProviderLookupResult:
+    matches: tuple[ProviderMatch, ...] = ()
+    errors: tuple[dict[str, Any], ...] = ()
+
+
+def provider_lookup_error(provider: str, error: Exception) -> dict[str, Any]:
+    """Public diagnostics must never include exception URLs or credentials."""
+    code = "unavailable"
+    message = "Package source lookup failed. Retry the lookup."
+    if isinstance(error, urllib.error.HTTPError):
+        code = f"http_{error.code}"
+        if error.code in {401, 403}:
+            message = "Access denied by the package source. Check its API key and permissions."
+        elif error.code == 429:
+            message = "The package source rate limit was reached. Wait and retry."
+        else:
+            message = f"The package source returned HTTP {error.code}. Retry the lookup."
+    elif isinstance(error, TimeoutError) or (
+        isinstance(error, urllib.error.URLError) and isinstance(error.reason, TimeoutError)
+    ):
+        code = "timeout"
+        message = "The package source timed out. Retry the lookup."
+    elif isinstance(error, (OSError, urllib.error.URLError)):
+        code = "network"
+        message = "Cannot connect to the package source. Check the connection and retry."
+    return {"provider": provider, "code": code, "message": message, "retryable": True}
 
 
 def normalize_package_kind(value: str | None) -> str | None:
@@ -176,11 +209,13 @@ class ModrinthMatcher:
 
     def __init__(self, timeout: float = 10.0):
         self.timeout = timeout
-        self._project_metadata: dict[str, tuple[str, tuple[str, ...]]] = {}
+        self._project_metadata: dict[str, tuple[str, tuple[str, ...], str | None]] = {}
+        self._project_lock = threading.Lock()
 
-    def _project(self, project_id: str) -> tuple[str, tuple[str, ...]] | None:
-        if project_id in self._project_metadata:
-            return self._project_metadata[project_id]
+    def _project(self, project_id: str) -> tuple[str, tuple[str, ...], str | None] | None:
+        with self._project_lock:
+            if project_id in self._project_metadata:
+                return self._project_metadata[project_id]
         request = urllib.request.Request(
             self.project_endpoint.format(project_id=urllib.parse.quote(project_id, safe="")),
             headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
@@ -198,10 +233,15 @@ class ModrinthMatcher:
             additional = _string_list(raw.get("additional_categories"), "additional_categories")
         except (OSError, urllib.error.URLError, UnicodeError, json.JSONDecodeError, MetadataError):
             return None  # Optional project metadata must not discard an exact file match.
-        result = kind, tuple(dict.fromkeys((*categories, *additional)))
-        if len(self._project_metadata) >= self.project_cache_limit:
-            self._project_metadata.pop(next(iter(self._project_metadata)))
-        self._project_metadata[project_id] = result
+        slug = _nonempty_string(raw.get("slug"))
+        result = kind, tuple(dict.fromkeys((*categories, *additional))), slug
+        with self._project_lock:
+            if (
+                project_id not in self._project_metadata
+                and len(self._project_metadata) >= self.project_cache_limit
+            ):
+                self._project_metadata.pop(next(iter(self._project_metadata)))
+            self._project_metadata[project_id] = result
         return result
 
     def match(self, content: bytes) -> ProviderMatch | None:
@@ -254,6 +294,8 @@ class ModrinthMatcher:
             kind=version_kind or (project[0] if project else None),
             categories=project[1] if project else (),
             tags=project[1] if project else (),
+            project_slug=project[2] if project else None,
+            filename=_nonempty_string(selected.get("filename")),
         )
 
 
@@ -290,7 +332,7 @@ class CurseForgeFingerprintRunner:
     def __init__(self) -> None:
         self._executor: ProcessPoolExecutor | None = None
         self._lock = threading.Lock()
-        self._slots = threading.BoundedSemaphore(2)
+        self._slots = threading.BoundedSemaphore(4)
         self._closed = False
 
     def __call__(self, content: bytes) -> int:
@@ -301,7 +343,7 @@ class CurseForgeFingerprintRunner:
                     raise RuntimeError("CurseForge fingerprint runner is closed")
                 if self._executor is None:
                     self._executor = ProcessPoolExecutor(
-                        max_workers=1,
+                        max_workers=4,
                         mp_context=multiprocessing.get_context("spawn"),
                     )
                 future = self._executor.submit(curseforge_fingerprint, content)
@@ -424,6 +466,7 @@ class CurseForgeFingerprintMatcher:
                 download_url,
                 hashes,
                 reason="CurseForge returned the exact file fingerprint and hash",
+                filename=_nonempty_string(file.get("fileName")),
             )
         return None
 
@@ -431,8 +474,35 @@ class CurseForgeFingerprintMatcher:
 class CompositeProviderMatcher:
     """Ordered provider matcher used for enrichment and explicit selection."""
 
-    def __init__(self, matchers: Iterable[ProviderMatcher]):
+    def __init__(
+        self, matchers: Iterable[ProviderMatcher], *,
+        configuration_errors: tuple[dict[str, Any], ...] = ()
+    ):
         self.matchers = tuple(matchers)
+        self.configuration_errors = configuration_errors
+
+    def lookup_all(self, content: bytes) -> ProviderLookupResult:
+        """Keep successful matches and failures independently for the capture UI."""
+        matches: list[ProviderMatch] = []
+        errors = list(self.configuration_errors)
+        if self.matchers:
+            with ThreadPoolExecutor(
+                max_workers=len(self.matchers), thread_name_prefix="mcpack-provider-adapter"
+            ) as pool:
+                futures = [
+                    (matcher, pool.submit(matcher.match, content)) for matcher in self.matchers
+                ]
+                for matcher, future in futures:
+                    try:
+                        match = future.result()
+                    except Exception as error:
+                        errors.append(
+                            provider_lookup_error(getattr(matcher, "provider", "remote"), error)
+                        )
+                    else:
+                        if match is not None:
+                            matches.append(match)
+        return ProviderLookupResult(tuple(matches), tuple(errors))
 
     def match_all(self, content: bytes) -> tuple[ProviderMatch, ...]:
         if not self.matchers:
@@ -500,7 +570,11 @@ def default_provider_matcher(
     api_key = os.environ.get("CURSEFORGE_API_KEY", "").strip()
     if api_key:
         matchers.append(CurseForgeFingerprintMatcher(api_key, fingerprinter=fingerprinter))
-    return CompositeProviderMatcher(matchers)
+    configuration_errors = () if api_key else ({
+        "provider": "curseforge", "code": "not_configured", "retryable": False,
+        "message": "CurseForge lookup is disabled because CURSEFORGE_API_KEY is not configured.",
+    },)
+    return CompositeProviderMatcher(matchers, configuration_errors=configuration_errors)
 
 
 def confirmed_provider_match(value: object, content: bytes) -> ProviderMatch | None:
@@ -528,6 +602,8 @@ def confirmed_provider_match(value: object, content: bytes) -> ProviderMatch | N
         raise MetadataError("provider_match kind must be a non-empty string or null")
     categories = _string_list(value.get("categories", []), "categories")
     tags = _string_list(value.get("tags", []), "tags")
+    project_slug = _optional_match_text(value.get("project_slug"), "project_slug")
+    filename = _optional_match_text(value.get("filename"), "filename")
     return ProviderMatch(
         str(value["provider"]),
         str(value["project_id"]),
@@ -540,6 +616,8 @@ def confirmed_provider_match(value: object, content: bytes) -> ProviderMatch | N
         kind,
         categories,
         tags,
+        project_slug,
+        filename,
     )
 
 
@@ -569,6 +647,18 @@ def _one_string(value: object) -> tuple[str, ...]:
 
 def _optional_text(value: object) -> str | None:
     return str(value) if isinstance(value, (str, int, float)) else None
+
+
+def _nonempty_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _optional_match_text(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise MetadataError(f"provider_match {field} must be a string or null")
+    return value or None
 
 
 def _dependency_ids(value: object) -> tuple[str, ...]:

@@ -9,9 +9,11 @@ from unittest.mock import Mock
 
 import pytest
 
+from mcframework.artifacts import ArtifactRegistry, PackageSelection
 from mcframework.cli import main
 from mcframework.errors import MetadataError
 from mcframework.local_state import LocalState
+from mcframework.modrinth_provider import ModrinthPackageProvider
 from mcframework.project import ProjectService
 from mcframework.web_process import start_web, stop_web
 from mcframework.web_server import McpackServer
@@ -19,6 +21,60 @@ from mcframework.web_server import McpackServer
 
 def game_path(project: Path, name: str = "game") -> Path:
     return project.parent / f"{project.name}-{name}"
+
+
+def test_web_sync_preserves_declared_disabled_mod_under_prune(
+    layer_factory, tmp_path: Path
+) -> None:
+    layer_factory(
+        "client",
+        operations=[
+            {
+                "type": "package",
+                "id": "kept",
+                "kind": "mod",
+                "activation": "disabled",
+                "destination": "mods/kept.jar",
+                "source": {
+                    "provider": "local",
+                    "location": "unused.jar",
+                    "sha256": "0" * 64,
+                },
+            },
+            {"type": "prune", "glob": "mods/**"},
+        ],
+    )
+    game = game_path(tmp_path)
+    (game / "mods").mkdir(parents=True)
+    kept = game / "mods/kept.jar.disabled"
+    unrelated = game / "mods/unrelated.jar.disabled"
+    kept.write_bytes(b"kept")
+    unrelated.write_bytes(b"unrelated")
+    ProjectService(tmp_path).link("client", "dev", game)
+    url = start_web(tmp_path, "dev")
+    base = url.split("?", 1)[0]
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+    try:
+        opener.open(url, timeout=3).read()
+        bootstrap = json.loads(opener.open(base + "api/v1/bootstrap", timeout=3).read())
+        request = urllib.request.Request(
+            base + "api/v1/sync",
+            data=b"{}",
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Mcpack-CSRF": bootstrap["csrf"],
+                "If-Match": f'"{bootstrap["revision"]}"',
+                "Origin": base.rstrip("/"),
+            },
+        )
+        opener.open(request, timeout=3).read()
+    finally:
+        stop_web(tmp_path, "dev")
+
+    assert kept.read_bytes() == b"kept"
+    assert not (game / "mods/kept.jar").exists()
+    assert not unrelated.exists()
 
 
 def test_fast_bootstrap_skips_delta_and_server_delta_runs_full_diff_once(
@@ -77,17 +133,13 @@ def test_init_layer_creates_only_minimal_marker_and_refuses_existing_content(
     monkeypatch.chdir(tmp_path)
 
     assert main(["init", "client"]) == 0
-    marker = tmp_path / "client/.pack/layer.json"
-    assert json.loads(marker.read_text(encoding="utf-8")) == {
-        "schema": 2,
-        "id": "client",
-        "parents": [],
-    }
+    marker = tmp_path / "client/.pack/layer.mcpack"
+    assert marker.read_text(encoding="utf-8") == 'layer("client")\n'
     assert sorted(
         path.relative_to(tmp_path / "client").as_posix()
         for path in (tmp_path / "client").rglob("*")
         if path.is_file()
-    ) == [".pack/layer.json"]
+    ) == [".pack/layer.mcpack"]
     assert ProjectService(tmp_path).branches() == ("client",)
     ProjectService(tmp_path).resolve_branch("client")
 
@@ -95,7 +147,7 @@ def test_init_layer_creates_only_minimal_marker_and_refuses_existing_content(
     empty = tmp_path / "empty"
     empty.mkdir()
     assert main(["init", "empty"]) == 0
-    assert (empty / ".pack/layer.json").is_file()
+    assert (empty / ".pack/layer.mcpack").is_file()
     occupied = tmp_path / "occupied"
     occupied.mkdir()
     (occupied / "keep.txt").write_text("keep", encoding="utf-8")
@@ -186,6 +238,195 @@ def test_activation_edit_re_resolves_and_replaces_previous_value(
         (tmp_path / ".mcpack/features/dev/.pack/local-edits.json").read_text()
     )["operations"]
     assert operations == [{"type": "activation", "id": "mod", "state": "available"}]
+
+
+def test_web_disable_moves_mod_jar_and_rejects_existing_disabled_path(
+    layer_factory, tmp_path: Path
+) -> None:
+    artifact = b"managed artifact"
+    (tmp_path / "source.jar").write_bytes(artifact)
+    layer_factory(
+        "client",
+        operations=[
+            {
+                "type": "package",
+                "id": "mod",
+                "kind": "mod",
+                "activation": "enabled",
+                "destination": "mods/mod.jar",
+                "source": {
+                    "provider": "local",
+                    "location": "source.jar",
+                    "sha256": hashlib.sha256(artifact).hexdigest(),
+                },
+            }
+        ],
+    )
+    game = game_path(tmp_path)
+    (game / "mods").mkdir(parents=True)
+    jar = game / "mods/mod.jar"
+    jar.write_bytes(b"instance jar")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+
+    service.set_activation("dev", "mod", "disabled", move_disabled_mod=True)
+
+    disabled = game / "mods/mod.jar.disabled"
+    assert not jar.exists()
+    assert disabled.read_bytes() == b"instance jar"
+
+    jar.write_bytes(b"still managed")
+    with pytest.raises(MetadataError, match="both 'mods/mod.jar'"):
+        service.set_activation("dev", "mod", "disabled", move_disabled_mod=True)
+    assert jar.read_bytes() == b"still managed"
+    assert disabled.read_bytes() == b"instance jar"
+
+
+def test_resolve_pins_unselected_mcpack_provider_line_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metadata = tmp_path / "client/.pack"
+    metadata.mkdir(parents=True)
+    (metadata / "layer.mcpack").write_text(
+        'layer("client", minecraft="26.3", loader="neoforge")\n',
+        encoding="utf-8",
+    )
+    package_file = metadata / "mods.mcpack"
+    package_file.write_bytes(
+        b'#magic\r\nsodium = modrinth("sodium") // keep this comment\r\n'
+    )
+
+    selector = Mock()
+    selector.select.return_value = PackageSelection(
+        "mc26.3-0.9.3", "https://example.invalid/sodium.jar", "sodium.jar"
+    )
+    registry = ArtifactRegistry()
+    registry.register("modrinth", selector)
+    service = ProjectService(tmp_path, provider_matcher=Mock())
+    monkeypatch.setattr(service, "artifact_components", lambda: (registry, None, None))
+
+    resolution = service.resolve_branch("client")
+
+    assert resolution.state.packages["sodium"].version == "mc26.3-0.9.3"
+    assert package_file.read_bytes() == (
+        b'#magic\r\nsodium = modrinth("sodium", "mc26.3-0.9.3") '
+        b"// keep this comment\r\n"
+    )
+
+
+def test_web_bootstrap_pins_available_mcpack_provider_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    metadata = tmp_path / "client/.pack"
+    metadata.mkdir(parents=True)
+    (metadata / "layer.mcpack").write_text(
+        'layer("client", minecraft="26.3", loader="neoforge")\n',
+        encoding="utf-8",
+    )
+    package_file = metadata / "mods.mcpack"
+    package_file.write_text(
+        '#Performance\nsodium = *modrinth("sodium", version="") // keep comment\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        ModrinthPackageProvider,
+        "select",
+        lambda _self, _package: PackageSelection(
+            "mc26.3-0.9.3-alpha.1", "https://example.invalid/sodium.jar", "sodium.jar"
+        ),
+    )
+    service = ProjectService(tmp_path, provider_matcher=Mock())
+    game = game_path(tmp_path)
+    game.mkdir()
+    service.link("client", "dev", game)
+
+    bootstrap = service.bootstrap("dev", include_delta=False)
+
+    assert bootstrap["packages"][0]["version"] == "mc26.3-0.9.3-alpha.1"
+    assert package_file.read_text(encoding="utf-8") == (
+        '#Performance\nsodium = *modrinth("sodium", version="mc26.3-0.9.3-alpha.1") '
+        "// keep comment\n"
+    )
+
+
+def test_same_layer_mcpack_disable_can_be_enabled_again(
+    tmp_path: Path,
+) -> None:
+    metadata = tmp_path / "client/.pack"
+    metadata.mkdir(parents=True)
+    (metadata / "layer.mcpack").write_text('layer("client")\n', encoding="utf-8")
+    (metadata / "mods.mcpack").write_text(
+        'named = local("artifact.jar", destination="mods/named.jar") // keep package\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "artifact.jar").write_bytes(b"artifact")
+    game = game_path(tmp_path)
+    game.mkdir()
+    service = ProjectService(tmp_path, provider_matcher=Mock())
+    service.link("client", "dev", game)
+
+    service.set_activation("dev", "named", "disabled", "client")
+    disabled_file = tmp_path / "client/mods/.pack/disabled.mcpack"
+    package_file = metadata / "mods.mcpack"
+    assert package_file.read_text(encoding="utf-8") == (
+        'named = *local("artifact.jar", destination="mods/named.jar") // keep package\n'
+    )
+    assert not disabled_file.exists()
+    assert (
+        service.instance_context("dev").resolution.state.packages["named"].activation.value
+        == "available"
+    )
+
+    service.set_activation("dev", "named", "enabled", "client")
+
+    assert package_file.read_text(encoding="utf-8") == (
+        'named = local("artifact.jar", destination="mods/named.jar") // keep package\n'
+    )
+    assert (
+        service.instance_context("dev").resolution.state.packages["named"].activation.value
+        == "enabled"
+    )
+
+    service.remove_package("dev", "named", mode="disable", target_layer="client")
+
+    assert package_file.read_text(encoding="utf-8") == (
+        'named = *local("artifact.jar", destination="mods/named.jar") // keep package\n'
+    )
+    assert not disabled_file.exists()
+
+
+def test_inherited_mcpack_activation_routes_add_into_selected_section(
+    tmp_path: Path,
+) -> None:
+    artifact = b"mod artifact"
+    (tmp_path / "artifact.jar").write_bytes(artifact)
+    base_meta = tmp_path / "base/.pack"
+    child_meta = tmp_path / "child/.pack"
+    base_meta.mkdir(parents=True)
+    child_meta.mkdir(parents=True)
+    (base_meta / "layer.mcpack").write_text('layer("base")\n', encoding="utf-8")
+    (base_meta / "mods.mcpack").write_text(
+        '#Magic\nmod = *local("artifact.jar") // keep declaration\n', encoding="utf-8"
+    )
+    (child_meta / "layer.mcpack").write_text(
+        'layer("child")\nparent("../base")\n', encoding="utf-8"
+    )
+    service = ProjectService(tmp_path, provider_matcher=Mock())
+    service.link("child", "dev", game_path(tmp_path))
+
+    with service.metadata_destination("mods/.pack/write", "Magic"):
+        service.set_activation("dev", "mod", "enabled", "child")
+
+    output = child_meta.parent / "mods/.pack/write.mcpack"
+    assert output.read_text(encoding="utf-8") == "#Magic\nadd(mod)\n"
+    assert (base_meta / "mods.mcpack").read_text(encoding="utf-8") == (
+        '#Magic\nmod = *local("artifact.jar") // keep declaration\n'
+    )
+
+    with service.metadata_destination("mods/.pack/write", "Magic"):
+        service.set_activation("dev", "mod", "disabled", "child")
+
+    assert output.read_text(encoding="utf-8") == "#Magic\ndisable(mod)\n"
 
 
 def test_capture_changed_package_creates_verified_local_artifact(

@@ -92,7 +92,7 @@ def test_explicit_base_import_owner_edits_declaration(imported_package):
 @pytest.mark.parametrize(
     ("target", "error", "message"),
     [
-        ("base", ResolutionError, "same-layer activation"),
+        ("base", ResolutionError, "disable must target a package inherited"),
         ("unrelated", MetadataError, "not writable"),
     ],
 )
@@ -115,7 +115,7 @@ def test_invalid_explicit_target_is_rejected_without_leaving_edits(
 
 
 @pytest.mark.parametrize("activation_first", [False, True])
-def test_imported_package_still_rejects_same_layer_activation_operation(
+def test_imported_package_same_layer_disable_remains_compatible(
     imported_package, activation_first
 ):
     service, declaration = imported_package(OVERLAY)
@@ -124,5 +124,6 @@ def test_imported_package_still_rejects_same_layer_activation_operation(
     document["operations"].insert(0 if activation_first else 1, operation)
     declaration.write_text(json.dumps(document), encoding="utf-8")
 
-    with pytest.raises(ResolutionError, match="same-layer activation"):
-        service.instance_context("dev")
+    assert service.instance_context("dev").resolution.state.packages[
+        "extra"
+    ].activation.value == "disabled"

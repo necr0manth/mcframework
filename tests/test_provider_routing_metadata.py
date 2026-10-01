@@ -10,7 +10,11 @@ from pathlib import Path
 import pytest
 
 from mcframework.errors import MetadataError
-from mcframework.package_inspect import ModrinthMatcher, confirmed_provider_match, file_hashes
+from mcframework.package_inspect import (
+    ModrinthMatcher,
+    confirmed_provider_match,
+    file_hashes,
+)
 from mcframework.project import ProjectService
 
 CONTENT = b"exact jar bytes"
@@ -19,13 +23,18 @@ CONTENT = b"exact jar bytes"
 def version(project_id: str = "magic") -> dict:
     return {
         "id": "version", "project_id": project_id,
-        "files": [{"url": "https://cdn.example.invalid/magic.jar", "hashes": file_hashes(CONTENT)}],
+        "version_number": "1.0",
+        "files": [{
+            "filename": "magic.jar",
+            "url": "https://cdn.example.invalid/magic.jar",
+            "hashes": file_hashes(CONTENT),
+        }],
     }
 
 
 def project(project_id: str = "magic") -> dict:
     return {
-        "id": project_id, "project_type": "mod", "categories": ["magic"],
+        "id": project_id, "slug": "magic-slug", "project_type": "mod", "categories": ["magic"],
         "additional_categories": ["library", "magic"],
     }
 
@@ -57,6 +66,53 @@ def test_modrinth_enriches_exact_match_and_reuses_project_cache(monkeypatch):
     assert selected.kind == match.kind
     assert selected.categories == match.categories
     assert selected.tags == match.tags
+    assert selected.project_slug == "magic-slug"
+    assert selected.filename == "magic.jar"
+
+
+def test_exact_nonprimary_modrinth_file_metadata_roundtrips(monkeypatch):
+    content = b"exact secondary file bytes"
+    exact_hashes = file_hashes(content)
+    calls = []
+
+    def urlopen(request, timeout):
+        calls.append(request.full_url)
+        if "/project/" in request.full_url:
+            return response(project())
+        return response({
+            "id": "version-id",
+            "project_id": "magic",
+            "version_number": "1.2.3",
+            "files": [
+                {
+                    "filename": "primary.jar",
+                    "url": "https://cdn.example.invalid/primary.jar",
+                    "primary": True,
+                    "hashes": file_hashes(b"different primary bytes"),
+                },
+                {
+                    "filename": "secondary.jar",
+                    "url": "https://cdn.example.invalid/secondary.jar",
+                    "primary": False,
+                    "hashes": exact_hashes,
+                },
+            ],
+        })
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    match = ModrinthMatcher().match(content)
+
+    assert match is not None
+    assert match.project_slug == "magic-slug"
+    assert match.version == "1.2.3"
+    assert match.filename == "secondary.jar"
+    assert match.download_url.endswith("/secondary.jar")
+    restored = confirmed_provider_match(match.document(), content)
+    assert restored is not None
+    assert restored.project_slug == match.project_slug
+    assert restored.filename == match.filename
+    assert restored.download_url == match.download_url
+    assert restored.hashes["sha256"] == exact_hashes["sha256"]
 
 
 @pytest.mark.parametrize("optional_response", [
@@ -129,6 +185,7 @@ def test_project_cache_is_bounded_and_ids_are_url_encoded(monkeypatch):
 @pytest.mark.parametrize("field,value", [
     ("kind", []), ("kind", ""), ("categories", "magic"),
     ("categories", ["magic", 1]), ("tags", [""]), ("tags", None),
+    ("project_slug", 42), ("filename", []),
 ])
 def test_confirmed_selection_validates_optional_metadata(field, value):
     candidate = {
@@ -186,6 +243,6 @@ def test_modrinth_categories_route_actual_import(tmp_path: Path, monkeypatch, co
     source = root / "mods/.pack/magic.json"
     assert source.is_file()
     declaration = json.loads(source.read_text())["operations"][0]
-    assert declaration["source"]["provider"] == "direct_url"
+    assert declaration["source"]["provider"] == "modrinth"
     assert "categories" not in declaration and "tags" not in declaration
     assert service.instance_context("dev").files["mods/magic.jar"] == content

@@ -75,6 +75,8 @@ class LayerDefinition:
     parents: tuple[ParentReference, ...]
     producers: tuple[Producer, ...]
     payload: Mapping[str, bytes]
+    minecraft: str | None = None
+    loader: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +101,12 @@ class PackageDeclaration:
     layer_precedence: int = 0
     source_file: str | None = None
     source_index: int | None = None
+    artifact_url: str | None = None
+    filename: str | None = None
+    minecraft: str | None = None
+    loader: str | None = None
+    logical_identity_explicit: bool = False
+    automatic_requires_explicit: bool = False
 
 
 @dataclass(frozen=True)
@@ -214,6 +222,7 @@ class Resolution:
     trace: tuple[LayerApplicationTrace, ...]
     artifacts: tuple[ResolvedArtifact, ...] = ()
     manifest: tuple[ManifestEntry, ...] = ()
+    automatic_dependencies: bool = True
 
 
 def with_activation(package: PackageDeclaration, activation: Activation) -> PackageDeclaration:

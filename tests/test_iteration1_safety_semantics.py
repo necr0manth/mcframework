@@ -531,7 +531,44 @@ def test_import_defaults_local_but_accepts_explicit_exact_provider(
     exact_operation = json.loads(
         (second_project / ".mcpack/features/dev/.pack/local-edits.json").read_text()
     )["operations"][0]
-    assert exact_operation["source"]["provider"] == "direct_url"
+    assert exact_operation["source"]["provider"] == "modrinth"
+
+
+def test_import_disabled_jar_as_inactive_package(layer_factory, tmp_path: Path) -> None:
+    layer_factory("client", operations=[])
+    game = outside(tmp_path)
+    (game / "mods").mkdir(parents=True)
+    content = jar({"fabric.mod.json": '{"id":"extra","version":"2.0"}'})
+    physical = game / "mods/extra.JAR.disabled"
+    physical.write_bytes(content)
+    service = ProjectService(tmp_path, provider_matcher=NoMatch())
+    service.link("client", "dev", game)
+    item = service.instance_diff(service.instance_context("dev"))["items"][0]
+
+    assert item["kind"] == "package"
+    assert item["capture_modes"] == ["package", "payload"]
+    detail = service.delta_detail("dev", str(item["id"]))
+    assert detail["proposed_package_id"] == "extra"
+    service.import_package("dev", item["id"], provider_match="local")
+
+    operation = json.loads(
+        (tmp_path / ".mcpack/features/dev/.pack/local-edits.json").read_text()
+    )["operations"][0]
+    assert operation["id"] == "extra"
+    assert operation["activation"] == "disabled"
+    assert operation["destination"] == "mods/extra.JAR"
+    assert operation["source"]["sha256"] == hashlib.sha256(content).hexdigest()
+    context = service.instance_context("dev")
+    assert context.resolution.state.packages["extra"].activation.value == "disabled"
+    assert "mods/extra.JAR" not in context.files
+    assert "mods/extra.JAR.disabled" not in context.files
+    assert physical.read_bytes() == content
+    assert service.instance_diff(context)["items"] == []
+    with pytest.raises(MetadataError, match="does not exist"):
+        service.delta_detail("dev", str(item["id"]))
+    assert next(
+        (tmp_path / ".mcpack/features/dev/.pack/artifacts").glob("*.jar")
+    ).read_bytes() == content
 
 
 def test_explicit_modrinth_failure_falls_back_to_local(layer_factory, tmp_path: Path) -> None:

@@ -9,6 +9,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from mcframework.errors import MetadataError
 from mcframework.model import IgnoreSelector, SelectorKind
 from mcframework.operations import AddIgnoreSelector, operation_from_json, operation_to_json
 from mcframework.project import ProjectService
+from mcframework.transport import LocalFilesystemInstance
 from mcframework.web_process import start_web, stop_web
 
 
@@ -60,6 +62,86 @@ def test_ignore_selectors_preserve_legacy_globs_and_literal_special_characters()
     assert subtree.contains("config/[profile]")
     assert subtree.contains("config/[profile]/nested/file")
     assert not subtree.contains("config/[profile]-copy/file")
+
+
+@pytest.mark.parametrize("operation, ignored", [
+    ({"type": "ignore", "selector": {"kind": "subtree", "path": "mods/.connector"}},
+     "mods/.connector/nested/generated.jar"),
+    ({"type": "ignore", "selector": {"kind": "exact", "path": "mods/generated.jar"}},
+     "mods/generated.jar"),
+    ({"type": "ignore", "glob": "mods/cache/**"}, "mods/cache/nested/generated.jar"),
+])
+def test_folder_plan_skips_ignored_packages_before_reading(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    operation: dict[str, object], ignored: str,
+) -> None:
+    layer_factory("client", operations=[operation])
+    game = game_path(tmp_path)
+    ignored_file = game / ignored
+    ignored_file.parent.mkdir(parents=True)
+    ignored_file.write_bytes(b"must not inspect")
+    (game / "mods/keep.txt").write_text("keep")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+    snapshot = service.explorer_snapshot("dev")
+    assert snapshot.entries[ignored]["ignored"]
+    original_read = LocalFilesystemInstance.read
+
+    def read(transport, path: str):
+        assert path != ignored, "ignored package must not be read or enriched"
+        return original_read(transport, path)
+
+    monkeypatch.setattr("mcframework.project.LocalFilesystemInstance.read", read)
+    plan = service.explorer_plan("dev", "mods")
+    assert [item["path"] for item in plan["items"]] == ["mods/keep.txt"]
+    assert plan["unsupported"] == []
+    service.capture_explorer_path("dev", "mods", decisions=planned_decisions(service, "mods"))
+    assert ignored_file.read_bytes() == b"must not inspect"
+    assert service.instance_diff(service.instance_context("dev"))["items"] == []
+    assert not any(
+        path.name == "generated.jar" for path in service.state.feature_root("dev").rglob("*")
+    )
+
+
+@pytest.mark.parametrize("ignored", ["mods/old.txt", "mods/new.txt"])
+def test_folder_plan_skips_rename_with_either_side_ignored(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ignored: str,
+) -> None:
+    layer_factory("client", operations=[
+        {"type": "ignore", "selector": {"kind": "exact", "path": ignored}},
+    ], payload={"mods/old.txt": "same"})
+    game = game_path(tmp_path)
+    (game / "mods").mkdir(parents=True)
+    (game / "mods/new.txt").write_text("same")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+    snapshot = service.explorer_snapshot("dev")
+    # Fast snapshots currently split rename sides; exercise a rename delta explicitly.
+    rename = dict(snapshot.delta_items[0], path="mods/old.txt", to_path="mods/new.txt",
+                  status="rename")
+    monkeypatch.setattr(service, "explorer_snapshot", lambda *args, **kwargs: replace(
+        snapshot, delta_items=(rename,), context_verified=True,
+    ))
+    assert service.explorer_plan("dev", "mods")["items"] == []
+
+
+def test_folder_plan_ignores_unsupported_descendants(layer_factory, tmp_path: Path) -> None:
+    layer_factory("client", operations=[
+        {"type": "ignore", "selector": {"kind": "subtree", "path": "config/blocked"}},
+    ], payload={"config/blocked/file.txt": "wanted"})
+    game = game_path(tmp_path)
+    (game / "config").mkdir(parents=True)
+    (game / "config/blocked").write_text("conflict")
+    (game / "config/keep.txt").write_text("keep")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+    plan = service.explorer_plan("dev", "config")
+    assert plan["unsupported"] == []
+    assert [item["path"] for item in plan["items"]] == ["config/keep.txt"]
+    service.capture_explorer_path("dev", "config", decisions=planned_decisions(service, "config"))
+    assert (game / "config/blocked").read_text() == "conflict"
+    assert not (service.state.feature_root("dev") / "config/blocked").exists()
+    assert service.instance_diff(service.instance_context("dev"))["items"] == []
 
 
 def test_explorer_unions_real_tree_ghost_deletions_empty_dirs_and_ignored_status(
@@ -444,6 +526,53 @@ def test_jar_capture_requires_explicit_choice(layer_factory, tmp_path: Path) -> 
     decisions = planned_decisions(service, "mods/extra.jar", {str(item["id"]): "payload"})
     service.capture_explorer_path("dev", "mods/extra.jar", decisions=decisions)
     assert service.instance_diff(service.instance_context("dev"))["items"] == []
+
+
+def test_folder_package_capture_preserves_disabled_suffix_semantics(
+    layer_factory, tmp_path: Path
+) -> None:
+    enabled = io.BytesIO()
+    disabled = io.BytesIO()
+    old_disabled = io.BytesIO()
+    with zipfile.ZipFile(enabled, "w") as archive:
+        archive.writestr("fabric.mod.json", '{"id":"enabled","version":"1"}')
+    with zipfile.ZipFile(disabled, "w") as archive:
+        archive.writestr("fabric.mod.json", '{"id":"inactive","version":"1"}')
+    with zipfile.ZipFile(old_disabled, "w") as archive:
+        archive.writestr("fabric.mod.json", '{"id":"inactive","version":"0"}')
+    layer_factory(
+        "client",
+        operations=[],
+        payload={"mods/inactive.jar.disabled": old_disabled.getvalue()},
+    )
+    game = game_path(tmp_path)
+    (game / "mods").mkdir(parents=True)
+    (game / "mods/enabled.jar").write_bytes(enabled.getvalue())
+    (game / "mods/inactive.jar.disabled").write_bytes(disabled.getvalue())
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+    plan = service.explorer_plan("dev", "mods")
+    modes = {str(item["id"]): "package" for item in plan["items"]}
+
+    service.capture_explorer_path(
+        "dev", "mods", decisions=planned_decisions(service, "mods", modes)
+    )
+
+    operations = json.loads(
+        (tmp_path / ".mcpack/features/dev/.pack/local-edits.json").read_text()
+    )["operations"]
+    packages = {item["destination"]: item for item in operations if item["type"] == "package"}
+    assert {item["path"] for item in operations if item["type"] == "remove"} == {
+        "mods/inactive.jar.disabled"
+    }
+    assert packages["mods/enabled.jar"]["activation"] == "enabled"
+    assert packages["mods/inactive.jar"]["activation"] == "disabled"
+    context = service.instance_context("dev")
+    assert "mods/enabled.jar" in context.files
+    assert "mods/inactive.jar" not in context.files
+    assert (game / "mods/enabled.jar").read_bytes() == enabled.getvalue()
+    assert (game / "mods/inactive.jar.disabled").read_bytes() == disabled.getvalue()
+    assert service.instance_diff(context)["items"] == []
 
 
 def test_folder_capture_requires_exact_plan_preconditions_before_writes(

@@ -41,6 +41,64 @@ def test_ignore_is_not_a_sync_suppression_rule(tmp_path: Path) -> None:
     assert report.deleted == ("logs.txt",)
 
 
+def test_sync_prune_preserves_only_exact_disabled_package_alias(tmp_path: Path) -> None:
+    target = tmp_path / "instance"
+    (target / "mods").mkdir(parents=True)
+    kept = target / "mods/kept.jar.disabled"
+    unrelated = target / "mods/unrelated.jar.disabled"
+    kept.write_bytes(b"kept")
+    unrelated.write_bytes(b"unrelated")
+
+    report = Synchronizer().sync(
+        {},
+        LocalFilesystemInstance(target),
+        ("mods/**",),
+        ("mods/kept.jar.disabled",),
+    )
+
+    assert report.deleted == ("mods/unrelated.jar.disabled",)
+    assert kept.read_bytes() == b"kept"
+    assert not unrelated.exists()
+
+
+def test_sync_renames_live_disabled_mod_and_preserves_disabled_file(tmp_path: Path) -> None:
+    root = tmp_path / "instance"
+    (root / "mods").mkdir(parents=True)
+    active = root / "mods/mod.jar"
+    disabled = root / "mods/mod.jar.disabled"
+    active.write_bytes(b"mod bytes")
+
+    report = Synchronizer().sync(
+        {"config/settings.txt": b"settings"},
+        LocalFilesystemInstance(root),
+        preserve=("mods/mod.jar.disabled",),
+    )
+
+    assert not active.exists()
+    assert disabled.read_bytes() == b"mod bytes"
+    assert "mods/mod.jar.disabled" in report.created
+
+
+def test_sync_reports_both_active_and_disabled_mod_without_overwriting(tmp_path: Path) -> None:
+    root = tmp_path / "instance"
+    (root / "mods").mkdir(parents=True)
+    active = root / "mods/mod.jar"
+    disabled = root / "mods/mod.jar.disabled"
+    active.write_bytes(b"active")
+    disabled.write_bytes(b"disabled")
+
+    with pytest.raises(TransportError, match="disabled package conflict"):
+        Synchronizer().sync(
+            {"config/settings.txt": b"settings"},
+            LocalFilesystemInstance(root),
+            preserve=("mods/mod.jar.disabled",),
+        )
+
+    assert active.read_bytes() == b"active"
+    assert disabled.read_bytes() == b"disabled"
+    assert not (root / "config/settings.txt").exists()
+
+
 def test_local_transport_contract_and_path_safety(tmp_path: Path) -> None:
     transport = LocalFilesystemInstance(tmp_path / "instance")
     transport.create_directories("a/b")

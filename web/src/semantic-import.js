@@ -6,7 +6,9 @@ const PROVIDER_ORDER = ['modrinth', 'curseforge'];
 
 export function isPackageImportItem(entry) {
   if (PACKAGE_KINDS.has(entry.proposed_package_kind)) return true;
-  return !entry.proposed_package_kind && entry.path.toLowerCase().endsWith('.jar');
+  const path = entry.path.toLowerCase();
+  return !entry.proposed_package_kind
+    && (path.endsWith('.jar') || path.endsWith('.jar.disabled'));
 }
 
 export function singleFileImportItem(entry) {
@@ -88,8 +90,38 @@ export function packageProviderLookupPending(plan) {
     || packagePlanItems(plan?.items || []).some(providerLookupPending);
 }
 
-export function preferredProviderSelectable(plan, provider) {
+export function preferredProviderReady(plan, provider) {
   return provider === 'local' || !packageProviderLookupPending(plan);
+}
+
+export function packageLookupProgress(plan) {
+  const items = packagePlanItems(plan?.items || []);
+  return { completed: items.filter((item) => !providerLookupPending(item)).length, total: items.length };
+}
+
+export function packageLookupMessage(item) {
+  if (providerLookupPending(item)) return 'Still checking remote sources for this package. Matches will appear here; you can choose a local artifact or raw file now.';
+  if (item.provider_lookup === 'failed' || item.provider_errors?.length) return 'Remote source lookup is incomplete for this package. Available matches and local choices remain usable.';
+  if (!orderedProviderCandidates(item).length) return 'No remote matches found for this package. Choose a local artifact or raw file.';
+  return '';
+}
+
+export function packageLookupIssues(plan) {
+  const items = packagePlanItems(plan?.items || []);
+  const incomplete = items.filter((item) => item.provider_lookup === 'failed' || item.provider_errors?.length);
+  const errors = new Map();
+  for (const item of incomplete) {
+    for (const error of item.provider_errors || []) {
+      errors.set(`${error.provider}\0${error.code}\0${error.message}`, error);
+    }
+  }
+  return {
+    count: incomplete.length,
+    errors: [...errors.values()],
+    retryable: incomplete.some((item) => item.provider_errors?.length
+      ? item.provider_errors.some((error) => error.retryable)
+      : item.provider_lookup === 'failed'),
+  };
 }
 
 export function previousFolderWizardState(state) {

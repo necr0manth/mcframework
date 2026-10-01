@@ -310,3 +310,6 @@ select:focus, input:focus { border-color: #668b43; box-shadow: 0 0 0 2px rgba(16
 .routing-rule-editor input[type=checkbox] { width: auto; }
 .routing-rule-editor pre, .routing-fields pre { max-height: 250px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .modal .routing-fields { grid-template-columns: 1fr; }
+
+.modal .package-lookup-status { grid-column: 1 / -1; margin: 0 0 4px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.modal .lookup-detail { margin: 5px 0 0; font-size: 10px; line-height: 1.5; }
