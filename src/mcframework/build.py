@@ -6,12 +6,10 @@ from dataclasses import replace
 from pathlib import Path
 
 from .artifacts import ArtifactResolver
-from .manifest import manifest_bytes, materialized_files
+from .manifest import materialized_files
 from .model import Resolution
 from .sync import Synchronizer, SyncReport
 from .transport import LocalFilesystemInstance
-
-MANIFEST_NAME = ".mcpack-manifest.json"
 
 
 class Builder:
@@ -27,6 +25,5 @@ class Builder:
 
     def build(self, resolution: Resolution, output: Path | str) -> tuple[Resolution, SyncReport]:
         resolved, files = self.prepare(resolution)
-        files[MANIFEST_NAME] = manifest_bytes(resolved)
         report = Synchronizer().sync(files, LocalFilesystemInstance(output), ("**",))
         return resolved, report

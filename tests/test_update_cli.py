@@ -118,7 +118,9 @@ def test_cli_resolve_build_and_local_sync(layer_factory, tmp_path: Path, capsys)
     assert '"mods/mod.jar"' in capsys.readouterr().out
     output = tmp_path / "build"
     assert main(["build", str(tmp_path), "pack", str(output), "--cache", str(cache)]) == 0
-    assert (output / ".mcpack-manifest.json").exists()
+    assert not (output / ".mcpack-manifest.json").exists()
+    assert (output / "mods/mod.jar").read_bytes() == b"jar"
+    assert (output / "config/a").read_text() == "value"
     instance = tmp_path / "instance"
     (instance / "mods").mkdir(parents=True)
     (instance / "mods/old.jar").write_bytes(b"old")

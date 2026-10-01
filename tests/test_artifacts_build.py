@@ -132,11 +132,16 @@ def test_build_is_deterministic_and_prunes_stale_files(layer_factory, tmp_path: 
     first, report = builder.build(resolution, output)
     assert report.deleted == ("stale",)
     assert (output / "mods/a.jar").read_bytes() == b"artifact"
-    manifest_first = (output / ".mcpack-manifest.json").read_bytes()
+    assert (output / "config/a").read_bytes() == b"x"
+    assert not (output / ".mcpack-manifest.json").exists()
+    (output / ".mcpack-manifest.json").write_text("old manifest")
     second, report2 = builder.build(resolution, output)
     assert report2.updated == ()
-    assert (output / ".mcpack-manifest.json").read_bytes() == manifest_first
-    document = json.loads(manifest_first)
+    assert report2.created == ()
+    assert report2.deleted == (".mcpack-manifest.json",)
+    assert report2.unchanged == ("config/a", "mods/a.jar")
+    assert not (output / ".mcpack-manifest.json").exists()
+    document = json.loads(manifest_bytes(first))
     assert [item["path"] for item in document["files"]] == ["config/a", "mods/a.jar"]
     assert document["artifacts"][0]["sha256"] == digest
     assert first.manifest == second.manifest

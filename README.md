@@ -170,8 +170,8 @@ mcpack import dev <delta-id> --provider-match modrinth
 ```
 
 `build <branch>` defaults to `build/<branch>`. Custom output is rejected when it intersects
-the project, any branch, `.mcpack`, or a registered instance. A build writes
-`.mcpack-manifest.json` beside the materialized files. The artifact cache defaults to
+the project, any branch, `.mcpack`, or a registered instance. A build writes only the
+materialized files, without an additional manifest. The artifact cache defaults to
 `.mcpack/cache`.
 
 `sync <instance>` resolves the linked effective layer and synchronizes its direct game root.
