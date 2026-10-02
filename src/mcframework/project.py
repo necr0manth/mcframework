@@ -909,6 +909,21 @@ class ProjectService:
         return generation(path)
 
     def _context_source_generations(self, context: InstanceContext) -> SourceGenerations:
+        with self._context_lock:
+            cached = self._contexts.get(context.instance.name)
+            if (
+                cached is not None
+                and cached.context is not None
+                and cached.context.resolution.state is context.resolution.state
+                and len(cached.context.files) == len(context.files)
+                and all(
+                    cached.context.files.get(path) is content
+                    for path, content in context.files.items()
+                )
+            ):
+                # These stamps precede the reads that produced this context. Re-enumerating
+                # now adds a full source scan and could bless a concurrent source edit.
+                return (*cached.generations, *cached.loader.source_generations())
         paths = {
             self.state.instances_path,
             self.state.links_path,
@@ -1179,7 +1194,53 @@ class ProjectService:
         return {"path": normalized, "items": items, "unsupported": conflicts}
 
     def ignore_rules(self, instance: str, target_layer: str | None = None) -> list[dict[str, Any]]:
-        context = self.instance_context(instance)
+        context = self.instance_context(instance, prepare=False)
+        return self._ignore_rules(context, target_layer)
+
+    def mutation_projection(
+        self, instance: str, *, activation: bool = False, ignore: bool = False,
+        target_layer: str | None = None,
+    ) -> dict[str, Any]:
+        """Project a just-validated mutation without preparing or scanning sources again.
+
+        The HTTP caller holds the instance mutation lock and calls this only after a
+        successful activation or ignore edit, which validates and publishes its context.
+        """
+        with self._context_lock:
+            context = self._contexts[instance].context
+            if context is None:
+                raise RuntimeError("mutation did not publish a validated context")
+            result: dict[str, Any] = {}
+            if activation:
+                state = context.resolution.state
+                result["activation_patch"] = {
+                    "packages": [
+                        {
+                            "id": package.identity,
+                            "activation": (
+                                "enabled" if package.activation is Activation.TRANSITIVE
+                                else package.activation.value
+                            ),
+                            **(
+                                {"activation_reason": "dependency"}
+                                if package.activation is Activation.TRANSITIVE else {}
+                            ),
+                        }
+                        for package in state.packages.values()
+                    ],
+                    "groups": [
+                        {"id": group.identity, "activation": group.activation.value}
+                        for group in state.groups.values()
+                    ],
+                }
+            if ignore:
+                result["ignore_rules"] = self._ignore_rules(context, target_layer)
+            return result
+
+    def _ignore_rules(
+        self, context: InstanceContext, target_layer: str | None = None
+    ) -> list[dict[str, Any]]:
+        instance = context.instance.name
         target = self._target_path(instance, context, target_layer)
         rules: list[dict[str, Any]] = []
         for trace in context.resolution.trace:
@@ -1274,7 +1335,7 @@ class ProjectService:
         source = identity.get("source")
         if not isinstance(source, str) or not any(
             rule["identity"] == identity and rule["removable"]
-            for rule in self.ignore_rules(instance, target_layer)
+            for rule in self._ignore_rules(context, target_layer)
         ):
             raise MetadataError("inherited ignore rule cannot be removed, or the rule has moved")
         index = identity.get("index")

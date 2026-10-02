@@ -257,3 +257,28 @@ def test_ignore_reprojection_does_not_bless_stale_source(
     assert refreshed is not initial
     assert refreshed.entries["config.txt"]["status"] == "change"
     assert refreshed.entries["extra.txt"]["ignored"] is not remove
+
+
+def test_verified_context_source_stamps_reuse_reads_and_do_not_bless_later_edits(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = layer_factory("client", operations=[], payload={"config.txt": "same"})
+    service, game = linked_service(tmp_path)
+    (game / "config.txt").write_text("same")
+    context = service.instance_context("dev")
+
+    def fail_generation(path: Path) -> Any:
+        raise AssertionError("verified context must reuse generations recorded before reads")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(service, "_source_generation", fail_generation)
+        stamps = service._context_source_generations(context)
+
+    original = dict(stamps)[source / "config.txt"]
+    write_changed(source / "config.txt", "diff")
+    # Returning the saved stamp makes any snapshot built from this context immediately
+    # stale; recording a new stamp here would bless old bytes as if they were fresh.
+    assert dict(service._context_source_generations(context))[source / "config.txt"] == original
+    assert project_module.generation(source / "config.txt") != original
+    refreshed = service.explorer_snapshot("dev")
+    assert refreshed.entries["config.txt"]["status"] == "change"

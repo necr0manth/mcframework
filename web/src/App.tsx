@@ -6,6 +6,7 @@ import type { MetadataWrite } from './RoutingControls.js';
 import { captureCreatesMetadata, captureRoutingOperation, packageOwnedBy } from './routing-model.js';
 import { candidateKey, defaultProviderKey, orderedProviderCandidates, providerLookupPending, semanticCaptureAction, semanticItemReady } from './semantic-import.js';
 import { allMembersActive, buildMetadataTree, canImportDelta, deltaPresentation, featureSidebarSummary, metadataDeclarationCount, packageActivationTarget, paginateDelta } from './view-model.js';
+import { applyCompactReply, applyPendingMutations, optimisticActivation, settleCompactReply } from './mutation-model.js';
 
 type View = 'pack' | 'delta' | 'files';
 type Activation = 'available' | 'enabled' | 'disabled' | 'transitive' | string;
@@ -160,9 +161,17 @@ export default function App() {
     (id: string, revision: number) => client.deltaItem(id, revision),
   )).current;
   const detailKey = useRef('');
-  const [data, setData] = useState<Bootstrap | null>(null);
+  const [snapshot, setData] = useState<Bootstrap | null>(null);
+  type PendingMutation = { id: number; label: string; optimistic?: (value: Bootstrap) => Bootstrap };
+  const [pending, setPending] = useState<PendingMutation[]>([]);
+  const pendingRef = useRef<PendingMutation[]>([]);
+  const mutationId = useRef(0);
+  const data: Bootstrap | null = snapshot ? applyPendingMutations(snapshot, pending) : null;
   const [view, setView] = useState<View>('pack');
-  const [selected, setSelected] = useState<Selected | null>(null);
+  const [selectedItem, setSelected] = useState<Selected | null>(null);
+  const selected: Selected | null = selectedItem?.type === 'package' && data
+    ? { type: 'package', value: data.packages.find((item) => item.id === selectedItem.value.id) || selectedItem.value }
+    : selectedItem;
   const [targetLayer, setTargetLayer] = useState('');
   const [routingDialog, setRoutingDialog] = useState(false);
   const [packageEdit, setPackageEdit] = useState<{
@@ -182,6 +191,7 @@ export default function App() {
   const [compositionStaleRevision, setCompositionStaleRevision] = useState<number | null>(null);
 
   function applyBootstrap(next: Bootstrap) {
+    if (next.revision < (client.revision ?? 0)) return;
     setData(next);
     setCompositionStaleRevision(null);
     if (!next.writable_layers.some((layer) => layer.id === targetLayer)) {
@@ -241,28 +251,17 @@ export default function App() {
   }, [view, data?.delta.loaded, data?.revision, deltaLoader]);
 
   useEffect(() => {
-    if (view !== 'pack' || compositionStaleRevision === null) return;
+    if (view !== 'pack' || compositionStaleRevision === null || pending.length) return;
     let live = true;
-    setBusy('refresh:pack');
     client.bootstrap().then((next: Bootstrap) => {
       if (!live) return;
       applyBootstrap(next);
-    }).catch((reason: Error) => live && setError(reason.message))
-      .finally(() => live && setBusy(''));
+    }).catch((reason: Error) => live && setError(reason.message));
     return () => { live = false; };
-  }, [view, compositionStaleRevision]);
+  }, [view, compositionStaleRevision, pending.length]);
 
   function applyCompactMutation(revision: number, success: string) {
-    setData((current) => current ? {
-      ...current,
-      revision,
-      delta: {
-        ...current.delta,
-        loaded: false,
-        complete: false,
-        revision,
-      },
-    } : current);
+    setData((current) => applyCompactReply(current, { revision }));
     setCompositionStaleRevision(revision);
     setError('');
     setNotice(success);
@@ -275,7 +274,7 @@ export default function App() {
 
   async function refreshAfterConflict(reason: ApiError) {
     try {
-      const next = await client.bootstrap() as Bootstrap;
+      const next = reason.bootstrap || await client.bootstrap() as Bootstrap;
       applyBootstrap(next);
       const actual = (reason.details as Record<string, unknown>).actual;
       setError(`Another change was saved${actual === undefined ? '' : ` (revision ${actual})`}. The view was refreshed; review and try again.`);
@@ -284,13 +283,23 @@ export default function App() {
     }
   }
 
-  async function act(label: string, action: () => Promise<Bootstrap>, success: string) {
-    setBusy(label);
+  async function act(label: string, action: () => Promise<Bootstrap>, success: string, optimistic?: (value: Bootstrap) => Bootstrap, onApplied?: (reply: unknown) => void) {
+    const operation = { id: ++mutationId.current, label, optimistic };
+    pendingRef.current = [...pendingRef.current, operation];
+    setPending(pendingRef.current);
+    if (label === 'sync') setBusy(label);
     setError('');
     setNotice('');
     try {
       const outcome = await runRevisionedMutation(client, action);
-      applyBootstrap(outcome.value as Bootstrap);
+      const next = outcome.value as Bootstrap & { ok?: boolean };
+      if (outcome.applied) onApplied?.(next);
+      if (next.ok === true && !next.packages) {
+        setData((current) => settleCompactReply(current, next, optimistic));
+        setCompositionStaleRevision(next.revision);
+      } else {
+        applyBootstrap(next);
+      }
       if (!outcome.applied) {
         const actual = (outcome.conflict?.details as Record<string, unknown> | undefined)?.actual;
         setError(`Another change was saved${actual === undefined ? '' : ` (revision ${actual})`}. The view was refreshed; review and try again.`);
@@ -302,7 +311,9 @@ export default function App() {
       setError(reason instanceof Error ? reason.message : 'Request failed');
       return false;
     } finally {
-      setBusy('');
+      pendingRef.current = pendingRef.current.filter((entry) => entry.id !== operation.id);
+      setPending(pendingRef.current);
+      if (label === 'sync') setBusy('');
     }
   }
 
@@ -325,20 +336,27 @@ export default function App() {
       `activation:${item.id}`,
       () => client.setActivation(item.id, state, target),
       `${item.id} is now ${state}.`,
+      (current) => optimisticActivation(current, [item.id], state),
     );
   }
 
   async function submitPackageEdit() {
     if (!packageEdit) return;
-    const { item, mode, target, metadataWrite } = packageEdit;
+    const draft = packageEdit;
+    const { item, mode, target, metadataWrite } = draft;
+    setPackageEdit(null);
     const changed = await act(
       `package:${item.id}`,
       () => mode === 'enabled'
         ? client.setActivation(item.id, 'enabled', target, metadataWrite)
         : client.removePackage(item.id, mode, target, metadataWrite),
       mode === 'remove' ? `${item.id} declaration removed.` : `${item.id} updated.`,
+      mode === 'remove' ? undefined : (current) => optimisticActivation(
+        current, [item.id], mode === 'enabled' ? 'enabled' : 'disabled',
+      ),
     );
-    if (changed) { setPackageEdit(null); if (mode === 'remove') setSelected(null); }
+    if (!changed) setPackageEdit((current) => current ?? draft);
+    else if (mode === 'remove') setSelected(null);
   }
 
   function toggleGroup(item: Group) {
@@ -347,6 +365,7 @@ export default function App() {
       `group:${item.id}`,
       () => client.setGroupActivation(item.id, state, targetLayer),
       `${item.name} group is now ${state}.`,
+      (current) => optimisticActivation(current, item.members, state, item.id),
     );
   }
 
@@ -357,6 +376,7 @@ export default function App() {
       `section:${item.id}`,
       () => client.setSectionActivation(item.id, state, targetLayer),
       `${item.title} section was updated atomically.`,
+      (current) => optimisticActivation(current, item.members, state),
     );
   }
 
@@ -600,7 +620,7 @@ export default function App() {
       </aside>
 
       <main className="workspace">
-        {(error || notice) && <div className={`banner ${error ? 'error' : 'success'}`} role={error ? 'alert' : 'status'}><span>{error ? '!' : '✓'}</span><p>{error || notice}</p><button aria-label="Dismiss" onClick={() => { setError(''); setNotice(''); }}>×</button></div>}
+        {(error || notice || pending.length > 0) && <div className={`banner ${error ? 'error' : 'success'}`} role={error ? 'alert' : 'status'}><span>{error ? '!' : pending.length ? '…' : '✓'}</span><p>{error || (pending.length ? 'Saving changes…' : notice)}</p><button aria-label="Dismiss" onClick={() => { setError(''); setNotice(''); }}>×</button></div>}
         {readOnly && <div className="banner warning"><span>i</span><p><strong>Read-only session.</strong> This server did not grant editing capabilities.</p></div>}
 
         {view === 'pack' ? <>
@@ -640,7 +660,7 @@ export default function App() {
             const canReviewImport = canImportDelta(item) && data.capabilities.package_import;
             return <article className={`delta-card delta-${item.kind}`} key={item.id}><span className={`change-kind ${presentation.tone}`}>{presentation.label}</span><div className="delta-copy"><div className="delta-title"><h2>{presentation.title}</h2><span>{item.kind}</span></div><code>{presentation.path}</code><p>{presentation.detail}</p>{(item.actual_version || item.desired_version) && item.status !== 'update' && <small>Local {item.actual_version || '?'} · desired {item.desired_version || '?'}</small>}{item.desired_sha256 && <small>Expected {item.desired_sha256.slice(0, 12)}…</small>}{item.actual_sha256 && <small>Local {item.actual_sha256.slice(0, 12)}…</small>}</div><div className="delta-actions">{!item.editable && <span className="readonly-pill">Read-only producer</span>}<button className="primary" disabled={!!busy || !!detailBusy || !item.editable || (!data.capabilities.capture && !data.capabilities.package_import) || !data.writable_layers.length} onClick={() => void openCapture(item)}>{detailBusy === `${data.revision}:${item.id}` ? 'Inspecting…' : busy === `delta:${item.id}` ? 'Capturing…' : canReviewImport ? 'Review import' : 'Capture change'}</button></div></article>;
           })}{deltaPage.rendered < deltaPage.total && <button className="secondary" onClick={() => setDeltaPageState({ key: deltaPageKey, limit: deltaPage.nextLimit })}>Load {Math.min(DELTA_PAGE_SIZE, deltaPage.total - deltaPage.rendered)} more</button>}</div> : <Empty title="Instance matches the layer">There are no uncaptured semantic changes in this instance.</Empty>}
-        </> : <FileExplorer client={client} data={data} targetLayer={targetLayer} layers={data.writable_layers} onTargetLayer={setTargetLayer} onMutate={(label, action, success) => act(label, async () => await action() as Bootstrap, success)} onCompactMutation={applyCompactMutation} onRevisionConflict={(reason) => refreshAfterConflict(reason as ApiError)} onReviewImport={openCapture} onError={setError} />}
+        </> : <FileExplorer client={client} data={data} targetLayer={targetLayer} layers={data.writable_layers} onTargetLayer={setTargetLayer} onMutate={(label, action, success, onApplied) => act(label, async () => await action() as Bootstrap, success, undefined, onApplied)} onCompactMutation={applyCompactMutation} onRevisionConflict={(reason) => refreshAfterConflict(reason as ApiError)} onReviewImport={openCapture} onError={setError} />}
       </main>
 
       {routingDialog && <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="routing-title">

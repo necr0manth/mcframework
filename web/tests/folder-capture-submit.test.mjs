@@ -10,7 +10,7 @@ import * as semanticImport from '../src/semantic-import.js';
 
 // Render the component's JSX and run its handlers without a browser dependency.
 // The mutation callback deliberately swallows errors like App.act does.
-async function explorerFixture({ capture, missingExpectation = false } = {}) {
+async function explorerFixture({ capture, missingExpectation = false, otherFolder = false } = {}) {
   const hooks = [];
   const effects = [];
   let cursor = 0;
@@ -72,8 +72,9 @@ async function explorerFixture({ capture, missingExpectation = false } = {}) {
       files: async () => ({ parent: '', next_cursor: null, ignore_rules: [], items: [{
         path: 'mods', name: 'mods', type: 'directory', actionable: true,
         changed_count: 2, changed: true, status: 'add',
-      }] }),
-      filePlan: async () => plan,
+      }, ...(otherFolder ? [{ path: 'config', name: 'config', type: 'directory', actionable: true,
+        changed_count: 2, changed: true, status: 'add' }] : [])] }),
+      filePlan: async (path) => ({ ...plan, path }),
       capturePath: async (...args) => { calls.push(args); return capture?.(...args); },
     },
     data: { revision: 7 }, targetLayer: 'client', layers: [{ id: 'client', local: false }],
@@ -119,6 +120,14 @@ async function explorerFixture({ capture, missingExpectation = false } = {}) {
     input.props.onChange();
     await flush();
   }
+  async function clickFolder(path) {
+    const row = find((node) => node.props.className?.startsWith('file-row')
+      && descendants(node).some((child) => child.type === 'strong' && text(child) === path));
+    const button = descendants(row).find((node) => node.type === 'button' && text(node) === 'Send to layer');
+    assert.ok(button && !button.props.disabled);
+    button.props.onClick();
+    await flush();
+  }
   render();
   await flush();
   await click('Send to layer');
@@ -126,7 +135,7 @@ async function explorerFixture({ capture, missingExpectation = false } = {}) {
   await click('Continue');
   await choose('preferred-provider', 0);
   await click('Continue');
-  return { calls, errors, plan, click, flush, find, text };
+  return { calls, errors, plan, click, clickFolder, choose, flush, find, text };
 }
 
 test('atomic submit failure is visible outside the scrolling review and preserves choices for retry', async () => {
@@ -148,7 +157,8 @@ test('atomic submit failure is visible outside the scrolling review and preserve
   assert.equal(fixture.calls[0][3]['mod-1'].provider_match.provider, 'modrinth');
   await fixture.click('Send all atomically');
   assert.equal(fixture.find((node) => node.props.role === 'alert'), undefined, 'Retry clears stale error');
-  assert.equal(fixture.find((node) => node.type === 'button' && fixture.text(node) === 'Send all atomically').props.disabled, true);
+  assert.equal(fixture.find((node) => node.props.role === 'dialog'), undefined, 'Saving closes the review immediately');
+  assert.ok(fixture.find((node) => node.type === 'button' && fixture.text(node) === 'Saving…'), 'The folder remains visibly pending until save completes');
   assert.deepEqual(fixture.calls[1], fixture.calls[0], 'Retry retains the exact reviewed plan and provider choices');
   release();
   await fixture.flush();
@@ -161,4 +171,23 @@ test('atomic submit validation failure is displayed in the modal without a reque
   assert.match(fixture.text(fixture.find((node) => node.props.role === 'alert')), /missing a source expectation/);
   assert.equal(fixture.calls.length, 0);
   assert.ok(fixture.find((node) => node.props.role === 'dialog'));
+});
+
+test('an earlier pending capture failure does not replace a newer folder wizard or its choices', async () => {
+  let rejectPending;
+  const fixture = await explorerFixture({ otherFolder: true, capture: () => new Promise((_resolve, reject) => {
+    rejectPending = reject;
+  }) });
+  await fixture.click('Send all atomically');
+  assert.equal(fixture.find((node) => node.props.role === 'dialog'), undefined);
+  await fixture.clickFolder('config');
+  await fixture.choose('folder-strategy', 1);
+  await fixture.click('Continue');
+  const before = fixture.text(fixture.find((node) => node.props.role === 'dialog'));
+  assert.ok(before.includes('Choose source 1 of 2'));
+  rejectPending(new Error('Earlier capture failed'));
+  await fixture.flush();
+  assert.equal(fixture.text(fixture.find((node) => node.props.role === 'dialog')), before);
+  assert.equal(fixture.find((node) => node.props.role === 'alert'), undefined);
+  assert.deepEqual(fixture.errors, ['Earlier capture failed']);
 });

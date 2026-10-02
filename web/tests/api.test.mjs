@@ -633,7 +633,7 @@ test('auto payload revision conflict refreshes authoritatively without retrying 
     targetLayer: 'client',
     onApplied: () => assert.fail('tree must not be patched'),
     onDecisionRequired: () => assert.fail('decision modal must not open'),
-    onRevisionConflict: async () => { refreshed = await client.bootstrap(); },
+    onRevisionConflict: async (error) => { refreshed = error.bootstrap || await client.bootstrap(); },
   });
 
   assert.equal(outcome.state, 'conflict');
@@ -668,8 +668,8 @@ test('file tree expands before lazy loading and scopes loading disables to its p
   const loading = new Set(['load:mods']);
   assert.equal(explorerTreeNavigationDisabled('', loading, 'mods'), true);
   assert.equal(explorerTreeNavigationDisabled('', loading, 'config'), false);
-  assert.equal(explorerTreeNavigationDisabled('refresh:files:2', loading, 'config'), true);
-  assert.equal(explorerTreeNavigationDisabled('capture:config', loading, 'config'), true);
+  assert.equal(explorerTreeNavigationDisabled('refresh:files:2', loading, 'config'), false);
+  assert.equal(explorerTreeNavigationDisabled('capture:config', loading, 'config'), false);
 });
 
 test('compact capture patch updates exact loaded scope and ancestors without collapsing state', () => {

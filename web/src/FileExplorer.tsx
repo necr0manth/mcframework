@@ -1,10 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   applyExplorerCapturePatch,
+  applyExplorerIgnorePatch,
   decisionsForPlan,
   explorerTreeNavigationDisabled,
+  explorerPathPending,
   flattenExplorer,
   mergeExplorerPage,
+  mergeExplorerRefresh,
   refreshExplorerState,
   toggleExplorerDirectory,
 } from './file-explorer-model.js';
@@ -38,6 +41,11 @@ type Entry = {
 type Rule = {
   id: string; selector: { kind: string; path: string }; layer: string; source: string;
   own: boolean; removable: boolean; identity: Record<string, unknown>;
+};
+type FileMutationReply = {
+  revision: number;
+  ignore_rules?: Rule[];
+  explorer_patch?: { path: string; kind?: string; ignored?: boolean; captured_count?: number };
 };
 type PlanItem = {
   id: string; path: string; status: string; capture_modes: string[];
@@ -86,7 +94,7 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   layers: Array<{ id: string; local: boolean }>;
   onTargetLayer: (value: string) => void;
   onMutate: (
-    label: string, action: () => Promise<unknown>, success: string,
+    label: string, action: () => Promise<unknown>, success: string, onApplied?: (reply: unknown) => void,
   ) => Promise<boolean>;
   onCompactMutation: (revision: number, success: string) => void;
   onRevisionConflict: (reason: unknown) => Promise<void>;
@@ -100,7 +108,6 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   const [next, setNext] = useState<Record<string, number | null>>({});
   const [rules, setRules] = useState<Rule[]>([]);
   const [loadedPages, setLoadedPages] = useState<Record<string, number[]>>({ '': [0] });
-  const [busy, setBusy] = useState('');
   const [loading, setLoading] = useState(new Set<string>());
   const [plan, setPlan] = useState<ExplorerPlan | null>(null);
   const [choices, setChoices] = useState<Record<string, Choice>>({});
@@ -114,6 +121,10 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   const [retryingLookup, setRetryingLookup] = useState(false);
   const retryLookupRef = useRef(false);
   const [ignoreDraft, setIgnoreDraft] = useState<{ item: Entry; write?: MetadataWrite } | null>(null);
+  const [pendingPaths, setPendingPaths] = useState(new Set<string>());
+  const pendingPathsRef = useRef(pendingPaths);
+  const [pendingIgnores, setPendingIgnores] = useState<Array<{ path: string; kind: string; ignored: boolean }>>([]);
+  const [pendingRules, setPendingRules] = useState(new Set<string>());
   const childrenRef = useRef(children);
   const expandedRef = useRef(expanded);
   const nextRef = useRef(next);
@@ -188,7 +199,6 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
       setLoadedPages(loadedPagesRef.current);
     }
 
-    const label = `refresh:files:${generation}`;
     const state = {
       children: childrenRef.current,
       expanded: expandedRef.current,
@@ -196,29 +206,72 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
       rules: rulesRef.current,
       loadedPages: loadedPagesRef.current,
     };
-    setBusy(label);
     void refreshExplorerState(state, ({ parent, cursor }: { parent: string; cursor: number }) =>
       client.files(parent, { mode, showIgnored, cursor, limit: 200, targetLayer }))
       .then((updated: typeof state) => {
         if (generation !== requestGenerationRef.current || data.revision !== revisionRef.current) return;
-        childrenRef.current = updated.children;
-        nextRef.current = updated.next;
-        rulesRef.current = updated.rules;
-        setChildren(updated.children);
-        setNext(updated.next);
-        setRules(updated.rules);
+        const merged = mergeExplorerRefresh({
+          children: childrenRef.current,
+          next: nextRef.current,
+          expanded: expandedRef.current,
+          rules: rulesRef.current,
+          loadedPages: loadedPagesRef.current,
+        }, updated, state);
+        childrenRef.current = merged.children;
+        nextRef.current = merged.next;
+        rulesRef.current = merged.rules;
+        setChildren(merged.children);
+        setNext(merged.next);
+        setRules(merged.rules);
       })
       .catch((reason: unknown) => {
         if (generation === requestGenerationRef.current) {
           onError(reason instanceof Error ? reason.message : 'Could not refresh files');
         }
-      })
-      .finally(() => setBusy((value) => value === label ? '' : value));
+      });
   }, [mode, showIgnored, targetLayer, data.revision]);
 
   useEffect(() => () => { ++planGenerationRef.current; }, []);
 
-  const rows = useMemo(() => flattenExplorer(children, expanded), [children, expanded]);
+  const rows = useMemo(() => {
+    const projected = pendingIgnores.reduce((value, patch) =>
+      applyExplorerIgnorePatch(value, patch, true), children);
+    const visible = applyExplorerIgnorePatch(projected, {}, showIgnored);
+    return flattenExplorer(visible, expanded);
+  }, [children, expanded, pendingIgnores, showIgnored]);
+
+  function markPending(path: string, saving: boolean) {
+    const updated = new Set(pendingPathsRef.current);
+    if (saving) updated.add(path);
+    else updated.delete(path);
+    pendingPathsRef.current = updated;
+    setPendingPaths(updated);
+  }
+
+  function applyFileReply(value: unknown) {
+    const reply = value as FileMutationReply;
+    if (reply.revision < revisionRef.current) return;
+    ++requestGenerationRef.current;
+    if (reply.ignore_rules) {
+      rulesRef.current = reply.ignore_rules;
+      setRules(reply.ignore_rules);
+    }
+    const patch = reply.explorer_patch;
+    if (!patch) return;
+    if (typeof patch.ignored === 'boolean') {
+      childrenRef.current = applyExplorerIgnorePatch(childrenRef.current, patch, true);
+    } else {
+      childrenRef.current = applyExplorerCapturePatch({ children: childrenRef.current }, patch, mode).children;
+    }
+    setChildren(childrenRef.current);
+  }
+
+  function fileReplyHandler() {
+    const scope = scopeRef.current;
+    return (reply: unknown) => {
+      if (scope === scopeRef.current) applyFileReply(reply);
+    };
+  }
 
   function closePlan() {
     ++planGenerationRef.current;
@@ -375,8 +428,13 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   }
 
   async function ignore(item: Entry, write?: MetadataWrite) {
+    if (explorerPathPending(pendingPathsRef.current, item.path)) return;
     const label = `ignore:${item.path}`;
-    setBusy(label);
+    const draft = { item, write };
+    const patch = { path: item.path, kind: item.type === 'directory' ? 'subtree' : 'exact', ignored: true };
+    markPending(item.path, true);
+    setPendingIgnores((current) => [...current, patch]);
+    setIgnoreDraft(null);
     try {
       const applied = await onMutate(
         label,
@@ -384,11 +442,15 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
           item.path, item.type === 'directory' ? 'subtree' : 'exact', targetLayer, write,
         ),
         `${item.path} is now ignored in ${targetLayer}.`,
+        fileReplyHandler(),
       );
-      if (applied) setIgnoreDraft(null);
+      if (!applied) setIgnoreDraft((current) => current ?? draft);
     } catch (reason) {
       onError(reason instanceof Error ? reason.message : 'Could not add ignore rule');
-    } finally { setBusy((value) => value === label ? '' : value); }
+    } finally {
+      setPendingIgnores((current) => current.filter((entry) => entry !== patch));
+      markPending(item.path, false);
+    }
   }
 
   async function applyPlan(item: Entry, value: ExplorerPlan) {
@@ -402,6 +464,7 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
         `capture:${item.path}`,
         () => client.capturePath(item.path, targetLayer, value.revision, decisions),
         `${item.path} was sent to ${targetLayer}.`,
+        fileReplyHandler(),
       );
       return;
     }
@@ -419,8 +482,9 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   }
 
   async function reviewCapture(item: Entry) {
-    const label = `capture:auto:${item.path}`;
-    setBusy(label);
+    if (explorerPathPending(pendingPathsRef.current, item.path)) return;
+    const scope = scopeRef.current;
+    markPending(item.path, true);
     try {
       if (item.type === 'directory') {
         await applyPlan(item, await client.filePlan(item.path, targetLayer));
@@ -443,6 +507,10 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
           if (patch.path !== item.path || !Number.isInteger(Number(patch.captured_count))) {
             throw new Error('Capture response explorer patch is invalid');
           }
+          if (scope !== scopeRef.current || result.revision < revisionRef.current) {
+            onCompactMutation(result.revision, `${item.path} was sent to ${targetLayer}.`);
+            return;
+          }
           ++requestGenerationRef.current;
           revisionRef.current = result.revision;
           const state = applyExplorerCapturePatch({
@@ -464,16 +532,20 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
       });
     } catch (reason) {
       onError(reason instanceof Error ? reason.message : 'Could not capture files');
-    } finally { setBusy((current) => current === label ? '' : current); }
+    } finally { markPending(item.path, false); }
   }
 
   async function submitPlan() {
     if (!plan) return;
-    const label = `capture:${plan.path}`;
+    const draft = plan;
+    const label = `capture:${draft.path}`;
+    let submissionGeneration = planGenerationRef.current;
     setPlanSubmitError('');
     try {
       const decisions = decisionsForPlan(plan.items, choices);
-      setBusy(label);
+      markPending(draft.path, true);
+      submissionGeneration = ++planGenerationRef.current;
+      setPlan(null);
       const applied = await onMutate(
         label,
         async () => {
@@ -482,33 +554,44 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
           } catch (reason) {
             // onMutate handles errors globally, behind this modal. Keep the actual
             // capture failure visible here as well, without losing the choices.
-            setPlanSubmitError(reason instanceof Error ? reason.message : 'Could not capture files');
+            if (submissionGeneration === planGenerationRef.current) {
+              setPlanSubmitError(reason instanceof Error ? reason.message : 'Could not capture files');
+            }
             throw reason;
           }
         },
         `${plan.path} and all changed descendants were sent atomically.`,
+        fileReplyHandler(),
       );
-      if (applied) closePlan();
-      else setPlanSubmitError((current) => current || 'The folder was not sent. Review the choices and try again.');
+      if (!applied && submissionGeneration === planGenerationRef.current) {
+        if (draft.revision === revisionRef.current) setPlan(draft);
+        setPlanSubmitError((current) => current || 'The folder was not sent. Review the choices and try again.');
+      }
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : 'Could not capture files';
       setPlanSubmitError(message);
       onError(message);
-    } finally { setBusy((value) => value === label ? '' : value); }
+    } finally { markPending(draft.path, false); }
   }
 
   async function removeRule(rule: Rule) {
+    if (explorerPathPending(pendingPathsRef.current, rule.selector.path)) return;
     const label = `rule:${rule.id}`;
-    setBusy(label);
+    markPending(rule.selector.path, true);
+    setPendingRules((current) => new Set(current).add(rule.id));
     try {
       await onMutate(
         label,
         () => client.removeIgnore(rule.identity, targetLayer),
         `Ignore rule ${rule.selector.path} was removed.`,
+        fileReplyHandler(),
       );
     } catch (reason) {
       onError(reason instanceof Error ? reason.message : 'Could not remove ignore rule');
-    } finally { setBusy((value) => value === label ? '' : value); }
+    } finally {
+      markPending(rule.selector.path, false);
+      setPendingRules((current) => new Set([...current].filter((id) => id !== rule.id)));
+    }
   }
 
   const lookupProgress = packageLookupProgress(plan);
@@ -517,18 +600,18 @@ export default function FileExplorer({ client, data, targetLayer, layers, onTarg
   const wizardChoice = wizardItem ? choices[wizardItem.id] : undefined;
   const wizardChoiceNeedsConfirmation = wizardChoice?.provider_match?.confidence === 'fuzzy'
     && !wizardChoice.fuzzyConfirmed;
-  const actionBusy = Boolean(busy) || loading.size > 0;
+  const busy = plan && pendingPaths.has(plan.path) ? plan.path : '';
 
   return <>
     <div className="page-heading files-heading"><div><p className="eyebrow">Local filesystem</p><h1>Files</h1><p>Actual files, desired ghost deletions and layer actions in one tree.</p></div><div className="explorer-controls"><label><span>Writable target</span><select value={targetLayer} onChange={(event) => onTargetLayer(event.target.value)}>{layers.map((layer) => <option value={layer.id} key={layer.id}>{layer.id}{layer.local ? ' · local' : ''}</option>)}</select></label><label><span>Order</span><select value={mode} onChange={(event) => setMode(event.target.value)}><option value="all">All files</option><option value="changed-first">Changed first</option><option value="changed-only">Changed only</option></select></label><label className="show-ignored"><input type="checkbox" checked={showIgnored} onChange={(event) => setShowIgnored(event.target.checked)} /> Show ignored</label></div></div>
     <div className="explorer-layout"><section className="file-tree" aria-label="Instance files">
       {rows.length ? rows.map((item: Entry) => <div className={`file-row ${item.synthetic ? 'ghost' : ''} ${item.ignored ? 'ignored' : ''} ${item.changed ? 'changed' : ''}`} style={{ paddingLeft: `${14 + (item.depth || 0) * 22}px` }} key={item.path}>
         <button className="file-main" disabled={explorerTreeNavigationDisabled(busy, loading, item.path)} onClick={() => void toggle(item)} title={item.reason || item.path}><span>{item.type === 'directory' ? (expanded.has(item.path) ? '▾' : '▸') : item.type === 'symlink' ? '↗' : '·'}</span><strong>{item.name}</strong>{item.synthetic && <em>deleted</em>}{item.ignored && <em>ignored</em>}{item.changed_count > 0 && <small>{item.status !== 'unchanged' ? item.status : `${item.changed_count} changed`}</small>}</button>
-        <div className="file-actions"><button disabled={actionBusy || !item.actionable || item.ignored} onClick={() => setIgnoreDraft({ item })}>Ignore</button><button className="primary" disabled={actionBusy || item.changed_count === 0 || !item.actionable} onClick={() => void reviewCapture(item)}>Send to layer</button></div>
+        <div className="file-actions"><button disabled={explorerPathPending(pendingPaths, item.path) || !item.actionable || item.ignored} onClick={() => setIgnoreDraft({ item })}>Ignore</button><button className="primary" disabled={explorerPathPending(pendingPaths, item.path) || item.changed_count === 0 || !item.actionable} onClick={() => void reviewCapture(item)}>{explorerPathPending(pendingPaths, item.path) ? 'Saving…' : 'Send to layer'}</button></div>
       </div>) : <div className="empty"><h2>No files in this mode</h2><p>Change the filter or enable ignored files.</p></div>}
       {next[''] !== null && next[''] !== undefined && <button className="load-more" disabled={explorerTreeNavigationDisabled(busy, loading, '')} onClick={() => void load('', next[''] || 0)}>Load more</button>}
       {Object.entries(next).filter(([parent, cursor]) => parent && cursor !== null).map(([parent, cursor]) => <button className="load-more" disabled={explorerTreeNavigationDisabled(busy, loading, parent)} key={parent} onClick={() => void load(parent, cursor || 0)}>Load more in {parent}</button>)}
-    </section><aside className="ignore-inspector"><p className="eyebrow">Selected layer</p><h2>Ignore rules</h2>{rules.length ? rules.map((rule) => <article key={rule.id}><code>{rule.selector.kind}: {rule.selector.path}</code><small>{rule.own ? 'Own rule' : `Inherited from ${rule.layer}`}</small>{rule.removable && <button disabled={actionBusy} onClick={() => void removeRule(rule)}>Remove</button>}</article>) : <p>No ignore rules apply in this composition.</p>}</aside></div>
+    </section><aside className="ignore-inspector"><p className="eyebrow">Selected layer</p><h2>Ignore rules</h2>{rules.length ? rules.filter((rule) => !pendingRules.has(rule.id)).map((rule) => <article key={rule.id}><code>{rule.selector.kind}: {rule.selector.path}</code><small>{rule.own ? 'Own rule' : `Inherited from ${rule.layer}`}</small>{rule.removable && <button disabled={pendingPaths.has(rule.selector.path)} onClick={() => void removeRule(rule)}>Remove</button>}</article>) : <p>No ignore rules apply in this composition.</p>}</aside></div>
     {ignoreDraft && <div className="modal-backdrop"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="ignore-title">
       <header><h2 id="ignore-title">Ignore {ignoreDraft.item.path}</h2><button aria-label="Close" onClick={() => setIgnoreDraft(null)}>×</button></header>
       <div className="modal-body"><label><span>Writable target</span><select value={targetLayer} onChange={(event) => onTargetLayer(event.target.value)}>{layers.map((layer) => <option key={layer.id} value={layer.id}>{layer.id}</option>)}</select></label>

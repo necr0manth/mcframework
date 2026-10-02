@@ -60,6 +60,12 @@ class WorkspaceLoader:
             for path, expected in entries.items()
         )
 
+    def source_generations(self) -> tuple[tuple[Path, Generation], ...]:
+        """Return the generations recorded before reading the current layer graph."""
+        return tuple(
+            item for entries in self._generations.values() for item in entries.items()
+        )
+
     @staticmethod
     def _scan(
         root: Path,

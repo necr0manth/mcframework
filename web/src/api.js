@@ -259,11 +259,30 @@ export class ApiClient {
     this.fetchImpl = fetchImpl;
     this.csrf = '';
     this.revision = null;
+    this.mutationQueue = Promise.resolve();
   }
 
   async request(path, options = {}) {
-    const { revision = this.revision, ...requestOptions } = options;
+    if (!options.method || options.method === 'GET') return this.performRequest(path, options);
+    const result = this.mutationQueue.then(async () => {
+      try {
+        return await this.performRequest(path, options);
+      } catch (error) {
+        if (error instanceof ApiError && error.code === 'revision_conflict') {
+          // Reconcile before releasing the next queued, separately requested write.
+          try { error.bootstrap = await this.bootstrap(); } catch { /* Keep the original error. */ }
+        }
+        throw error;
+      }
+    });
+    this.mutationQueue = result.catch(() => {});
+    return result;
+  }
+
+  async performRequest(path, options = {}) {
+    const { revision = this.revision, minimal, ...requestOptions } = options;
     const headers = new Headers(options.headers || {});
+    if (minimal) headers.set('Prefer', 'return=minimal');
     headers.set('Accept', 'application/json');
     if (options.body !== undefined) headers.set('Content-Type', 'application/json');
     if (this.csrf && options.method && options.method !== 'GET') {
@@ -288,13 +307,20 @@ export class ApiClient {
         asObject(error.details),
       );
     }
+    if (options.method && options.method !== 'GET' && Number.isInteger(payload.revision)) {
+      this.revision = Math.max(this.revision ?? 0, payload.revision);
+    }
     return payload;
   }
 
   remember(bootstrap) {
+    if (bootstrap.ok === true && !bootstrap.csrf && Number.isInteger(bootstrap.revision)) {
+      this.revision = Math.max(this.revision ?? 0, bootstrap.revision);
+      return bootstrap;
+    }
     const normalized = normalizeBootstrap(bootstrap);
     this.csrf = normalized.csrf;
-    this.revision = normalized.revision;
+    this.revision = Math.max(this.revision ?? 0, normalized.revision);
     return normalized;
   }
 
@@ -340,19 +366,19 @@ export class ApiClient {
     const body = { state };
     if (metadataWrite) body.metadata_write = metadataWrite;
     if (targetLayer) body.target_layer = targetLayer;
-    return this.remember(await this.request(`/api/v1/packages/${encodeURIComponent(id)}/activation`, { method: 'PATCH', body }));
+    return this.remember(await this.request(`/api/v1/packages/${encodeURIComponent(id)}/activation`, { method: 'PATCH', body, minimal: true }));
   }
 
   async setGroupActivation(id, state, targetLayer) {
     const body = { state };
     if (targetLayer) body.target_layer = targetLayer;
-    return this.remember(await this.request(`/api/v1/groups/${encodeURIComponent(id)}/activation`, { method: 'PATCH', body }));
+    return this.remember(await this.request(`/api/v1/groups/${encodeURIComponent(id)}/activation`, { method: 'PATCH', body, minimal: true }));
   }
 
   async setSectionActivation(id, state, targetLayer) {
     const body = { state };
     if (targetLayer) body.target_layer = targetLayer;
-    return this.remember(await this.request(`/api/v1/sections/${encodeURIComponent(id)}/activation`, { method: 'PATCH', body }));
+    return this.remember(await this.request(`/api/v1/sections/${encodeURIComponent(id)}/activation`, { method: 'PATCH', body, minimal: true }));
   }
 
   async capture(deltaId, targetLayer, expectedSha256, metadataWrite) {
@@ -402,7 +428,7 @@ export class ApiClient {
     )) {
       throw new Error('Capture response explorer patch is invalid');
     }
-    this.revision = revision;
+    this.revision = Math.max(this.revision ?? 0, revision);
     return {
       ok: payload.ok === true,
       applied: payload.applied,
@@ -416,7 +442,7 @@ export class ApiClient {
     const body = { path, plan_revision: planRevision, decisions };
     if (targetLayer) body.target_layer = targetLayer;
     return this.remember(await this.request('/api/v1/files/capture', {
-      method: 'POST', body, revision: planRevision,
+      method: 'POST', body, revision: planRevision, minimal: true,
     }));
   }
 
@@ -425,7 +451,7 @@ export class ApiClient {
     if (metadataWrite) body.metadata_write = metadataWrite;
     if (targetLayer) body.target_layer = targetLayer;
     return this.remember(await this.request('/api/v1/files/ignore', {
-      method: 'POST', body,
+      method: 'POST', body, minimal: true,
     }));
   }
 
@@ -433,7 +459,7 @@ export class ApiClient {
     const body = { identity };
     if (targetLayer) body.target_layer = targetLayer;
     return this.remember(await this.request('/api/v1/files/ignore', {
-      method: 'DELETE', body,
+      method: 'DELETE', body, minimal: true,
     }));
   }
 
@@ -498,7 +524,7 @@ export class ApiClient {
     if (targetLayer) body.target_layer = targetLayer;
     if (metadataWrite) body.metadata_write = metadataWrite;
     return this.remember(await this.request(`/api/v1/packages/${encodeURIComponent(id)}`, {
-      method: 'DELETE', body,
+      method: 'DELETE', body, minimal: true,
     }));
   }
 
@@ -514,6 +540,7 @@ export class ApiError extends Error {
     this.status = status;
     this.code = code;
     this.details = details;
+    this.bootstrap = null;
   }
 }
 
@@ -548,7 +575,7 @@ export async function runRevisionedMutation(client, action) {
     return { applied: true, value: await action(), conflict: null };
   } catch (error) {
     if (!(error instanceof ApiError) || error.code !== 'revision_conflict') throw error;
-    const value = await client.bootstrap();
+    const value = error.bootstrap || await client.bootstrap();
     return { applied: false, value, conflict: error };
   }
 }

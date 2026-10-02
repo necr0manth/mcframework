@@ -67,16 +67,21 @@ def auto_capture_request(
     csrf: str,
     revision: int,
     body: dict[str, object],
+    *,
+    route: str = "files/capture",
+    method: str = "POST",
+    minimal: bool = False,
 ) -> urllib.request.Request:
     return urllib.request.Request(
-        base + "api/v1/files/capture",
+        base + "api/v1/" + route,
         data=json.dumps(body).encode(),
-        method="POST",
+        method=method,
         headers={
             "Content-Type": "application/json",
             "X-Mcpack-CSRF": csrf,
             "If-Match": f'"{revision}"',
             "Origin": base.rstrip("/"),
+            **({"Prefer": "return=minimal"} if minimal else {}),
         },
     )
 
@@ -982,3 +987,139 @@ def test_warm_ignore_reprojects_without_instance_io_and_matches_cold_snapshot(
     assert warm_projection == cold_projection
     assert warm.entries["inherited/a.txt"]["ignored"] is True
     assert warm.entries["own/nested/b.txt"]["ignored"] is True
+
+
+def test_compact_activation_reuses_validated_dependency_states_and_preserves_default_api(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    operations = []
+    for identity in ("owner", "library"):
+        source = tmp_path / f"{identity}.jar"
+        content = identity.encode()
+        source.write_bytes(content)
+        operations.append({
+            "type": "package", "id": identity, "activation": "available",
+            "automatic_requires": ["library"] if identity == "owner" else [],
+            "destination": f"mods/{identity}.jar",
+            "source": {"provider": "local", "location": str(source),
+                       "sha256": hashlib.sha256(content).hexdigest()},
+        })
+    layer_factory("client", operations=operations)
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game_path(tmp_path))
+    service.instance_context("dev")
+    original_context = service.instance_context
+    context_calls = 0
+
+    def context(*args: Any, **kwargs: Any) -> Any:
+        nonlocal context_calls
+        context_calls += 1
+        return original_context(*args, **kwargs)
+
+    def fail_bootstrap() -> dict[str, object]:
+        raise AssertionError("compact mutation must not build the full bootstrap")
+
+    with auto_capture_server(tmp_path, service) as (server, opener, base):
+        with monkeypatch.context() as patch:
+            patch.setattr(service, "instance_context", context)
+            patch.setattr(server, "bootstrap", fail_bootstrap)
+            response = json.loads(opener.open(auto_capture_request(
+                opener, base, server.csrf, 0, {"state": "enabled", "target_layer": "client"},
+                route="packages/owner/activation", method="PATCH", minimal=True,
+            ), timeout=5).read())
+            assert context_calls == 2  # Initial freshness and required post-write validation.
+            states = {item["id"]: item for item in response["activation_patch"]["packages"]}
+            assert states["owner"] == {"id": "owner", "activation": "enabled"}
+            assert states["library"] == {
+                "id": "library", "activation": "enabled", "activation_reason": "dependency",
+            }
+            assert set(response) == {"ok", "revision", "activation_patch"}
+            assert response["revision"] == 1
+            with pytest.raises(urllib.error.HTTPError) as conflict:
+                opener.open(auto_capture_request(
+                    opener, base, server.csrf, 0, {"state": "disabled"},
+                    route="packages/owner/activation", method="PATCH", minimal=True,
+                ), timeout=5)
+            assert conflict.value.code == 409
+            assert context_calls == 2
+            assert server.revision == 1
+
+        response = json.loads(opener.open(auto_capture_request(
+            opener, base, server.csrf, 1, {"state": "available", "target_layer": "client"},
+            route="packages/owner/activation", method="PATCH",
+        ), timeout=5).read())
+        assert response["revision"] == 2
+        assert response["csrf"] == server.csrf
+        assert "declarations" in response and "packages" in response
+        assert {item["activation"] for item in response["packages"]} == {"available"}
+
+
+def test_compact_ignore_add_and_remove_skip_bootstrap_and_repeated_context_validation(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer_factory("client", operations=[], payload={"config.txt": "same"})
+    game = game_path(tmp_path)
+    game.mkdir()
+    (game / "config.txt").write_text("same")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+    service.explorer_snapshot("dev")
+    original_context = service.instance_context
+    calls = 0
+
+    def context(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return original_context(*args, **kwargs)
+
+    def fail_bootstrap() -> dict[str, object]:
+        raise AssertionError("compact ignore must not build bootstrap")
+
+    with auto_capture_server(tmp_path, service) as (server, opener, base):
+        monkeypatch.setattr(service, "instance_context", context)
+        monkeypatch.setattr(server, "bootstrap", fail_bootstrap)
+        response = json.loads(opener.open(auto_capture_request(
+            opener, base, server.csrf, 0,
+            {"path": "config.txt", "kind": "exact", "target_layer": "client"},
+            route="files/ignore", minimal=True,
+        ), timeout=5).read())
+        assert calls == 2
+        assert response["explorer_patch"] == {
+            "path": "config.txt", "kind": "exact", "ignored": True,
+        }
+        rule = response["ignore_rules"][0]
+        assert rule["removable"] is True
+        response = json.loads(opener.open(auto_capture_request(
+            opener, base, server.csrf, 1,
+            {"identity": rule["identity"], "target_layer": "client"},
+            route="files/ignore", method="DELETE", minimal=True,
+        ), timeout=5).read())
+        assert calls == 4
+        assert response["ignore_rules"] == []
+        assert response["explorer_patch"]["ignored"] is False
+        assert response["revision"] == 2
+
+
+def test_compact_explicit_folder_capture_skips_bootstrap_after_verified_payload_write(
+    layer_factory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layer_factory("client", operations=[])
+    game = game_path(tmp_path)
+    (game / "bulk").mkdir(parents=True)
+    (game / "bulk/a.txt").write_text("captured")
+    service = ProjectService(tmp_path)
+    service.link("client", "dev", game)
+    decisions = decisions_for(service.explorer_plan("dev", "bulk", "client"))
+
+    def fail_bootstrap() -> dict[str, object]:
+        raise AssertionError("compact capture must not build bootstrap")
+
+    with auto_capture_server(tmp_path, service) as (server, opener, base):
+        monkeypatch.setattr(server, "bootstrap", fail_bootstrap)
+        response = json.loads(opener.open(auto_capture_request(
+            opener, base, server.csrf, 0,
+            {"path": "bulk", "target_layer": "client", "plan_revision": 0,
+             "decisions": decisions}, minimal=True,
+        ), timeout=5).read())
+        assert response == {"ok": True, "revision": 1, "explorer_patch": {"path": "bulk"}}
+    assert (tmp_path / "client/bulk/a.txt").read_text() == "captured"

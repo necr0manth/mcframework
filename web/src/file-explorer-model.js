@@ -27,7 +27,11 @@ export function toggleExplorerDirectory(expanded, path, loaded) {
 }
 
 export function explorerTreeNavigationDisabled(busy, loading, path) {
-  return Boolean(busy) || loading.has(`load:${path}`);
+  return loading.has(`load:${path}`);
+}
+
+export function explorerPathPending(pending, path) {
+  return [...pending].some((scope) => insideScope(path, scope) || insideScope(scope, path));
 }
 
 export function explorerRefreshRequests(children, expanded, loadedPages) {
@@ -47,8 +51,7 @@ export async function refreshExplorerState(state, loadPage) {
     state.expanded,
     state.loadedPages,
   );
-  const pages = [];
-  for (const request of requests) pages.push(await loadPage(request));
+  const pages = await Promise.all(requests.map((request) => loadPage(request)));
 
   let children = state.children;
   const next = { ...state.next };
@@ -62,6 +65,44 @@ export async function refreshExplorerState(state, loadPage) {
     if (page.parent === '') rules = page.ignore_rules || [];
   }
   return { ...state, children, next, rules };
+}
+
+// A user can open a previously collapsed folder while this refresh is in flight.
+// Only replace the parents that the refresh actually requested.
+export function mergeExplorerRefresh(current, refreshed, requestedState) {
+  const parents = new Set(explorerRefreshRequests(
+    requestedState.children, requestedState.expanded, requestedState.loadedPages,
+  ).map(({ parent }) => parent));
+  const children = { ...current.children };
+  const next = { ...current.next };
+  for (const parent of parents) {
+    const loaded = current.loadedPages[parent] || [];
+    const requested = requestedState.loadedPages[parent] || [0];
+    // A newly loaded pagination page owns this parent until the next refresh.
+    if (loaded.some((cursor) => !requested.includes(cursor))) continue;
+    children[parent] = refreshed.children[parent];
+    next[parent] = refreshed.next[parent];
+  }
+  return { ...current, children, next, rules: refreshed.rules };
+}
+
+/**
+ * @template T
+ * @param {Record<string, T[]>} children
+ * @param {{path?: string, kind?: string, ignored?: boolean}} patch
+ * @returns {Record<string, T[]>}
+ */
+export function applyExplorerIgnorePatch(children, patch, showIgnored) {
+  /** @type {Record<string, T[]>} */
+  const updated = {};
+  for (const [parent, entries] of Object.entries(children)) {
+    const items = entries.map((entry) => (entry.path === patch.path
+      || (patch.kind === 'subtree' && insideScope(entry.path, patch.path)))
+      ? { ...entry, ignored: patch.ignored }
+      : entry);
+    updated[parent] = showIgnored ? items : items.filter((entry) => !entry.ignored);
+  }
+  return updated;
 }
 
 function insideScope(path, scope) {

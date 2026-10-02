@@ -344,6 +344,39 @@ class Handler(BaseHTTPRequestHandler):
                     self._json({"ok": True, "revision": self.server.revision})
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
                     return
+                if any(
+                    preference.strip() == "return=minimal"
+                    for preference in self.headers.get("Prefer", "").split(",")
+                ):
+                    compact: dict[str, object] = {"ok": True, "revision": self.server.revision}
+                    activation = (
+                        method == "PATCH" and parsed.path.endswith("/activation")
+                        or method == "DELETE" and parsed.path.startswith("/api/v1/packages/")
+                    )
+                    ignore = parsed.path == "/api/v1/files/ignore"
+                    if activation or ignore:
+                        compact.update(self.server.service.mutation_projection(
+                            self.server.instance, activation=activation, ignore=ignore,
+                            target_layer=self._optional_string(body, "target_layer"),
+                        ))
+                    if ignore:
+                        selector: object = body
+                        if method == "DELETE":
+                            identity = body.get("identity")
+                            selector = (
+                                identity.get("selector") if isinstance(identity, dict) else None
+                            )
+                        if not isinstance(selector, dict):
+                            raise RuntimeError("ignore mutation returned no selector")
+                        compact["explorer_patch"] = {
+                            "path": self._string(selector, "path"),
+                            "kind": self._string(selector, "kind"),
+                            "ignored": method == "POST",
+                        }
+                    elif parsed.path == "/api/v1/files/capture":
+                        compact["explorer_patch"] = {"path": body["path"]}
+                    self._json(compact)
+                    return
                 self._json(self.server.bootstrap())
         except RevisionConflict as exc:
             self._error(
